@@ -1,0 +1,25 @@
+[package]
+name = "batchplan"
+version = "0.1.0"
+edition = "2024"
+description = "Batched collision-aware IK and trajectory optimization on any GPU (wgpu: Vulkan/Metal/DX12) with a CPU reference backend."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/noah-wardlow/batchplan"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.33", features = ["serde"] }
+pollster = "1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urdf-rs = "0.10"
+wgpu = "30"
+
+[profile.release]
+debug = 1
+
+[profile.test]
+opt-level = 3

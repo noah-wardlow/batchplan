@@ -1,0 +1,82 @@
+//! Batched IK + planning throughput on every available backend, on identical problems.
+//!
+//! cargo run --release --example bench -- [problems=512]
+//! Set BENCH_LLVMPIPE=1 to also run the WGSL kernels on the CPU through Mesa's llvmpipe.
+
+#[path = "common/mod.rs"]
+mod common;
+
+use std::time::Instant;
+
+use anyhow::Result;
+use batchplan::rng::Rng;
+use batchplan::*;
+
+fn main() -> Result<()> {
+    let count: usize = std::env::args().nth(1).map_or(Ok(512), |a| a.parse())?;
+    let robot = Robot::from_config_file(common::panda_config())?;
+    let mut rng = Rng::new(42);
+    let worlds: Vec<World> = (0..count).map(|_| common::tabletop(&mut rng)).collect();
+    let ik_problems: Vec<IkProblem> = worlds
+        .iter()
+        .enumerate()
+        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
+        .collect();
+
+    let mut devices = vec![];
+    match Device::gpu(&robot) {
+        Ok(gpu) => devices.push(gpu),
+        Err(e) => eprintln!("no GPU device: {e}"),
+    }
+    devices.push(Device::cpu(&robot));
+    if std::env::var("BENCH_LLVMPIPE").is_ok() {
+        devices.push(Device::gpu_named(&robot, "llvmpipe")?);
+    }
+
+    let ik_opts = IkOptions::default();
+    let plan_opts = PlanOptions::default();
+    println!(
+        "{count} worlds (table + 2-6 boxes), IK {} seeds x {} iters, trajopt {} seeds x {} waypoints x {} iters\n",
+        ik_opts.seeds, ik_opts.iterations, plan_opts.seeds, plan_opts.waypoints, plan_opts.iterations
+    );
+    for device in &devices {
+        // Warm up (pipeline compilation, thread pool).
+        solve_ik(device, &worlds, &ik_problems[..1], &IkOptions { iterations: 1, ..ik_opts })?;
+
+        let t = Instant::now();
+        let ik = solve_ik(device, &worlds, &ik_problems, &ik_opts)?;
+        let ik_time = t.elapsed().as_secs_f64();
+        let problems: Vec<PlanProblem> = (0..count)
+            .filter_map(|p| {
+                ik.best(p).map(|goal| PlanProblem {
+                    world: p as u32,
+                    start: robot.default_q().to_vec(),
+                    goal: goal.to_vec(),
+                })
+            })
+            .collect();
+
+        let t = Instant::now();
+        let result = plan(device, &worlds, &problems, &plan_opts)?;
+        let plan_time = t.elapsed().as_secs_f64();
+        let solved = (0..problems.len()).filter(|&p| result.best(p).is_some()).count();
+        let valid_seeds = result.valid.iter().filter(|&&v| v).count();
+
+        println!("{}", device.name());
+        println!(
+            "  IK    {:7.3} s  {:9.0} seeds/s   targets solved {}/{count}",
+            ik_time,
+            (count * ik_opts.seeds) as f64 / ik_time,
+            problems.len()
+        );
+        println!(
+            "  plan  {:7.3} s  {:9.0} seeds/s   problems solved {solved}/{} ({:.1}% of seeds valid)",
+            plan_time,
+            (problems.len() * plan_opts.seeds) as f64 / plan_time,
+            problems.len(),
+            100.0 * valid_seeds as f64 / result.valid.len().max(1) as f64
+        );
+        println!("  end-to-end {:.1} solved problems/s\n", solved as f64 / (ik_time + plan_time));
+    }
+    Ok(())
+}

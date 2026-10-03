@@ -1,0 +1,176 @@
+//! Batched trajectory optimization: many seeds per start/goal pair, each a fixed-length waypoint
+//! path optimized with Adam on collision + smoothness cost, then validated by dense interpolation.
+
+use anyhow::{Result, ensure};
+
+use crate::device::{CollisionWeights, Device};
+use crate::rng::Rng;
+use crate::robot::Robot;
+use crate::types::JointPaths;
+use crate::world::World;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlanOptions {
+    pub seeds: usize,
+    pub waypoints: usize,
+    pub iterations: u32,
+    pub learning_rate: f32,
+    pub lr_decay: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    /// Weight of squared waypoint accelerations.
+    pub w_acc: f32,
+    /// Weight of squared waypoint velocities (path length).
+    pub w_vel: f32,
+    pub collision: CollisionWeights,
+    /// Linear interpolation samples per segment used to validate the result.
+    pub validate_substeps: usize,
+    pub rng_seed: u64,
+}
+
+impl Default for PlanOptions {
+    fn default() -> Self {
+        Self {
+            seeds: 8,
+            waypoints: 32,
+            iterations: 200,
+            learning_rate: 0.03,
+            lr_decay: 0.99,
+            beta1: 0.9,
+            beta2: 0.999,
+            w_acc: 50.0,
+            w_vel: 2.0,
+            collision: CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 },
+            validate_substeps: 8,
+            rng_seed: 2,
+        }
+    }
+}
+
+impl PlanOptions {
+    /// Adam learning rate and bias corrections for iteration `k` (shared by all backends).
+    pub(crate) fn schedule(&self, k: u32) -> [f32; 3] {
+        let lr = self.learning_rate * self.lr_decay.powi(k as i32);
+        [lr, 1.0 - self.beta1.powi(k as i32 + 1), 1.0 - self.beta2.powi(k as i32 + 1)]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanProblem {
+    pub world: u32,
+    pub start: Vec<f32>,
+    pub goal: Vec<f32>,
+}
+
+/// Per-seed results; paths are problem-major (`item = problem * seeds + seed`).
+#[derive(Clone, Debug)]
+pub struct PlanResult {
+    pub seeds: usize,
+    pub paths: JointPaths,
+    pub valid: Vec<bool>,
+    /// Minimum of world and self clearance along the densely interpolated path.
+    pub min_clearance: Vec<f32>,
+    /// Joint-space path length.
+    pub length: Vec<f32>,
+}
+
+impl PlanResult {
+    /// The shortest valid seed.
+    pub fn best(&self, problem: usize) -> Option<&[f32]> {
+        (problem * self.seeds..(problem + 1) * self.seeds)
+            .filter(|&i| self.valid[i])
+            .min_by(|&a, &b| self.length[a].total_cmp(&self.length[b]))
+            .map(|i| self.paths.path(i))
+    }
+}
+
+pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &PlanOptions) -> Result<PlanResult> {
+    let robot = device.robot();
+    let n = robot.dof();
+    let t_count = o.waypoints;
+    ensure!(t_count >= 3 && o.seeds > 0, "need at least 3 waypoints and one seed");
+    let items = problems.len() * o.seeds;
+    let mut rng = Rng::new(o.rng_seed);
+    let mut paths = JointPaths::zeros(items, t_count, n);
+    let mut item_world = Vec::with_capacity(items);
+    for (pi, p) in problems.iter().enumerate() {
+        ensure!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
+        for s in 0..o.seeds {
+            seed_path(robot, &p.start, &p.goal, s, &mut rng, paths.path_mut(pi * o.seeds + s));
+            item_world.push(p.world);
+        }
+    }
+    device.backend().trajopt(worlds, &item_world, &mut paths, o)?;
+
+    // Validate along the joint-space polyline (the path the retimer follows).
+    let k = o.validate_substeps.max(1);
+    let samples = (t_count - 1) * k + 1;
+    let mut dense = Vec::with_capacity(items * samples * n);
+    let mut dense_world = Vec::with_capacity(items * samples);
+    for (item, &world) in item_world.iter().enumerate() {
+        let tr = paths.path(item);
+        for t in 0..t_count - 1 {
+            for s in 0..k {
+                let a = s as f32 / k as f32;
+                dense.extend((0..n).map(|j| tr[t * n + j] + a * (tr[(t + 1) * n + j] - tr[t * n + j])));
+            }
+        }
+        dense.extend_from_slice(&tr[(t_count - 1) * n..]);
+        dense_world.extend(std::iter::repeat_n(world, samples));
+    }
+    let eval = device.evaluate(worlds, &dense_world, &dense, &CollisionWeights::NONE)?;
+    let min_clearance: Vec<f32> = (0..items)
+        .map(|item| {
+            (item * samples..(item + 1) * samples)
+                .map(|i| eval.world_clearance[i].min(eval.self_clearance[i]))
+                .fold(f32::INFINITY, f32::min)
+        })
+        .collect();
+    let length = (0..items)
+        .map(|item| {
+            let tr = paths.path(item);
+            (0..t_count - 1)
+                .map(|t| (0..n).map(|j| (tr[(t + 1) * n + j] - tr[t * n + j]).powi(2)).sum::<f32>().sqrt())
+                .sum()
+        })
+        .collect();
+    Ok(PlanResult {
+        seeds: o.seeds,
+        paths,
+        valid: min_clearance.iter().map(|&c| c >= 0.0).collect(),
+        min_clearance,
+        length,
+    })
+}
+
+/// Seed 0 is the straight line; other seeds bend through a random via point.
+fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], seed: usize, rng: &mut Rng, out: &mut [f32]) {
+    let n = start.len();
+    let t_count = out.len() / n;
+    let (via_u, via): (f32, Vec<f32>) = if seed == 0 {
+        (0.5, (0..n).map(|j| 0.5 * (start[j] + goal[j])).collect())
+    } else {
+        let u = rng.range(0.3, 0.7);
+        let alpha = rng.range(0.2, 0.6);
+        let via = (0..n)
+            .map(|j| {
+                let mid = start[j] + u * (goal[j] - start[j]);
+                mid + alpha * (rng.range(robot.lower[j], robot.upper[j]) - mid)
+            })
+            .collect();
+        (u, via)
+    };
+    for t in 1..t_count - 1 {
+        let u = t as f32 / (t_count - 1) as f32;
+        for j in 0..n {
+            out[t * n + j] = if u <= via_u {
+                start[j] + (via[j] - start[j]) * (u / via_u)
+            } else {
+                via[j] + (goal[j] - via[j]) * ((u - via_u) / (1.0 - via_u))
+            };
+        }
+    }
+    // Endpoints are copied, not interpolated, so they stay bit-exact.
+    out[..n].copy_from_slice(start);
+    out[(t_count - 1) * n..].copy_from_slice(goal);
+}
