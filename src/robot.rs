@@ -68,6 +68,7 @@ pub(crate) struct CollisionSphere {
 /// A robot's kinematic tree and collision-sphere model. Immutable once loaded.
 #[derive(Clone, Debug)]
 pub struct Robot {
+    pub(crate) name: String,
     pub(crate) links: Vec<Link>,
     pub(crate) dof_names: Vec<String>,
     pub(crate) lower: Vec<f32>,
@@ -237,6 +238,7 @@ impl Robot {
             bail!("default_q has {} values but the robot has {} actuated joints", cfg.default_q.len(), dof_names.len());
         }
         Ok(Self {
+            name: urdf.name.clone(),
             links,
             dof_names,
             lower,
@@ -247,6 +249,11 @@ impl Robot {
             ee_link,
             default_q: cfg.default_q.clone(),
         })
+    }
+
+    /// The URDF robot name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn dof(&self) -> usize {

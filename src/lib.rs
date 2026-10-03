@@ -7,6 +7,7 @@
 //!   are independent modules that take a `Device` and exchange the [`types`]; there are no
 //!   planner plugins or runtime configuration.
 //! - **Standalone.** No middleware; robots load from URDF plus a collision-sphere config.
+//!   Datasets export to LeRobot v3.0 with the optional `lerobot` feature.
 //!
 //! ```no_run
 //! use batchplan::*;
@@ -25,6 +26,8 @@ pub mod datagen;
 pub mod device;
 mod gpu;
 pub mod ik;
+#[cfg(feature = "lerobot")]
+pub mod lerobot;
 pub mod npy;
 pub mod rng;
 pub mod robot;
