@@ -46,20 +46,19 @@ fn main() -> Result<()> {
         let t = Instant::now();
         let ik = solve_ik(device, &worlds, &ik_problems, &ik_opts)?;
         let ik_time = t.elapsed().as_secs_f64();
-        let problems: Vec<PlanProblem> = (0..count)
-            .filter_map(|p| {
-                ik.best(p).map(|goal| PlanProblem {
-                    world: p as u32,
-                    start: robot.default_q().to_vec(),
-                    goal: goal.to_vec(),
-                })
+        let problems: Vec<PlanProblem> = ik
+            .solved()
+            .map(|s| PlanProblem {
+                world: s.problem.world,
+                start: robot.default_q().to_vec(),
+                goal: s.solution.to_vec(),
             })
             .collect();
 
         let t = Instant::now();
         let result = plan(device, &worlds, &problems, &plan_opts)?;
         let plan_time = t.elapsed().as_secs_f64();
-        let solved = (0..problems.len()).filter(|&p| result.best(p).is_some()).count();
+        let solved = result.solved().count();
         let valid_seeds = result.valid.iter().filter(|&&v| v).count();
 
         println!("{}", device.name());

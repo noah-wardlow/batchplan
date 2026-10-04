@@ -112,26 +112,20 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     let worlds = worlds(128, 6);
     let problems = ik_problems(&worlds, 7);
     let ik = solve_ik(&gpu, &worlds, &problems, &IkOptions::default()).unwrap();
-    let plan_problems: Vec<PlanProblem> = (0..problems.len())
-        .filter_map(|p| {
-            ik.best(p).map(|goal| PlanProblem {
-                world: p as u32,
-                start: robot.default_q().to_vec(),
-                goal: goal.to_vec(),
-            })
-        })
+    let plan_problems: Vec<PlanProblem> = ik
+        .solved()
+        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
         .collect();
     let o = PlanOptions::default();
     let result = plan(&gpu, &worlds, &plan_problems, &o).unwrap();
-    let solved = (0..plan_problems.len()).filter(|&p| result.best(p).is_some()).count();
+    let solved = result.solved().count();
     eprintln!("ik solved {}/{}; planned {solved}/{}", plan_problems.len(), problems.len(), plan_problems.len());
     assert!(solved as f32 >= 0.8 * plan_problems.len() as f32);
 
     // Independent check: CPU model, 4x denser interpolation than the planner's validation.
     let substeps = o.validate_substeps * 4;
     let (mut dense, mut dense_world) = (vec![], vec![]);
-    for (p, prob) in plan_problems.iter().enumerate() {
-        let Some(tr) = result.best(p) else { continue };
+    for Solved { problem: prob, solution: tr, .. } in result.solved() {
         assert!(tr[..n].iter().zip(&prob.start).all(|(a, b)| a == b), "start moved");
         assert!(tr[tr.len() - n..].iter().zip(&prob.goal).all(|(a, b)| a == b), "goal moved");
         for t in 0..o.waypoints - 1 {
@@ -148,26 +142,49 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     assert!(worst > -2e-3, "trajectory penetrates by {worst}");
 }
 
+/// Trajectory-cost gradients recovered from one optimizer step. With a huge Adam epsilon a single
+/// step is plain gradient descent, moving each waypoint by `-(lr / epsilon) * gradient`, so
+/// `(seed - stepped) * epsilon / lr` is the gradient each device computed. Returns the gradients
+/// and a mask of values a joint limit clamped (those carry no gradient information).
+fn one_step_gradients(
+    d: &Device,
+    worlds: &[World],
+    problems: &[PlanProblem],
+    o: &PlanOptions,
+) -> (Vec<f32>, Vec<bool>) {
+    let (lr, eps) = (1e3, 1e7);
+    let seed = plan(d, worlds, problems, &PlanOptions { iterations: 0, ..*o }).unwrap().paths.positions;
+    let step = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..*o };
+    let stepped = plan(d, worlds, problems, &step).unwrap().paths.positions;
+    let robot = d.robot();
+    let n = robot.dof();
+    let clamped =
+        stepped.iter().enumerate().map(|(i, &q)| q <= robot.lower()[i % n] || q >= robot.upper()[i % n]).collect();
+    (seed.iter().zip(&stepped).map(|(a, b)| (a - b) * (eps / lr)).collect(), clamped)
+}
+
 #[test]
-fn trajopt_matches_cpu_statistically() {
+fn trajopt_gradients_match_cpu_element_wise() {
     let Some((robot, gpu, cpu)) = setup() else { return };
+    let n = robot.dof();
     let worlds = worlds(32, 8);
-    let problems = ik_problems(&worlds, 9);
-    let ik = solve_ik(&cpu, &worlds, &problems, &IkOptions::default()).unwrap();
-    let plan_problems: Vec<PlanProblem> = (0..problems.len())
-        .filter_map(|p| {
-            ik.best(p).map(|goal| PlanProblem {
-                world: p as u32,
-                start: robot.default_q().to_vec(),
-                goal: goal.to_vec(),
-            })
-        })
+    let ik = solve_ik(&cpu, &worlds, &ik_problems(&worlds, 9), &IkOptions::default()).unwrap();
+    let problems: Vec<PlanProblem> = ik
+        .solved()
+        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
         .collect();
     let o = PlanOptions::default();
-    let a = plan(&cpu, &worlds, &plan_problems, &o).unwrap();
-    let b = plan(&gpu, &worlds, &plan_problems, &o).unwrap();
-    let rate = |r: &PlanResult| r.valid.iter().filter(|&&v| v).count() as f32 / r.valid.len() as f32;
-    let max_diff = a.paths.positions.iter().zip(&b.paths.positions).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
-    eprintln!("seed validity cpu {:.3} gpu {:.3}; max waypoint difference {max_diff:.2e} rad", rate(&a), rate(&b));
-    assert!((rate(&a) - rate(&b)).abs() < 0.05);
+    let (a, clamped_a) = one_step_gradients(&cpu, &worlds, &problems, &o);
+    let (b, clamped_b) = one_step_gradients(&gpu, &worlds, &problems, &o);
+    let mut worst = 0.0f32;
+    for (w, (ga, gb)) in a.chunks(n).zip(b.chunks(n)).enumerate() {
+        if (0..n).any(|j| clamped_a[w * n + j] || clamped_b[w * n + j]) {
+            continue;
+        }
+        let norm = ga.iter().map(|v| v * v).sum::<f32>().sqrt().max(1.0);
+        let diff = ga.iter().zip(gb).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+        worst = worst.max(diff / norm);
+    }
+    eprintln!("worst per-waypoint |cpu-gpu| / |grad|: {worst:.2e}");
+    assert!(worst < 1e-2, "trajectory gradients differ by {worst} of their norm");
 }

@@ -10,6 +10,15 @@ pub struct Pose {
     pub rotation: Quat,
 }
 
+/// A problem that has a solution: its position in the batch, the problem itself and its best
+/// solution (a configuration for IK, a `[waypoints, dof]` path for planning).
+#[derive(Clone, Copy, Debug)]
+pub struct Solved<'a, P> {
+    pub index: usize,
+    pub problem: &'a P,
+    pub solution: &'a [f32],
+}
+
 /// A batch of joint-space paths with a shared waypoint count, row-major `[len, waypoints, dof]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JointPaths {

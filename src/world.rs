@@ -40,6 +40,7 @@ impl Obstacle {
     }
 }
 
+#[inline]
 pub(crate) fn sphere_distance(center: Vec3, radius: f32, p: Vec3) -> (f32, Vec3) {
     let v = p - center;
     let len = v.length();
@@ -47,6 +48,7 @@ pub(crate) fn sphere_distance(center: Vec3, radius: f32, p: Vec3) -> (f32, Vec3)
 }
 
 /// Must stay in sync with `obstacle_distance` in kernels.wgsl.
+#[inline]
 pub(crate) fn box_distance(r: Mat3, center: Vec3, half: Vec3, p: Vec3) -> (f32, Vec3) {
     let lp = r.transpose() * (p - center);
     let sgn = Vec3::select(lp.cmpge(Vec3::ZERO), Vec3::ONE, Vec3::NEG_ONE);

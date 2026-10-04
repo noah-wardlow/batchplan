@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use crate::device::{CollisionWeights, Device};
 use crate::rng::Rng;
 use crate::robot::Robot;
-use crate::types::JointPaths;
+use crate::types::{JointPaths, Solved};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +18,8 @@ pub struct PlanOptions {
     pub lr_decay: f32,
     pub beta1: f32,
     pub beta2: f32,
+    /// Adam's denominator offset; gradients far below it take proportionally small steps.
+    pub adam_epsilon: f32,
     /// Weight of squared waypoint accelerations.
     pub w_acc: f32,
     /// Weight of squared waypoint velocities (path length).
@@ -38,6 +40,7 @@ impl Default for PlanOptions {
             lr_decay: 0.99,
             beta1: 0.9,
             beta2: 0.999,
+            adam_epsilon: 1e-8,
             w_acc: 50.0,
             w_vel: 2.0,
             collision: CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 },
@@ -62,9 +65,10 @@ pub struct PlanProblem {
     pub goal: Vec<f32>,
 }
 
-/// Per-seed results; paths are problem-major (`item = problem * seeds + seed`).
+/// Per-seed results for `problems`; paths are problem-major (`item = problem * seeds + seed`).
 #[derive(Clone, Debug)]
 pub struct PlanResult {
+    pub problems: Vec<PlanProblem>,
     pub seeds: usize,
     pub paths: JointPaths,
     pub valid: Vec<bool>,
@@ -81,6 +85,14 @@ impl PlanResult {
             .filter(|&i| self.valid[i])
             .min_by(|&a, &b| self.length[a].total_cmp(&self.length[b]))
             .map(|i| self.paths.path(i))
+    }
+
+    /// Every problem with a valid seed, with its best path (`[waypoints, dof]`).
+    pub fn solved(&self) -> impl Iterator<Item = Solved<'_, PlanProblem>> {
+        self.problems
+            .iter()
+            .enumerate()
+            .filter_map(|(index, problem)| Some(Solved { index, problem, solution: self.best(index)? }))
     }
 }
 
@@ -100,7 +112,7 @@ pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &Pla
             item_world.push(p.world);
         }
     }
-    device.backend().trajopt(worlds, &item_world, &mut paths, o)?;
+    device.trajopt(worlds, &item_world, &mut paths, o)?;
 
     // Validate along the joint-space polyline (the path the retimer follows).
     let k = o.validate_substeps.max(1);
@@ -135,6 +147,7 @@ pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &Pla
         })
         .collect();
     Ok(PlanResult {
+        problems: problems.to_vec(),
         seeds: o.seeds,
         paths,
         valid: min_clearance.iter().map(|&c| c >= 0.0).collect(),

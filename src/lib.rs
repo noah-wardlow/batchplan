@@ -40,5 +40,5 @@ pub use device::{CollisionWeights, Device, Evaluation};
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
 pub use robot::Robot;
 pub use trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
-pub use types::{JointPaths, JointTrajectory, Pose};
+pub use types::{JointPaths, JointTrajectory, Pose, Solved};
 pub use world::{Obstacle, World};

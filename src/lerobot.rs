@@ -264,10 +264,8 @@ fn episode_columns(
     action.extend_from_slice(&traj.positions[(frames - 1) * n..]);
     let env = environment_state(world, demo, max_obstacles);
     let env_width = env.len();
-    let (is_recovery, parent) = match demo.origin {
-        Origin::Nominal => (0, -1),
-        Origin::Recovery { parent, .. } => (1, parent as i64),
-    };
+    let (is_recovery, parent) =
+        (i64::from(demo.origin.parent().is_some()), demo.origin.parent().map_or(-1, |p| p as i64));
     let joint_names = Some(robot.joint_names().to_vec());
     let per_frame = |v: i64| vec![v; frames];
     vec![

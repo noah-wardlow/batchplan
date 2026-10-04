@@ -337,7 +337,7 @@ impl Backend for CpuBackend {
                         let g = grad[i];
                         m[i] = o.beta1 * m[i] + (1.0 - o.beta1) * g;
                         v[i] = o.beta2 * v[i] + (1.0 - o.beta2) * g * g;
-                        let step = lr * (m[i] / bc1) / ((v[i] / bc2).sqrt() + 1e-8);
+                        let step = lr * (m[i] / bc1) / ((v[i] / bc2).sqrt() + o.adam_epsilon);
                         tr[i] = (tr[i] - step).clamp(self.robot.lower[j], self.robot.upper[j]);
                     }
                 }

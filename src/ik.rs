@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 
 use crate::device::{CollisionWeights, Device};
 use crate::rng::Rng;
-use crate::types::Pose;
+use crate::types::{Pose, Solved};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
@@ -49,9 +49,10 @@ pub struct IkProblem {
     pub target: Pose,
 }
 
-/// Per-seed results; items are problem-major (`item = problem * seeds + seed`).
+/// Per-seed results for `problems`; items are problem-major (`item = problem * seeds + seed`).
 #[derive(Clone, Debug)]
 pub struct IkResult {
+    pub problems: Vec<IkProblem>,
     pub dof: usize,
     pub seeds: usize,
     /// `[problems, seeds, dof]`.
@@ -74,6 +75,14 @@ impl IkResult {
             .filter(|&i| self.success[i])
             .max_by(|&a, &b| self.world_clearance[a].total_cmp(&self.world_clearance[b]))
             .map(|i| self.solution(i))
+    }
+
+    /// Every problem with a successful seed, with its best configuration.
+    pub fn solved(&self) -> impl Iterator<Item = Solved<'_, IkProblem>> {
+        self.problems
+            .iter()
+            .enumerate()
+            .filter_map(|(index, problem)| Some(Solved { index, problem, solution: self.best(index)? }))
     }
 }
 
@@ -98,12 +107,13 @@ pub fn solve_ik(device: &Device, worlds: &[World], problems: &[IkProblem], o: &I
             targets.push(p.target);
         }
     }
-    let err = device.backend().ik(worlds, &item_world, &targets, &mut q, o)?;
+    let err = device.ik(worlds, &item_world, &targets, &mut q, o)?;
     let eval = device.evaluate(worlds, &item_world, &q, &CollisionWeights::NONE)?;
     let success = (0..items)
         .map(|i| err[i][0] < o.position_tolerance && err[i][1] < o.rotation_tolerance && eval.collision_free(i))
         .collect();
     Ok(IkResult {
+        problems: problems.to_vec(),
         dof: n,
         seeds: o.seeds,
         q,

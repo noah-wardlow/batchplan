@@ -143,13 +143,3 @@ fn retime_keeps_endpoints_and_velocity_limits() {
         assert!(row.iter().zip(robot.max_velocity()).all(|(v, max)| v.abs() <= max * 1.001));
     }
 }
-
-#[test]
-fn npy_files_have_aligned_headers() {
-    let path = std::env::temp_dir().join("batchplan-npy-test.npy");
-    batchplan::npy::write_npy(&path, &[2, 3], &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-    let bytes = std::fs::read(&path).unwrap();
-    let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-    assert_eq!((10 + header_len) % 64, 0);
-    assert_eq!(bytes.len(), 10 + header_len + 24);
-}

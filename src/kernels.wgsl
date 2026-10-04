@@ -1,28 +1,7 @@
 // Batched kinematics, collision cost/gradient, IK and trajectory optimization.
-// Mirrors src/cpu.rs function for function. MAX_DOF, MAX_LINKS and MAX_SPHERES are
-// prepended by gpu.rs from the Rust constants.
-
-struct Params {
-    n_dof: u32, n_links: u32, n_spheres: u32, n_pairs: u32,
-    ee_link: u32, n_items: u32, waypoints: u32, iterations: u32,
-    w_world: f32, w_self: f32, margin: f32, self_margin: f32,
-    w_acc: f32, w_vel: f32, beta1: f32, beta2: f32,
-    damping: f32, rot_weight: f32, max_step: f32, collision_step: f32,
-}
-
-struct Link {
-    c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>,  // origin rotation columns
-    trans: vec4<f32>,
-    axis: vec4<f32>,
-    parent: i32, kind: u32, dof: u32, mask: u32,  // kind: 0 fixed, 1 revolute, 2 prismatic
-}
-
-struct Sphere { c: vec4<f32>, link: u32, self_buf: f32, pad0: u32, pad1: u32 }
-
-// center.w: 0 = cuboid, 1 = sphere (radius in half.x). r0..r2: world-from-box rotation columns.
-struct Obstacle { center: vec4<f32>, half: vec4<f32>, r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32> }
-
-struct Iter { lr: f32, bc1: f32, bc2: f32, pad: f32 }
+// Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (MAX_DOF, MAX_LINKS,
+// MAX_SPHERES, JAC_LEN) and the shared structs (Params, Link, Sphere, Obstacle, Iter), generated
+// from their Rust definitions so the two sides cannot drift apart.
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> links: array<Link>;
@@ -457,7 +436,7 @@ fn traj_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let v = P.beta2 * aux[2u * total + i] + (1.0 - P.beta2) * g * g;
         aux[total + i] = m;
         aux[2u * total + i] = v;
-        let step = IT.lr * (m / IT.bc1) / (sqrt(v / IT.bc2) + 1e-8);
+        let step = IT.lr * (m / IT.bc1) / (sqrt(v / IT.bc2) + IT.eps);
         let lim = limits[j];
         qbuf[i] = clamp(qbuf[i] - step, lim.x, lim.y);
     }

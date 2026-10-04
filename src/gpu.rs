@@ -23,71 +23,59 @@ const EVAL_CHUNK: usize = 1 << 18;
 const IK_ITERS_PER_SUBMIT: u32 = 16;
 const TRAJ_ITERS_PER_SUBMIT: u32 = 25;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuParams {
-    n_dof: u32,
-    n_links: u32,
-    n_spheres: u32,
-    n_pairs: u32,
-    ee_link: u32,
-    n_items: u32,
-    waypoints: u32,
-    iterations: u32,
-    w_world: f32,
-    w_self: f32,
-    margin: f32,
-    self_margin: f32,
-    w_acc: f32,
-    w_vel: f32,
-    beta1: f32,
-    beta2: f32,
-    damping: f32,
-    rot_weight: f32,
-    max_step: f32,
-    collision_step: f32,
+/// A `vec4<f32>` on the shader side.
+type Vec4 = [f32; 4];
+
+/// Declares a struct shared with the kernels once: the `#[repr(C)]` Rust struct and its WGSL
+/// declaration come from the same field list, so host and shader layouts cannot drift apart.
+/// Field types must also be WGSL type names (`u32`, `i32`, `f32` or `Vec4`).
+macro_rules! shader_struct {
+    ($(#[$doc:meta])* $rust:ident => $wgsl:ident { $($field:ident: $ty:ident),* $(,)? }) => {
+        $(#[$doc])*
+        #[repr(C)]
+        #[derive(Clone, Copy, Default, Pod, Zeroable)]
+        struct $rust {
+            $($field: $ty),*
+        }
+
+        impl $rust {
+            const WGSL: &'static str =
+                concat!("struct ", stringify!($wgsl), " {\n", $("    ", stringify!($field), ": ", stringify!($ty), ",\n",)* "}\n");
+        }
+    };
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuLink {
-    c0: [f32; 4],
-    c1: [f32; 4],
-    c2: [f32; 4],
-    trans: [f32; 4],
-    axis: [f32; 4],
-    parent: i32,
-    kind: u32,
-    dof: u32,
-    mask: u32,
+shader_struct! {
+    /// Per-call constants (`P` in kernels.wgsl).
+    GpuParams => Params {
+        n_dof: u32, n_links: u32, n_spheres: u32, n_pairs: u32,
+        ee_link: u32, n_items: u32, waypoints: u32, iterations: u32,
+        w_world: f32, w_self: f32, margin: f32, self_margin: f32,
+        w_acc: f32, w_vel: f32, beta1: f32, beta2: f32,
+        damping: f32, rot_weight: f32, max_step: f32, collision_step: f32,
+    }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuSphere {
-    c: [f32; 4],
-    link: u32,
-    self_buf: f32,
-    pad: [u32; 2],
+shader_struct! {
+    /// One kinematic link: joint origin rotation columns and translation, joint axis, and
+    /// `kind` 0 fixed / 1 revolute / 2 prismatic.
+    GpuLink => Link { c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, parent: i32, kind: u32, dof: u32, mask: u32 }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuObstacle {
-    center: [f32; 4],
-    half: [f32; 4],
-    r0: [f32; 4],
-    r1: [f32; 4],
-    r2: [f32; 4],
+shader_struct! {
+    /// Collision sphere: center xyz and radius in `c`.
+    GpuSphere => Sphere { c: Vec4, link: u32, self_buf: f32, pad0: u32, pad1: u32 }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuIter {
-    lr: f32,
-    bc1: f32,
-    bc2: f32,
-    pad: f32,
+shader_struct! {
+    /// `center.w` is 0 for a cuboid and 1 for a sphere (radius in `half.x`); r0..r2 are the
+    /// world-from-box rotation columns.
+    GpuObstacle => Obstacle { center: Vec4, half: Vec4, r0: Vec4, r1: Vec4, r2: Vec4 }
+}
+
+shader_struct! {
+    /// Adam schedule for one trajopt iteration (`IT` in kernels.wgsl).
+    GpuIter => Iter { lr: f32, bc1: f32, bc2: f32, eps: f32 }
 }
 
 fn v4(v: glam::Vec3, w: f32) -> [f32; 4] {
@@ -176,11 +164,19 @@ impl GpuBackend {
         }))
         .context("requesting GPU device")?;
 
-        let source = format!(
-            "const MAX_DOF: u32 = {MAX_DOF}u;\nconst MAX_LINKS: u32 = {MAX_LINKS}u;\nconst MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n{}",
-            6 * MAX_DOF,
-            include_str!("kernels.wgsl")
-        );
+        // Constants and shared structs are generated from their Rust definitions.
+        let source = [
+            "alias Vec4 = vec4<f32>;\n",
+            &format!("const MAX_DOF: u32 = {MAX_DOF}u;\nconst MAX_LINKS: u32 = {MAX_LINKS}u;\n"),
+            &format!("const MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * MAX_DOF),
+            GpuParams::WGSL,
+            GpuLink::WGSL,
+            GpuSphere::WGSL,
+            GpuObstacle::WGSL,
+            GpuIter::WGSL,
+            include_str!("kernels.wgsl"),
+        ]
+        .concat();
         // Turn shader and pipeline validation failures into errors instead of panics.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -257,17 +253,22 @@ impl GpuBackend {
         let gpu_spheres: Vec<GpuSphere> = robot
             .spheres
             .iter()
-            .map(|s| GpuSphere { c: v4(s.center, s.radius), link: s.link as u32, self_buf: s.self_buffer, pad: [0; 2] })
+            .map(|s| GpuSphere {
+                c: v4(s.center, s.radius),
+                link: s.link as u32,
+                self_buf: s.self_buffer,
+                ..Default::default()
+            })
             .collect();
         let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
 
         Ok(Self {
             robot: robot.clone(),
             info,
-            links: storage_init(&device, "links", bytemuck::cast_slice(&gpu_links)),
-            spheres: storage_init(&device, "spheres", bytemuck::cast_slice(&gpu_spheres)),
-            pairs: storage_init(&device, "pairs", bytemuck::cast_slice(&robot.self_pairs)),
-            limits: storage_init(&device, "limits", bytemuck::cast_slice(&gpu_limits)),
+            links: storage(&device, "links", &gpu_links),
+            spheres: storage(&device, "spheres", &gpu_spheres),
+            pairs: storage(&device, "pairs", &robot.self_pairs),
+            limits: storage(&device, "limits", &gpu_limits),
             uniform_align: u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(16),
             device,
             queue,
@@ -288,20 +289,11 @@ impl GpuBackend {
             n_pairs: self.robot.self_pairs.len() as u32,
             ee_link: self.robot.ee_link as u32,
             n_items: n_items as u32,
-            waypoints: 0,
-            iterations: 0,
             w_world: w.world,
             w_self: w.self_collision,
             margin: w.margin,
             self_margin: w.self_margin,
-            w_acc: 0.0,
-            w_vel: 0.0,
-            beta1: 0.0,
-            beta2: 0.0,
-            damping: 0.0,
-            rot_weight: 0.0,
-            max_step: 0.0,
-            collision_step: 0.0,
+            ..Default::default()
         }
     }
 
@@ -326,10 +318,7 @@ impl GpuBackend {
                 }
             }));
         }
-        (
-            storage_init(&self.device, "obstacles", bytemuck::cast_slice(&obstacles)),
-            storage_init(&self.device, "world ranges", bytemuck::cast_slice(&ranges)),
-        )
+        (storage(&self.device, "obstacles", &obstacles), storage(&self.device, "world ranges", &ranges))
     }
 
     fn uniform(&self, params: &GpuParams) -> wgpu::Buffer {
@@ -409,10 +398,10 @@ impl GpuBackend {
         let stride = 3 + self.robot.dof();
         let params = self.uniform(&self.params(items, w));
         let (obstacles, ranges) = self.world_buffers(worlds);
-        let world_buf = storage_init(&self.device, "item world", bytemuck::cast_slice(item_world));
-        let no_targets = storage_init(&self.device, "unused targets", &[]);
-        let no_aux = storage_init(&self.device, "unused aux", &[]);
-        let q_buf = storage_init(&self.device, "q", bytemuck::cast_slice(q));
+        let world_buf = storage(&self.device, "item world", item_world);
+        let no_targets = storage::<[f32; 4]>(&self.device, "unused targets", &[]);
+        let no_aux = storage::<f32>(&self.device, "unused aux", &[]);
+        let q_buf = storage(&self.device, "q", q);
         let out = storage_zeroed(&self.device, "out", items * stride);
         let bg = self.bind_main(&CallBuffers {
             params: &params,
@@ -477,7 +466,7 @@ impl Backend for GpuBackend {
         params.collision_step = o.collision_step;
         let params_buf = self.uniform(&params);
         let (obstacles, ranges) = self.world_buffers(worlds);
-        let world_buf = storage_init(&self.device, "item world", bytemuck::cast_slice(item_world));
+        let world_buf = storage(&self.device, "item world", item_world);
         let target_data: Vec<[f32; 4]> = targets
             .iter()
             .flat_map(|t| {
@@ -485,9 +474,9 @@ impl Backend for GpuBackend {
                 [v4(t.position, 0.0), v4(r.x_axis, 0.0), v4(r.y_axis, 0.0), v4(r.z_axis, 0.0)]
             })
             .collect();
-        let target_buf = storage_init(&self.device, "targets", bytemuck::cast_slice(&target_data));
-        let dummy = storage_init(&self.device, "unused", &[]);
-        let q_buf = storage_init(&self.device, "q", bytemuck::cast_slice(q));
+        let target_buf = storage(&self.device, "targets", &target_data);
+        let dummy = storage::<f32>(&self.device, "unused", &[]);
+        let q_buf = storage(&self.device, "q", q);
         let out = storage_zeroed(&self.device, "ik errors", items * 2);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
@@ -537,11 +526,11 @@ impl Backend for GpuBackend {
         params.beta2 = o.beta2;
         let params_buf = self.uniform(&params);
         let (obstacles, ranges) = self.world_buffers(worlds);
-        let world_buf = storage_init(&self.device, "item world", bytemuck::cast_slice(item_world));
-        let dummy = storage_init(&self.device, "unused", &[]);
-        let q_buf = storage_init(&self.device, "trajectories", bytemuck::cast_slice(traj));
+        let world_buf = storage(&self.device, "item world", item_world);
+        let dummy = storage::<f32>(&self.device, "unused", &[]);
+        let q_buf = storage(&self.device, "trajectories", traj);
         let aux = storage_zeroed(&self.device, "adam state", traj.len() * 3);
-        let out = storage_init(&self.device, "unused out", &[]);
+        let out = storage::<f32>(&self.device, "unused out", &[]);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
             obstacles: &obstacles,
@@ -556,7 +545,7 @@ impl Backend for GpuBackend {
         let mut schedule = vec![0u8; align * o.iterations as usize];
         for k in 0..o.iterations {
             let [lr, bc1, bc2] = o.schedule(k);
-            let it = GpuIter { lr, bc1, bc2, pad: 0.0 };
+            let it = GpuIter { lr, bc1, bc2, eps: o.adam_epsilon };
             schedule[k as usize * align..k as usize * align + 16].copy_from_slice(bytemuck::bytes_of(&it));
         }
         let iter_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -626,13 +615,14 @@ fn dispatch(pass: &mut wgpu::ComputePass, threads: usize) {
     pass.dispatch_workgroups(x, groups.div_ceil(x), 1);
 }
 
-/// Storage buffers must not be empty; pad tiny ones.
-fn storage_init(device: &wgpu::Device, label: &str, bytes: &[u8]) -> wgpu::Buffer {
-    let mut data = bytes.to_vec();
-    data.resize(data.len().max(16), 0);
+/// A storage buffer holding `data`, padded to at least one element: WGSL requires a binding to
+/// hold one element of its array type even when the batch has none (e.g. a world with no obstacles).
+fn storage<T: Pod>(device: &wgpu::Device, label: &str, data: &[T]) -> wgpu::Buffer {
+    let mut bytes = bytemuck::cast_slice(data).to_vec();
+    bytes.resize(bytes.len().max(std::mem::size_of::<T>()).max(16), 0);
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
-        contents: &data,
+        contents: &bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     })
 }

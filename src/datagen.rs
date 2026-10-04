@@ -8,7 +8,7 @@ use crate::ik::{IkOptions, IkProblem, solve_ik};
 use crate::rng::Rng;
 use crate::timing::{RetimeOptions, retime};
 use crate::trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
-use crate::types::{JointTrajectory, Pose};
+use crate::types::{JointTrajectory, Pose, Solved};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
@@ -30,7 +30,7 @@ impl Default for RecoveryOptions {
 /// A planning problem that starts from a perturbed state of a planned path.
 #[derive(Clone, Debug)]
 pub struct Recovery {
-    /// Index of the nominal problem whose best path was perturbed.
+    /// Index in `result.problems` of the problem whose best path was perturbed.
     pub parent: usize,
     /// Fraction of the nominal path where the perturbation happened.
     pub phase: f32,
@@ -43,7 +43,6 @@ pub struct Recovery {
 pub fn recovery_problems(
     device: &Device,
     worlds: &[World],
-    problems: &[PlanProblem],
     result: &PlanResult,
     o: &RecoveryOptions,
 ) -> Result<Vec<Recovery>> {
@@ -52,8 +51,7 @@ pub fn recovery_problems(
     let last = result.paths.waypoints - 1;
     let mut rng = Rng::new(o.rng_seed);
     let mut candidates = vec![];
-    for (parent, problem) in problems.iter().enumerate() {
-        let Some(path) = result.best(parent) else { continue };
+    for Solved { index: parent, problem, solution: path } in result.solved() {
         for _ in 0..o.per_trajectory {
             let phase = rng.range(o.phase.0, o.phase.1);
             let x = phase * last as f32;
@@ -84,6 +82,16 @@ pub enum Origin {
         parent: usize,
         phase: f32,
     },
+}
+
+impl Origin {
+    /// The demonstration a recovery branches from; `None` for nominal demonstrations.
+    pub fn parent(&self) -> Option<usize> {
+        match *self {
+            Origin::Nominal => None,
+            Origin::Recovery { parent, .. } => Some(parent),
+        }
+    }
 }
 
 /// One time-parameterized reach toward `goal` in `worlds[world]`.
@@ -151,14 +159,16 @@ pub fn demonstrations(
     for g in (0..goals.len()).filter(|&g| !start_eval.collision_free(g)) {
         starts[g * n..(g + 1) * n].copy_from_slice(&robot.default_q);
     }
-    let (goal_of_problem, problems): (Vec<usize>, Vec<PlanProblem>) = (0..goals.len())
-        .filter_map(|g| {
-            let goal = ik.best(g)?.to_vec();
-            Some((g, PlanProblem { world: goals[g].world, start: starts[g * n..(g + 1) * n].to_vec(), goal }))
+    // Nominal plan problem p reaches the target of IK problem goal_of[p].
+    let (goal_of, problems): (Vec<usize>, Vec<PlanProblem>) = ik
+        .solved()
+        .map(|s| {
+            let start = starts[s.index * n..(s.index + 1) * n].to_vec();
+            (s.index, PlanProblem { world: s.problem.world, start, goal: s.solution.to_vec() })
         })
         .unzip();
     let nominal = plan(device, worlds, &problems, &o.plan)?;
-    let recoveries = recovery_problems(device, worlds, &problems, &nominal, &o.recovery)?;
+    let recoveries = recovery_problems(device, worlds, &nominal, &o.recovery)?;
     let recovery_plans: Vec<PlanProblem> = recoveries.iter().map(|r| r.problem.clone()).collect();
     let recovered = plan(device, worlds, &recovery_plans, &o.plan)?;
 
@@ -167,28 +177,27 @@ pub fn demonstrations(
         retime(robot, path, &RetimeOptions { max_acceleration: o.max_acceleration, speed_scale, dt: o.dt })
     };
     let mut demos = vec![];
-    let mut demo_of_problem = vec![None; problems.len()];
-    for (p, problem) in problems.iter().enumerate() {
-        if let Some(path) = nominal.best(p) {
-            demo_of_problem[p] = Some(demos.len());
-            let goal = goals[goal_of_problem[p]].target;
-            demos.push(Demonstration {
-                origin: Origin::Nominal,
-                world: problem.world,
-                goal,
-                trajectory: retimed(path),
-            });
-        }
+    // Demonstration index of each solved nominal problem, for recovery parents.
+    let mut demo_of = vec![usize::MAX; problems.len()];
+    for s in nominal.solved() {
+        demo_of[s.index] = demos.len();
+        let goal = goals[goal_of[s.index]].target;
+        demos.push(Demonstration {
+            origin: Origin::Nominal,
+            world: s.problem.world,
+            goal,
+            trajectory: retimed(s.solution),
+        });
     }
-    for (r, rec) in recoveries.iter().enumerate() {
-        if let (Some(path), Some(parent)) = (recovered.best(r), demo_of_problem[rec.parent]) {
-            demos.push(Demonstration {
-                origin: Origin::Recovery { parent, phase: rec.phase },
-                world: rec.problem.world,
-                goal: demos[parent].goal,
-                trajectory: retimed(path),
-            });
-        }
+    for s in recovered.solved() {
+        let rec = &recoveries[s.index];
+        let parent = demo_of[rec.parent];
+        demos.push(Demonstration {
+            origin: Origin::Recovery { parent, phase: rec.phase },
+            world: s.problem.world,
+            goal: demos[parent].goal,
+            trajectory: retimed(s.solution),
+        });
     }
     Ok(demos)
 }

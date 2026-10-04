@@ -22,18 +22,20 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 
 | Module | Interface | Behind it |
 |---|---|---|
-| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.evaluate(..)` | Robot uploaded once. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. |
-| `ik` | `solve_ik(&device, &worlds, &problems, &IkOptions)` | Many seeds per target. Damped least squares, with the collision gradient projected into the Jacobian null space. Success = pose tolerance + collision-free. |
-| `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal. Adam on collision + smoothness cost, then validation by dense interpolation. `best()` picks the shortest valid seed. |
+| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.evaluate(..)` | Robot uploaded once. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices), so malformed input is an `Err` on both devices. |
+| `ik` | `solve_ik(&device, &worlds, &problems, &IkOptions)` | Many seeds per target. Damped least squares, with the collision gradient projected into the Jacobian null space. Success = pose tolerance + collision-free. The result keeps its problems; `ik.solved()` yields each one with its best configuration. |
+| `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal. Adam on collision + smoothness cost, then validation by dense interpolation. `result.solved()` yields each problem with its shortest valid path. |
 | `timing` | `retime(&robot, path, &RetimeOptions)` | Minimum-jerk (bell-shaped velocity) timing within the robot's velocity limits and an acceleration limit. |
-| `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(..)` exposes the recovery step on its own. |
+| `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
+| `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
-| `robot`, `world`, `types` | `Robot::from_config_file`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory` | URDF + collision-sphere config. Box and sphere obstacles. Shared data types with documented row-major shapes. |
+| `robot`, `world`, `types` | `Robot::from_config_file`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | URDF + collision-sphere config. Box and sphere obstacles. Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
 - **One handle, two implementations.** `Device` is the only way to run batched work. The CPU and GPU implementations sit behind a crate-private trait and are tested against each other through `Device`.
 - **Separate algorithms over shared types.** There are no planner plugins and no runtime configuration. Algorithms are plain functions over a `Device` and the shared data types, and they own seeding, validation and selection. That way both devices see identical inputs.
+- **Shared structs declared once.** Every struct passed to the GPU (parameters, links, spheres, obstacles, the Adam schedule) is declared once in Rust, and its WGSL declaration is generated from the same field list. The two sides can't drift apart.
 - **Standalone.** No middleware.
 
 ## Quick start
@@ -52,52 +54,57 @@ use batchplan::*;
 let robot = Robot::from_config_file("assets/franka/panda.json")?;
 let device = Device::gpu(&robot)?;
 let ik = solve_ik(&device, &worlds, &ik_problems, &IkOptions::default())?;
-let problems: Vec<PlanProblem> = (0..ik_problems.len())
-    .filter_map(|p| ik.best(p).map(|goal| PlanProblem { world: p as u32, start: robot.default_q().to_vec(), goal: goal.to_vec() }))
+// Each solved IK problem carries its world, so the handoff can't mix up worlds.
+let problems: Vec<PlanProblem> = ik
+    .solved()
+    .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
     .collect();
 let result = plan(&device, &worlds, &problems, &PlanOptions::default())?;
+for s in result.solved() { /* s.problem, s.solution: [waypoints, dof] path */ }
 ```
 
 ## Results
 
-All numbers are from a Framework Desktop: Ryzen AI Max+ 395 (16 cores / 32 threads), Radeon 8060S, Ubuntu 26.04, Mesa 26.0.3 RADV, no ROCm.
-
-`bench -- 512` uses 512 random worlds, each a table plus 2–6 boxes. Each world gets a top-down grasp target.
+`bench -- 512` uses 512 random worlds, each a table plus 2–6 boxes, with one top-down grasp target per world:
 - **IK:** 32 seeds × 60 iterations per target.
 - **Planning:** 8 seeds × 32 waypoints × 200 Adam iterations from the default pose.
 
-| Device | IK | Planning | Solved | End-to-end |
+Every device solves the same 484 of 512 IK targets and plans all 484, except the Framework's and the T4 machine's CPU runs, which each missed one plan.
+
+| Machine | GPU | GPU end-to-end | CPU end-to-end | GPU speedup |
 |---|---|---|---|---|
-| Radeon 8060S (Vulkan, RADV) | 0.062 s (263k seeds/s) | 1.13 s (3.4k seeds/s) | 484/484 IK goals planned | **406 problems/s** |
-| CPU, 32 threads (rayon) | 0.257 s | 5.49 s | 483/484 | 84 problems/s |
-| CPU via llvmpipe (same WGSL), 128 worlds | 0.134 s | 2.79 s | 123/123 | 42 problems/s |
+| Framework Desktop (Ryzen AI Max+ 395) | AMD Radeon 8060S, Mesa RADV (Vulkan) | **406 problems/s** | 84 problems/s (32 threads) | 4.8× |
+| MacBook (Apple M4 Pro) | Apple M4 Pro, 20 cores (Metal) | **233 problems/s** | 86 problems/s (14 threads) | 2.7× |
+| AWS g4dn.xlarge | NVIDIA Tesla T4, driver 595.91 (Vulkan) | **209 problems/s** | 4 problems/s (4 vCPUs) | 52× |
 
-The same benchmark on a MacBook with an Apple M4 Pro (20-core GPU, 14 CPU cores):
+GPU time per phase:
 
-| Device | IK | Planning | Solved | End-to-end |
-|---|---|---|---|---|
-| Apple M4 Pro (Metal) | 0.080 s | 2.00 s | 484/484 | **233 problems/s** |
-| CPU, 14 threads (rayon) | 0.242 s | 5.39 s | 484/484 | 86 problems/s |
+| GPU | IK (16,384 seeds) | Planning (3,872 seeds) |
+|---|---|---|
+| Radeon 8060S | 0.062 s | 1.13 s |
+| M4 Pro | 0.080 s | 2.00 s |
+| Tesla T4 | 0.115 s | 2.20 s |
+| Mesa llvmpipe: the same WGSL on the Framework's CPU, 128 worlds | 0.134 s | 2.79 s (42 problems/s end-to-end) |
 
-The same benchmark on an AWS g4dn.xlarge (NVIDIA Tesla T4, 4 vCPUs):
+All three machines were measured at commit `950e06c` on otherwise idle machines. Alternating runs on the M4 Pro show the current code within noise of that commit on both GPU and CPU. One thing those runs caught: hot functions the CPU backend calls across modules are marked `#[inline]`. Without it, the CPU path lost 15–20% whenever unrelated code changed how the compiler split the crate.
 
-| Device | IK | Planning | Solved | End-to-end |
-|---|---|---|---|---|
-| Tesla T4 (Vulkan) | 0.115 s | 2.20 s | 484/484 | **209 problems/s** |
-| CPU, 4 threads (rayon) | 5.01 s | 115.8 s | 483/484 | 4 problems/s |
-
-`datagen -- data/demo 512 20` produced 481 nominal and 932 recovery episodes from 512 worlds on the Framework, in about 3 s of planning. Peak joint speed reaches 0.99 of the limit, and recovery starts sit a median 0.35 rad off the nominal path.
+`datagen -- data/demo 512 20` produced 481 nominal and 932 recovery episodes from 512 worlds on the Framework, in about 3.3 s of planning. Peak joint speed reaches 0.99 of the limit, and recovery starts sit a median 0.35 rad off the nominal path.
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 14 tests and passes on the Framework (Radeon, Vulkan), the Mac (M4 Pro, Metal) and an NVIDIA T4 (Vulkan). `--features lerobot` adds 2 export tests:
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 18 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
-- **Gradients:** analytic collision gradients match finite differences.
-- **CPU IK:** solves targets taken from collision-free configurations.
-- **Retiming:** respects velocity limits and keeps the endpoints.
+- **Collision gradients:** analytic gradients match finite differences.
+- **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
 - **GPU vs CPU, 20,000 configurations:** clearances agree to 3e-7 m, and gradients agree to 3e-4 relative.
 - **GPU vs CPU IK:** the two agree on all 2,048 seeds.
 - **GPU plans under an independent check:** every GPU plan reported valid was re-checked on the CPU at 4× denser interpolation. None penetrates; the worst clearance is +0.1 mm.
+- **Every device behaves the same:**
+  - Malformed batches (wrong array lengths, a world index past the end) are an `Err` on both CPU and GPU.
+  - Obstacle-free worlds plan on both.
+  - Plans keep the worlds of their problems when one world holds several targets.
+- **CPU IK and retiming:** IK solves targets taken from collision-free configurations; retiming respects velocity limits and keeps the endpoints.
+- **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
 - **Adapter errors:** adapters below the required limits are rejected with the reason, and an unknown adapter name is a clear error.
 
 ## Training data
@@ -108,9 +115,9 @@ The same benchmark on an AWS g4dn.xlarge (NVIDIA Tesla T4, 4 vCPUs):
 3. **Plan recoveries:** perturb each solved path partway along it (20–80% by default), keep the collision-free perturbed states, and replan from them to the same goal. These are the recovery examples that raw planner data lacks.
 4. **Retime:** apply a minimum-jerk (bell-shaped velocity) profile with a randomized speed scale, sampled at a fixed `dt`.
 
-Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, goal pose and timed trajectory. `examples/datagen.rs` writes demonstrations in one of two formats.
+Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, goal pose and timed trajectory. Two exporters write them, `npy::export` and `lerobot::export`. `examples/datagen.rs` uses one or the other. Generated from the same worlds, the two formats hold identical trajectories, labels, worlds and goals.
 
-### Plain arrays (default)
+### Plain arrays (`npy::export`, default)
 
 | File | Contents |
 |---|---|
@@ -136,13 +143,13 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 `meta/batchplan.json` adds the worlds, the environment-state layout and each episode's origin. There are no camera features: the data is state-only until rendering is added.
 
-`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). On a 712-episode export, every check passed:
+`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). On the 512-world export (1,413 episodes, 57,650 frames), every check passed:
 - **Loading:** episodes, frames and the task string load as written.
 - **Episodes:** boundaries are correct, and `action` is the next frame's state.
 - **Labels and stats:** recovery labels match `meta/batchplan.json`, and the normalization stats match the data.
 - **Action chunks:** chunks are padded correctly at episode ends.
 
-`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. A 50-step CPU run cut the loss from 45.6 to 5.9.
+`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. On the same export, a 50-step CPU run cut the loss from 46.7 to 5.8.
 
 ## Limits of the MVP
 

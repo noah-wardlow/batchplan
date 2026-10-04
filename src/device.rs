@@ -3,8 +3,10 @@
 //!
 //! The CPU and GPU implementations sit behind a crate-private `Backend` trait and are kept
 //! numerically interchangeable, so code written against a `Device` runs unchanged on either.
+//! Every batch is checked here before it reaches either one, so malformed input is an `Err` on
+//! both rather than a panic on one and a plausible wrong answer on the other.
 
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 
 use crate::cpu::CpuBackend;
 use crate::gpu::GpuBackend;
@@ -77,7 +79,8 @@ impl Device {
     }
 
     /// Collision cost, its gradient and clearances for each configuration in `q` (`[items, dof]`)
-    /// against `worlds[item_world[item]]`.
+    /// against `worlds[item_world[item]]`. Errors if `q` does not hold `dof` values per item or an
+    /// item names a world outside `worlds`.
     pub fn evaluate(
         &self,
         worlds: &[World],
@@ -85,12 +88,54 @@ impl Device {
         q: &[f32],
         w: &CollisionWeights,
     ) -> Result<Evaluation> {
+        check_batch(worlds, item_world, q.len(), self.robot().dof())?;
         self.backend.evaluate(worlds, item_world, q, w)
     }
 
-    pub(crate) fn backend(&self) -> &dyn Backend {
-        self.backend.as_ref()
+    pub(crate) fn ik(
+        &self,
+        worlds: &[World],
+        item_world: &[u32],
+        targets: &[Pose],
+        q: &mut [f32],
+        o: &IkOptions,
+    ) -> Result<Vec<[f32; 2]>> {
+        check_batch(worlds, item_world, q.len(), self.robot().dof())?;
+        ensure!(targets.len() == item_world.len(), "{} IK targets for {} items", targets.len(), item_world.len());
+        self.backend.ik(worlds, item_world, targets, q, o)
     }
+
+    pub(crate) fn trajopt(
+        &self,
+        worlds: &[World],
+        item_world: &[u32],
+        paths: &mut JointPaths,
+        o: &PlanOptions,
+    ) -> Result<()> {
+        ensure!(
+            paths.dof == self.robot().dof(),
+            "paths have {} joints, the robot has {}",
+            paths.dof,
+            self.robot().dof()
+        );
+        ensure!(paths.waypoints >= 3, "paths need at least 3 waypoints");
+        check_batch(worlds, item_world, paths.positions.len(), paths.waypoints * paths.dof)?;
+        self.backend.trajopt(worlds, item_world, paths, o)
+    }
+}
+
+/// The shape and index invariants every batch must satisfy before it reaches a backend.
+fn check_batch(worlds: &[World], item_world: &[u32], values: usize, per_item: usize) -> Result<()> {
+    let items = item_world.len();
+    ensure!(
+        values == items * per_item,
+        "{items} items need {} values ({per_item} each), got {values}",
+        items * per_item
+    );
+    if let Some((item, &world)) = item_world.iter().enumerate().find(|&(_, &w)| w as usize >= worlds.len()) {
+        bail!("item {item} references world {world}, but only {} worlds were given", worlds.len());
+    }
+    Ok(())
 }
 
 /// The parallel inner loops each device implements. Algorithm modules own seeding, validation

@@ -111,6 +111,7 @@ pub(crate) struct Fk {
 
 impl Fk {
     /// Derivative of a point rigidly attached downstream of joint `dof`.
+    #[inline]
     pub(crate) fn dpoint(&self, dof: usize, p: Vec3) -> Vec3 {
         if self.prismatic >> dof & 1 == 1 { self.axis[dof] } else { self.axis[dof].cross(p - self.anchor[dof]) }
     }
@@ -295,6 +296,9 @@ impl Robot {
         Pose { position: fk.pos[link], rotation: Quat::from_mat3(&fk.rot[link]) }
     }
 
+    // Hot in the CPU backend's inner loops: `#[inline]` keeps it inlinable whichever codegen unit
+    // the caller lands in (a 20% swing on the CPU benchmark otherwise).
+    #[inline]
     pub(crate) fn fk(&self, q: &[f32]) -> Fk {
         let mut fk = Fk {
             rot: [Mat3::IDENTITY; MAX_LINKS],
