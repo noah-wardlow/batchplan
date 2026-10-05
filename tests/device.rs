@@ -85,6 +85,11 @@ fn results_keep_the_worlds_of_their_problems() {
             .collect();
         assert!(problems.len() >= 2, "{}: too few IK solutions to test", d.name());
         let result = plan(&d, &worlds, &problems, &PlanOptions::default()).unwrap();
+        assert!(
+            result.solved().any(|s| s.index as u32 != s.problem.world),
+            "{}: no solved problem whose index differs from its world",
+            d.name()
+        );
         for s in result.solved() {
             assert_eq!(s.problem.world, problems[s.index].world);
             // Every waypoint of every reported path is collision-free in its own world.

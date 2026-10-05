@@ -74,6 +74,8 @@ fn evaluate_matches_cpu() {
         "max |cpu-gpu|: world {:.2e} self {:.2e} cost(rel) {:.2e} grad(rel) {:.2e}",
         worst[0], worst[1], worst[2], worst[3]
     );
+    let colliding = a.cost.iter().filter(|&&c| c > 0.0).count();
+    assert!(colliding > items / 10, "only {colliding} of {items} configurations carry collision cost");
     assert!(worst[0] < 1e-4 && worst[1] < 1e-4 && worst[2] < 1e-3 && worst[3] < 1e-3);
 }
 
@@ -88,6 +90,7 @@ fn ik_matches_cpu() {
     let agree = a.success.iter().zip(&b.success).filter(|(x, y)| x == y).count();
     let (sa, sb) = (a.success.iter().filter(|&&s| s).count(), b.success.iter().filter(|&&s| s).count());
     eprintln!("seed successes cpu {sa} gpu {sb}, agreement {agree}/{}", a.success.len());
+    assert!(sa as f32 > 0.2 * a.success.len() as f32, "too few IK successes ({sa}) to compare");
     assert!(agree as f32 >= 0.97 * a.success.len() as f32);
     // Every GPU success must be a real solution according to the CPU model.
     let eval = cpu
@@ -120,6 +123,12 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     let result = plan(&gpu, &worlds, &plan_problems, &o).unwrap();
     let solved = result.solved().count();
     eprintln!("ik solved {}/{}; planned {solved}/{}", plan_problems.len(), problems.len(), plan_problems.len());
+    assert!(
+        plan_problems.len() >= problems.len() * 3 / 4,
+        "IK solved only {} of {}",
+        plan_problems.len(),
+        problems.len()
+    );
     assert!(solved as f32 >= 0.8 * plan_problems.len() as f32);
 
     // Independent check: CPU model, 4x denser interpolation than the planner's validation.
@@ -176,15 +185,19 @@ fn trajopt_gradients_match_cpu_element_wise() {
     let o = PlanOptions::default();
     let (a, clamped_a) = one_step_gradients(&cpu, &worlds, &problems, &o);
     let (b, clamped_b) = one_step_gradients(&gpu, &worlds, &problems, &o);
-    let mut worst = 0.0f32;
+    let (mut worst, mut compared, mut largest) = (0.0f32, 0, 0.0f32);
     for (w, (ga, gb)) in a.chunks(n).zip(b.chunks(n)).enumerate() {
         if (0..n).any(|j| clamped_a[w * n + j] || clamped_b[w * n + j]) {
             continue;
         }
-        let norm = ga.iter().map(|v| v * v).sum::<f32>().sqrt().max(1.0);
+        let norm = ga.iter().map(|v| v * v).sum::<f32>().sqrt();
         let diff = ga.iter().zip(gb).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
-        worst = worst.max(diff / norm);
+        worst = worst.max(diff / norm.max(1.0));
+        compared += 1;
+        largest = largest.max(norm);
     }
-    eprintln!("worst per-waypoint |cpu-gpu| / |grad|: {worst:.2e}");
+    eprintln!("worst per-waypoint |cpu-gpu| / |grad| over {compared} waypoints: {worst:.2e}");
+    assert!(compared > a.len() / n / 2, "only {compared} waypoints escaped joint-limit clamping");
+    assert!(largest > 1.0, "gradients too small ({largest}) to exercise the comparison");
     assert!(worst < 1e-2, "trajectory gradients differ by {worst} of their norm");
 }

@@ -28,7 +28,7 @@ pub struct JointPaths {
 }
 
 impl JointPaths {
-    pub fn zeros(len: usize, waypoints: usize, dof: usize) -> Self {
+    pub(crate) fn zeros(len: usize, waypoints: usize, dof: usize) -> Self {
         Self { dof, waypoints, positions: vec![0.0; len * waypoints * dof] }
     }
 
@@ -46,7 +46,7 @@ impl JointPaths {
         &self.positions[i * n..(i + 1) * n]
     }
 
-    pub fn path_mut(&mut self, i: usize) -> &mut [f32] {
+    pub(crate) fn path_mut(&mut self, i: usize) -> &mut [f32] {
         let n = self.waypoints * self.dof;
         &mut self.positions[i * n..(i + 1) * n]
     }

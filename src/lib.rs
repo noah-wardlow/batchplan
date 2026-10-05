@@ -2,10 +2,11 @@
 //! Intel; Metal; DX12), with a CPU implementation that produces the same results.
 //!
 //! - **Batch-first.** Every query covers many seeds, problems and worlds at once; a [`Device`]
-//!   runs them in parallel on a GPU or on all CPU cores.
-//! - **Separate algorithms over shared types.** [`ik`], [`trajopt`], [`timing`] and [`datagen`]
-//!   are independent modules that take a `Device` and exchange the [`types`]; there are no
-//!   planner plugins or runtime configuration.
+//!   checks each batch and runs it in parallel on a GPU or on all CPU cores.
+//! - **Separate algorithms over shared types.** [`ik`], [`trajopt`], [`timing`], [`datagen`] and
+//!   the exporters ([`npy`], `lerobot`) are independent modules that take a `Device` and exchange
+//!   the [`types`]; there are no planner plugins or runtime configuration. Results keep the
+//!   problems they answer (`solved()`).
 //! - **Standalone.** No middleware; robots load from URDF plus a collision-sphere config.
 //!   Datasets export to LeRobot v3.0 with the optional `lerobot` feature.
 //!

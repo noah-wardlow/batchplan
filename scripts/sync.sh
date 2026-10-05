@@ -6,5 +6,8 @@ set -euo pipefail
 : "${REMOTE:?set REMOTE=user@host}"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-}"
 cd "$(dirname "$0")/.."
-rsync -az --delete --exclude target --exclude data --exclude .git -e "$SSH" ./ "$REMOTE:batchplan/"
+# Local-only paths (see .gitignore): excluded paths neither sync nor get deleted on the remote,
+# so its build cache and generated data survive.
+rsync -az --delete --exclude .git --exclude target --exclude data --exclude .venv --exclude CLAUDE.local.md \
+  -e "$SSH" ./ "$REMOTE:batchplan/"
 $SSH "$REMOTE" "source ~/.cargo/env && cd ~/batchplan && ${*:-cargo build --release}"
