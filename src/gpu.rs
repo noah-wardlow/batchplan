@@ -54,7 +54,7 @@ macro_rules! shader_struct {
 shader_struct! {
     /// Per-call constants (`P` in kernels.wgsl).
     GpuParams => Params {
-        n_dof: u32, n_links: u32, n_spheres: u32, n_pairs: u32,
+        n_dof: u32, n_links: u32, n_spheres: u32, n_link_pairs: u32,
         ee_link: u32, n_items: u32, points: u32, iterations: u32,
         w_world: f32, w_self: f32, margin: f32, self_margin: f32,
         w_acc: f32, w_vel: f32, initial_step: f32, history: u32,
@@ -68,9 +68,10 @@ shader_struct! {
     /// `kind` 0 fixed / 1 revolute / 2 prismatic. A moving joint's value is
     /// `axis.w * q[dof] + trans.w` (multiplier and offset, for mimic joints), and `joint` numbers
     /// it among the moving joints. Bit `i` of `chain` marks link `i` as this link or an ancestor
-    /// with a moving joint.
+    /// with a moving joint. `bound` is the sphere (center in link frame, radius) enclosing the
+    /// link's collision spheres and their self-collision buffers.
     GpuLink => Link {
-        c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4,
+        c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, bound: Vec4,
         parent: i32, kind: u32, dof: u32, chain: u32, joint: u32, pad0: u32, pad1: u32, pad2: u32,
     }
 }
@@ -141,7 +142,8 @@ impl RobotBuffers {
         let gpu_links: Vec<GpuLink> = robot
             .links
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let joint = moving;
                 moving += u32::from(l.joint.actuation().is_some());
                 let (kind, dof, axis, multiplier, offset) = match l.joint {
@@ -155,6 +157,7 @@ impl RobotBuffers {
                     c2: v4(l.origin.rot.z_axis, 0.0),
                     trans: v4(l.origin.trans, offset),
                     axis: v4(axis, multiplier),
+                    bound: robot.link_bounds[i],
                     parent: l.parent.map_or(-1, |p| p as i32),
                     kind,
                     dof,
@@ -174,12 +177,20 @@ impl RobotBuffers {
                 ..Default::default()
             })
             .collect();
+        // Each link pair as (a, b), (first, count), then the sphere pairs they index.
+        let skip = 2 * robot.self_link_pairs.len() as u32;
+        let gpu_pairs: Vec<[u32; 2]> = robot
+            .self_link_pairs
+            .iter()
+            .flat_map(|lp| [[lp.a, lp.b], [skip + lp.first, lp.count]])
+            .chain(robot.self_pairs.iter().copied())
+            .collect();
         let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
 
         Self {
             links: storage(device, "links", &gpu_links),
             spheres: storage(device, "spheres", &gpu_spheres),
-            pairs: storage(device, "pairs", &robot.self_pairs),
+            pairs: storage(device, "pairs", &gpu_pairs),
             limits: storage(device, "limits", &gpu_limits),
         }
     }
@@ -346,7 +357,7 @@ impl GpuBackend {
             n_dof: self.robot.dof() as u32,
             n_links: self.robot.links.len() as u32,
             n_spheres: self.robot.spheres.len() as u32,
-            n_pairs: self.robot.self_pairs.len() as u32,
+            n_link_pairs: self.robot.self_link_pairs.len() as u32,
             ee_link: self.robot.ee_link as u32,
             n_items: n_items as u32,
             w_world: w.world,

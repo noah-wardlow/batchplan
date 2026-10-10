@@ -65,6 +65,35 @@ fn malformed_batches_are_errors_on_every_device() {
 }
 
 #[test]
+fn self_clearance_is_exact_up_to_the_self_margin() {
+    let robot = panda();
+    let (n, items) = (robot.dof(), 4000);
+    let mut rng = batchplan::rng::Rng::new(5);
+    let q: Vec<f32> = (0..items * n).map(|i| rng.range(robot.lower()[i % n], robot.upper()[i % n])).collect();
+    let item_world = vec![0; items];
+    let margin = 0.05;
+    let near = CollisionWeights { self_collision: 1.0, self_margin: margin, ..CollisionWeights::NONE };
+    // A margin wider than the robot leaves no pair of links apart enough to skip.
+    let everything = CollisionWeights { self_margin: 10.0, ..CollisionWeights::NONE };
+    for d in devices(&robot) {
+        let worlds = d.upload(&[World::default()]).unwrap();
+        let exact = d.evaluate(&worlds, &item_world, &q, &everything).unwrap().self_clearance;
+        let gated = d.evaluate(&worlds, &item_world, &q, &near).unwrap().self_clearance;
+        let (mut close, mut bounded) = (0, 0);
+        for (&e, &g) in exact.iter().zip(&gated) {
+            if e <= margin {
+                assert_eq!(g, e, "{}: a close pair was skipped", d.name());
+                close += 1;
+            } else {
+                assert!(g > margin && g <= e + 1e-5, "{}: {g} does not bound {e}", d.name());
+                bounded += usize::from(g < e);
+            }
+        }
+        assert!(close > 100 && bounded > 100, "{}: {close} close, {bounded} bounded", d.name());
+    }
+}
+
+#[test]
 fn obstacle_free_worlds_work_on_every_device() {
     let robot = panda();
     let start = robot.default_q().to_vec();

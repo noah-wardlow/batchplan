@@ -126,22 +126,34 @@ fn collision<const GRADIENT: bool>(
             }
         }
     }
-    for &[a, b] in &robot.self_pairs {
-        let (a, b) = (a as usize, b as usize);
-        let (sa, sb) = (&robot.spheres[a], &robot.spheres[b]);
-        let diff = sc[a] - sc[b];
-        let dist = diff.length();
-        let d = dist - (sa.radius + sa.self_buffer) - (sb.radius + sb.self_buffer);
-        smin = smin.min(d);
-        let pen = w.self_margin - d;
-        if pen > 0.0 && GRADIENT {
-            let u = if dist > 1e-9 { diff / dist } else { Vec3::X };
-            let g = 2.0 * w.self_collision * pen * u;
-            gc[a] -= g;
-            gc[b] += g;
+    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their
+    // gap bounds their clearance from below.
+    let gate = w.self_margin.max(0.0);
+    for lp in &robot.self_link_pairs {
+        let (ba, bb) = (robot.link_bounds[lp.a as usize], robot.link_bounds[lp.b as usize]);
+        let at = |link: u32, b: [f32; 4]| fk.rot[link as usize] * Vec3::new(b[0], b[1], b[2]) + fk.pos[link as usize];
+        let gap = (at(lp.a, ba) - at(lp.b, bb)).length() - ba[3] - bb[3];
+        if gap > gate {
+            smin = smin.min(gap);
+            continue;
         }
-        if pen > 0.0 {
-            cost += w.self_collision * pen * pen;
+        for &[a, b] in &robot.self_pairs[lp.first as usize..(lp.first + lp.count) as usize] {
+            let (a, b) = (a as usize, b as usize);
+            let (sa, sb) = (&robot.spheres[a], &robot.spheres[b]);
+            let diff = sc[a] - sc[b];
+            let dist = diff.length();
+            let d = dist - (sa.radius + sa.self_buffer) - (sb.radius + sb.self_buffer);
+            smin = smin.min(d);
+            let pen = w.self_margin - d;
+            if pen > 0.0 && GRADIENT {
+                let u = if dist > 1e-9 { diff / dist } else { Vec3::X };
+                let g = 2.0 * w.self_collision * pen * u;
+                gc[a] -= g;
+                gc[b] += g;
+            }
+            if pen > 0.0 {
+                cost += w.self_collision * pen * pen;
+            }
         }
     }
     if !GRADIENT {

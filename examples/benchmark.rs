@@ -303,7 +303,7 @@ fn main() -> Result<()> {
                 latency.push(t.elapsed().as_secs_f64() * 1e3);
             }
             all_latency.extend(&latency);
-            let mean = latency.iter().sum::<f64>() / latency.len().max(1) as f64;
+            let mean = latency.iter().sum::<f64>() / latency.len() as f64;
             let n = problems.len();
             println!(
                 "{:<28} {:>5} {:>9.1}% {:>10.1}% {:>10.1}% {:>9.1} {:>10.0} {:>7.0} {:>7.0} {:>7.2} {:>7.2} {:>8.1} {:>9.0}",
@@ -326,7 +326,7 @@ fn main() -> Result<()> {
             total_full += full.success;
             total_time += full.seconds;
         }
-        let mean = all_latency.iter().sum::<f64>() / all_latency.len().max(1) as f64;
+        let mean = all_latency.iter().sum::<f64>() / all_latency.len() as f64;
         println!(
             "{:<28} {:>5} {:>9.1}% {:>10.1}% {:>10.1}% {:>9.1} {:>10.0} {:>7.0} {:>7.0}\n",
             "all",

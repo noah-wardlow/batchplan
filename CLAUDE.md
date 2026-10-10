@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 68 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 69 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -82,6 +82,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   3. Read it in WGSL as `P.<field>`.
   4. Mirror it in `cpu.rs`.
 - The kernel limits (`MAX_DOF` = 16, `MAX_JOINTS` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) are defined in `robot.rs` and enforced when a robot loads.
+- Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with two entries per link pair, `(a, b)` and `(first, count)`, followed by the sphere pairs.
 - Per-joint kernel state (`jaxis`, `janchor`) is indexed by `Link.joint`, the moving-joint number, and sized `MAX_JOINTS`. Arrays that small stay in registers on AMD; indexing them per link (32 entries) cost 20% of GPU planning time.
 
 **GPU details.**

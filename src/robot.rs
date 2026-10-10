@@ -79,6 +79,16 @@ pub(crate) struct Link {
     pub(crate) chain: u32,
 }
 
+/// A pair of links checked for self-collision: sphere pairs `first..first + count` of
+/// `Robot::self_pairs`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkPair {
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) first: u32,
+    pub(crate) count: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CollisionSphere {
     pub(crate) link: usize,
@@ -181,8 +191,12 @@ pub struct Robot {
     pub(crate) max_acceleration: Vec<f32>,
     pub(crate) max_jerk: Vec<f32>,
     pub(crate) spheres: Vec<CollisionSphere>,
-    /// Sphere index pairs checked for self-collision.
+    /// Sphere index pairs checked for self-collision, grouped by `self_link_pairs`.
     pub(crate) self_pairs: Vec<[u32; 2]>,
+    pub(crate) self_link_pairs: Vec<LinkPair>,
+    /// Per link: a sphere around all its collision spheres and their self buffers (link frame
+    /// centre, radius).
+    pub(crate) link_bounds: Vec<[f32; 4]>,
     /// Link whose frame is the IK target frame.
     pub(crate) ee_link: usize,
     pub(crate) default_q: Vec<f32>,
@@ -306,17 +320,38 @@ impl Robot {
                 }
             }
         }
-        let mut self_pairs = vec![];
-        for a in 0..spheres.len() {
-            for b in a + 1..spheres.len() {
-                let (la, lb) = (spheres[a].link, spheres[b].link);
-                if la != lb && !ignore.contains(&(la.min(lb), la.max(lb))) {
-                    self_pairs.push([a as u32, b as u32]);
+        // Sphere pairs grouped by link pair, so a pair of links whose bounding spheres are apart
+        // skips all of them.
+        let held = &spheres;
+        let on = |link: usize| (0..held.len()).filter(move |&s| held[s].link == link);
+        let (mut self_pairs, mut self_link_pairs) = (vec![], vec![]);
+        for la in 0..self.links.len() {
+            for lb in la + 1..self.links.len() {
+                if ignore.contains(&(la, lb)) {
+                    continue;
+                }
+                let first = self_pairs.len();
+                for a in on(la) {
+                    self_pairs.extend(on(lb).map(|b| [a as u32, b as u32]));
+                }
+                if self_pairs.len() > first {
+                    let count = (self_pairs.len() - first) as u32;
+                    self_link_pairs.push(LinkPair { a: la as u32, b: lb as u32, first: first as u32, count });
                 }
             }
         }
+        self.link_bounds = (0..self.links.len())
+            .map(|link| {
+                let own: Vec<&CollisionSphere> = on(link).map(|s| &held[s]).collect();
+                let center = own.iter().map(|s| s.center).sum::<Vec3>() / own.len().max(1) as f32;
+                let radius =
+                    own.iter().map(|s| (s.center - center).length() + s.radius + s.self_buffer).fold(0.0, f32::max);
+                [center.x, center.y, center.z, radius]
+            })
+            .collect();
         self.spheres = spheres;
         self.self_pairs = self_pairs;
+        self.self_link_pairs = self_link_pairs;
         self.collision_model = model;
         Ok(())
     }
@@ -675,6 +710,8 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         max_jerk,
         spheres: vec![],
         self_pairs: vec![],
+        self_link_pairs: vec![],
+        link_bounds: vec![],
         ee_link,
         default_q,
         collision_model: CollisionModel::default(),

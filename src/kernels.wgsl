@@ -231,26 +231,40 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
             }
         }
     }
-    for (var k = 0u; k < P.n_pairs; k++) {
-        let pr = pairs[k];
-        let a = spheres[pr.x];
-        let b = spheres[pr.y];
-        let diff = sc[pr.x] - sc[pr.y];
-        let dist = length(diff);
-        let d = dist - (a.c.w + a.self_buf) - (b.c.w + b.self_buf);
-        smin = min(smin, d);
-        let pen = self_margin - d;
-        if (pen > 0.0 && gradient) {
-            var u = vec3<f32>(1.0, 0.0, 0.0);
-            if (dist > 1e-9) {
-                u = diff / dist;
-            }
-            let g = 2.0 * w_self * pen * u;
-            gc[pr.x] -= g;
-            gc[pr.y] += g;
+    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their
+    // gap bounds their clearance from below.
+    let gate = max(self_margin, 0.0);
+    for (var l = 0u; l < P.n_link_pairs; l++) {
+        let lp = pairs[2u * l];
+        let span = pairs[2u * l + 1u];
+        let ba = links[lp.x].bound;
+        let bb = links[lp.y].bound;
+        let gap = length(lrot[lp.x] * ba.xyz + lpos[lp.x] - lrot[lp.y] * bb.xyz - lpos[lp.y]) - ba.w - bb.w;
+        if (gap > gate) {
+            smin = min(smin, gap);
+            continue;
         }
-        if (pen > 0.0) {
-            cost += w_self * pen * pen;
+        for (var k = span.x; k < span.x + span.y; k++) {
+            let pr = pairs[k];
+            let a = spheres[pr.x];
+            let b = spheres[pr.y];
+            let diff = sc[pr.x] - sc[pr.y];
+            let dist = length(diff);
+            let d = dist - (a.c.w + a.self_buf) - (b.c.w + b.self_buf);
+            smin = min(smin, d);
+            let pen = self_margin - d;
+            if (pen > 0.0 && gradient) {
+                var u = vec3<f32>(1.0, 0.0, 0.0);
+                if (dist > 1e-9) {
+                    u = diff / dist;
+                }
+                let g = 2.0 * w_self * pen * u;
+                gc[pr.x] -= g;
+                gc[pr.y] += g;
+            }
+            if (pen > 0.0) {
+                cost += w_self * pen * pen;
+            }
         }
     }
     if (!gradient) {
