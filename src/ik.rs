@@ -3,7 +3,7 @@
 
 use crate::error::{Result, ensure_input};
 
-use crate::device::{CollisionWeights, Device, Worlds};
+use crate::device::{CollisionWeights, Device, Worlds, collision_free};
 use crate::rng::Rng;
 use crate::types::{Pose, Solved};
 
@@ -119,9 +119,9 @@ pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &Ik
         }
     }
     let err = device.ik(worlds, &item_world, &targets, &mut q, o)?;
-    let eval = device.evaluate(worlds, &item_world, &q, &CollisionWeights::NONE)?;
+    let clear = device.clearance(worlds, &item_world, &q)?;
     let success = (0..items)
-        .map(|i| err[i][0] < o.position_tolerance && err[i][1] < o.rotation_tolerance && eval.collision_free(i))
+        .map(|i| err[i][0] < o.position_tolerance && err[i][1] < o.rotation_tolerance && collision_free(clear[i]))
         .collect();
     Ok(IkResult {
         problems: problems.to_vec(),
@@ -130,8 +130,8 @@ pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &Ik
         q,
         position_error: err.iter().map(|e| e[0]).collect(),
         rotation_error: err.iter().map(|e| e[1]).collect(),
-        world_clearance: eval.world_clearance,
-        self_clearance: eval.self_clearance,
+        world_clearance: clear.iter().map(|c| c[0]).collect(),
+        self_clearance: clear.iter().map(|c| c[1]).collect(),
         success,
     })
 }

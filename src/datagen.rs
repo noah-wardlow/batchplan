@@ -1,7 +1,7 @@
 //! Planner output as policy-training demonstrations: nominal reaches plus recoveries from
 //! perturbed states, timed within the robot's limits at randomized speeds.
 
-use crate::device::{CollisionWeights, Device, Worlds};
+use crate::device::{Device, Worlds, collision_free};
 use crate::error::{Result, ensure_input};
 use crate::ik::{IkOptions, IkProblem, solve_ik};
 use crate::rng::Rng;
@@ -64,8 +64,8 @@ pub fn recovery_problems(
     }
     let starts: Vec<f32> = candidates.iter().flat_map(|c| c.problem.start.iter().copied()).collect();
     let item_world: Vec<u32> = candidates.iter().map(|c| c.problem.world).collect();
-    let eval = device.evaluate(worlds, &item_world, &starts, &CollisionWeights::NONE)?;
-    Ok(candidates.into_iter().enumerate().filter(|&(i, _)| eval.collision_free(i)).map(|(_, c)| c).collect())
+    let clear = device.clearance(worlds, &item_world, &starts)?;
+    Ok(candidates.into_iter().enumerate().filter(|&(i, _)| collision_free(clear[i])).map(|(_, c)| c).collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,8 +156,8 @@ pub fn demonstrations(
         })
         .collect();
     let item_world: Vec<u32> = goals.iter().map(|g| g.world).collect();
-    let start_eval = device.evaluate(worlds, &item_world, &starts, &CollisionWeights::NONE)?;
-    for g in (0..goals.len()).filter(|&g| !start_eval.collision_free(g)) {
+    let start_clear = device.clearance(worlds, &item_world, &starts)?;
+    for g in (0..goals.len()).filter(|&g| !collision_free(start_clear[g])) {
         starts[g * n..(g + 1) * n].copy_from_slice(&robot.default_q);
     }
     // Nominal plan problem p reaches the target of IK problem goal_of[p].

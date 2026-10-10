@@ -101,6 +101,9 @@ fn obstacle_distance(o: &Prepared, p: Vec3) -> (f32, Vec3) {
 
 /// Collision cost of the configuration behind `fk`; adds d(cost)/dq into `grad`.
 /// Without `GRADIENT` only the cost and clearances are computed, as the WGSL `gradient` flag does.
+// Inlined into every caller: once the cost-only form had two callers, LLVM stopped inlining it into
+// the line search, which cost 5% of CPU planning.
+#[inline(always)]
 fn collision<const GRADIENT: bool>(
     robot: &Robot,
     world: &[Prepared],
@@ -620,6 +623,20 @@ impl Backend for CpuBackend {
                     (*wc, *sc, *cost) = (c.world_clearance, c.self_clearance, c.cost);
                 },
             )
+        });
+        Ok(out)
+    }
+
+    fn clearance(&self, worlds: &Worlds, item_world: &[u32], q: &[f32]) -> Result<Vec<[f32; 2]>> {
+        let n = self.robot.dof();
+        let prepared: &CpuWorlds = worlds.prepared();
+        let mut out = vec![[0.0; 2]; item_world.len()];
+        self.pool.install(|| {
+            out.par_iter_mut().zip(q.par_chunks(n).zip(item_world.par_iter())).for_each(|(c, (qi, &s))| {
+                let fk = self.robot.fk(qi);
+                let r = collision::<false>(&self.robot, &prepared[s as usize], &fk, &CollisionWeights::NONE, &mut []);
+                *c = [r.world_clearance, r.self_clearance];
+            })
         });
         Ok(out)
     }

@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 69 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 70 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -110,7 +110,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 **Planning flow.** In `trajopt::plan`:
 1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Seed 0's free points lie on the straight line; the others bend through random via points.
 2. Run the backend's trajopt on the free control points.
-3. Validate by sampling each spline densely (`validate_substeps` per span) and running `device.evaluate`.
+3. Validate by sampling each spline densely (`validate_substeps` per span) and running `Device::clearance` (crate-private: world and self clearance without cost or gradient; IK, RRT and datagen use it too).
 4. `best()` picks the shortest valid seed.
 5. Problems without a valid seed fall back (`PlanOptions::fallback`): `rrt::connect` (RRT-Connect, several extensions per problem per round, every problem's edges checked in one `evaluate`), `shortcut::shortcut`, then `trace` turns the waypoints into control points whose spline runs exactly along them (each waypoint tripled). The traced spline and its optimized version are validated; the shorter valid one replaces seed 0.
 
@@ -145,7 +145,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - Build the previous commit in a `git worktree` with its own `CARGO_TARGET_DIR`, and alternate runs with the current code.
   - Check the load first; the dev machines often run other heavy work.
   - A single run proves nothing.
-- **Keep `#[inline]` on hot functions the CPU backend calls across modules** (`Robot::fk`, `Fk::dpoint`, `box_distance`, `sphere_distance`). Without it, how the compiler splits the crate into chunks swings CPU throughput by 15–20%. Mark new hot cross-module helpers the same way.
+- **Keep `#[inline]` on hot functions the CPU backend calls across modules** (`Robot::fk`, `Fk::dpoint`, `box_distance`, `sphere_distance`). Without it, how the compiler splits the crate into chunks swings CPU throughput by 15–20%. Mark new hot cross-module helpers the same way. `cpu::collision` is `#[inline(always)]`: with a second cost-only caller, LLVM stopped inlining it into the line search (−5%).
 - **`unwrap`/`expect` only for invariants you can prove.** Fallible paths return errors.
 - **The repo is public.** Keep hostnames, usernames and account details out of committed files.
 - **Comments only for what the next reader can't quickly recover from the code.** No comments referencing conversation context. If a workaround needs a paragraph of justification, fix the code instead.

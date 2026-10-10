@@ -101,6 +101,25 @@ fn clearances_are_exact_up_to_the_margins() {
 }
 
 #[test]
+fn ik_reports_the_clearances_evaluate_finds() {
+    let robot = panda();
+    let scene = [common::tabletop(&mut batchplan::rng::Rng::new(4))];
+    let mut rng = batchplan::rng::Rng::new(9);
+    let problems: Vec<IkProblem> =
+        (0..16).map(|_| IkProblem { world: 0, target: common::grasp_target(&scene[0], &mut rng) }).collect();
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let ik = solve_ik(&d, &worlds, &problems, &IkOptions::default()).unwrap();
+        let items = ik.q.len() / robot.dof();
+        let e = d.evaluate(&worlds, &vec![0; items], &ik.q, &CollisionWeights::NONE).unwrap();
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-6);
+        assert!(close(&ik.world_clearance, &e.world_clearance), "{}: world clearance", d.name());
+        assert!(close(&ik.self_clearance, &e.self_clearance), "{}: self clearance", d.name());
+        assert!(!close(&ik.world_clearance, &ik.self_clearance), "world and self clearance should differ");
+    }
+}
+
+#[test]
 fn obstacle_free_worlds_work_on_every_device() {
     let robot = panda();
     let start = robot.default_q().to_vec();

@@ -310,6 +310,24 @@ fn evaluate_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
     }
 }
 
+// One invocation per configuration: out = [world clearance, self clearance], without cost or
+// gradient.
+@compute @workgroup_size(64)
+fn clearance_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let item = item_index(gid, nwg);
+    if (item >= P.n_items) {
+        return;
+    }
+    let n = P.n_dof;
+    for (var j = 0u; j < n; j++) {
+        q[j] = qbuf[item * n + j];
+    }
+    fk();
+    let c = collision(item_world[item], 0.0, 0.0, 0.0, 0.0, false);
+    outbuf[item * 2u] = c.y;
+    outbuf[item * 2u + 1u] = c.z;
+}
+
 // One invocation per IK seed; runs P.iterations steps, writes q back and [pos err, rot err].
 @compute @workgroup_size(64)
 fn ik_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {

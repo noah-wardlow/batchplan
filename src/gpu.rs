@@ -304,6 +304,7 @@ pub(crate) struct GpuBackend {
 struct Kernels {
     layout0: wgpu::BindGroupLayout,
     evaluate: wgpu::ComputePipeline,
+    clearance: wgpu::ComputePipeline,
     ik: wgpu::ComputePipeline,
     traj_costs: wgpu::ComputePipeline,
     traj_search: wgpu::ComputePipeline,
@@ -443,6 +444,7 @@ fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: 
         })
     };
     let evaluate = pipeline("evaluate_main");
+    let clearance = pipeline("clearance_main");
     let ik = pipeline("ik_main");
     let traj_costs = pipeline("traj_costs");
     let traj_search = pipeline("traj_search");
@@ -453,7 +455,7 @@ fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: 
         return Err(Error::Gpu(format!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend)));
     }
 
-    Ok(Kernels { layout0, evaluate, ik, traj_costs, traj_search, traj_samples, traj_grad, lbfgs_direction })
+    Ok(Kernels { layout0, evaluate, clearance, ik, traj_costs, traj_search, traj_samples, traj_grad, lbfgs_direction })
 }
 
 /// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
@@ -685,15 +687,17 @@ impl GpuBackend {
         Ok(out)
     }
 
-    fn evaluate_chunk(
+    /// Runs `pipeline` once per configuration, which writes `stride` floats each.
+    fn per_configuration(
         &self,
+        pipeline: &wgpu::ComputePipeline,
+        stride: usize,
         worlds: &GpuWorlds,
         item_world: &[u32],
         q: &[f32],
         w: &CollisionWeights,
     ) -> Result<Vec<f32>> {
         let items = item_world.len();
-        let stride = 3 + self.robot.dof();
         let params = self.uniform(&self.params(items, w));
         let world_buf = storage(&self.device, "item world", item_world);
         let no_targets = storage::<[f32; 4]>(&self.device, "unused targets", &[]);
@@ -710,7 +714,7 @@ impl GpuBackend {
             out: &out,
         });
         self.submit_pass(|pass| {
-            pass.set_pipeline(&self.kernels.evaluate);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             dispatch(pass, items);
         });
@@ -743,13 +747,31 @@ impl Backend for GpuBackend {
         let stride = 3 + n;
         let mut out = Evaluation::default();
         for (chunk_world, chunk_q) in item_world.chunks(EVAL_CHUNK).zip(q.chunks(EVAL_CHUNK * n)) {
-            let raw = self.evaluate_chunk(worlds, chunk_world, chunk_q, w)?;
+            let raw = self.per_configuration(&self.kernels.evaluate, stride, worlds, chunk_world, chunk_q, w)?;
             for row in raw.chunks(stride) {
                 out.world_clearance.push(row[0]);
                 out.self_clearance.push(row[1]);
                 out.cost.push(row[2]);
                 out.grad.extend_from_slice(&row[3..]);
             }
+        }
+        Ok(out)
+    }
+
+    fn clearance(&self, worlds: &Worlds, item_world: &[u32], q: &[f32]) -> Result<Vec<[f32; 2]>> {
+        let worlds: &GpuWorlds = worlds.prepared();
+        let n = self.robot.dof();
+        let mut out = Vec::with_capacity(item_world.len());
+        for (chunk_world, chunk_q) in item_world.chunks(EVAL_CHUNK).zip(q.chunks(EVAL_CHUNK * n)) {
+            let raw = self.per_configuration(
+                &self.kernels.clearance,
+                2,
+                worlds,
+                chunk_world,
+                chunk_q,
+                &CollisionWeights::NONE,
+            )?;
+            out.extend(raw.chunks(2).map(|c| [c[0], c[1]]));
         }
         Ok(out)
     }

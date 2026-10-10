@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::error::{Result, ensure_input};
 
-use crate::device::{CollisionWeights, Device, Worlds};
+use crate::device::{Device, Worlds, collision_free};
 use crate::rng::Rng;
 
 #[derive(Clone, Copy, Debug)]
@@ -78,11 +78,11 @@ impl Segments {
     /// otherwise up to the sample before the first collision.
     pub(crate) fn check(&self, device: &Device, worlds: &Worlds) -> Result<Vec<f32>> {
         debug_assert_eq!(self.samples.len(), self.item_world.len() * self.dof);
-        let eval = device.evaluate(worlds, &self.item_world, &self.samples, &CollisionWeights::NONE)?;
+        let clear = device.clearance(worlds, &self.item_world, &self.samples)?;
         Ok(self
             .spans
             .iter()
-            .map(|&(first, end)| match (first..end).position(|i| !eval.collision_free(i)) {
+            .map(|&(first, end)| match (first..end).position(|i| !collision_free(clear[i])) {
                 Some(k) => k as f32 / (end - first) as f32,
                 None => 1.0,
             })
@@ -182,17 +182,17 @@ pub(crate) fn connect_until(
             end_world.push(p.world);
         }
     }
-    let free = device.evaluate(worlds, &end_world, &ends, &CollisionWeights::NONE)?;
+    let free: Vec<bool> = device.clearance(worlds, &end_world, &ends)?.into_iter().map(collision_free).collect();
     let mut searches = vec![];
     let mut next_end = 0;
     for (i, p) in problems.iter().enumerate() {
         let mut start = Tree::new(n);
-        if free.collision_free(next_end) {
+        if free[next_end] {
             start.add(&p.start, None);
         }
         let mut goals = Tree::new(n);
         for (k, g) in p.goals.iter().enumerate() {
-            if free.collision_free(next_end + 1 + k) {
+            if free[next_end + 1 + k] {
                 goals.add(g, None);
             }
         }

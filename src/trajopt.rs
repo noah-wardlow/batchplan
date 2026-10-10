@@ -176,11 +176,11 @@ fn validate(
         spline::dense(paths.path(item), n, k, out);
     }
     let dense_world: Vec<u32> = item_world.iter().flat_map(|&w| std::iter::repeat_n(w, samples)).collect();
-    let eval = device.evaluate(worlds, &dense_world, &dense, &CollisionWeights::NONE)?;
+    let clear = device.clearance(worlds, &dense_world, &dense)?;
     let min_clearance = (0..items)
         .map(|item| {
             (item * samples..(item + 1) * samples)
-                .map(|i| eval.world_clearance[i].min(eval.self_clearance[i]))
+                .map(|i| clear[i][0].min(clear[i][1]))
                 // NaN marks the path invalid rather than vanishing in a minimum.
                 .fold(f32::INFINITY, |m, c| if m.is_nan() || c.is_nan() { f32::NAN } else { m.min(c) })
         })

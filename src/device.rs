@@ -57,8 +57,13 @@ pub struct Evaluation {
 
 impl Evaluation {
     pub fn collision_free(&self, item: usize) -> bool {
-        self.world_clearance[item] >= 0.0 && self.self_clearance[item] >= 0.0
+        collision_free([self.world_clearance[item], self.self_clearance[item]])
     }
+}
+
+/// Whether a `[world, self]` clearance from [`Device::clearance`] is collision-free.
+pub(crate) fn collision_free(c: [f32; 2]) -> bool {
+    c[0] >= 0.0 && c[1] >= 0.0
 }
 
 pub struct Device {
@@ -164,6 +169,13 @@ impl Device {
         self.backend.evaluate(worlds, item_world, q, w)
     }
 
+    /// World and self clearance of each configuration (`[items, dof]`), without cost or gradient:
+    /// what validity checks need. Exact up to zero (see [`Evaluation`]).
+    pub(crate) fn clearance(&self, worlds: &Worlds, item_world: &[u32], q: &[f32]) -> Result<Vec<[f32; 2]>> {
+        self.check_batch(worlds, item_world, q.len(), self.robot().dof())?;
+        self.backend.clearance(worlds, item_world, q)
+    }
+
     pub(crate) fn ik(
         &self,
         worlds: &Worlds,
@@ -223,6 +235,9 @@ pub(crate) trait Backend: Send + Sync {
     /// The same backend for another robot, sharing the hardware and the form of worlds.
     fn with_robot(&self, robot: &Robot) -> Result<Box<dyn Backend>>;
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation>;
+    /// `[world, self]` clearance per configuration, computed as `evaluate` does with zero weights
+    /// and margins, without the gradient.
+    fn clearance(&self, worlds: &Worlds, item_world: &[u32], q: &[f32]) -> Result<Vec<[f32; 2]>>;
     /// Runs IK in place on `q` (`[items, dof]`) toward `targets[item]`; returns `[position error, rotation error]` per item.
     fn ik(
         &self,
