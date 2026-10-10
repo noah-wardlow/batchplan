@@ -216,7 +216,12 @@ fn the_fallback_keeps_the_time_budget() {
         let budget = alone + (full - alone) / 4;
         let spent = timed(&PlanOptions { time_budget: Some(budget), ..Default::default() });
         eprintln!("{}: full {full:?}, without fallback {alone:?}, budget {budget:?} -> {spent:?}", d.name());
-        assert!(full > 2 * alone, "{}: the search is too short to cut ({full:?})", d.name());
-        assert!(spent < budget + (full - alone) / 4, "{}: took {spent:?} of a {budget:?} budget", d.name());
+        let search = full - alone;
+        assert!(
+            search > std::time::Duration::from_millis(100),
+            "{}: the search is too short to cut ({search:?})",
+            d.name()
+        );
+        assert!(spent < budget + search / 4, "{}: took {spent:?} of a {budget:?} budget", d.name());
     }
 }

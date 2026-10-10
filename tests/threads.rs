@@ -1,5 +1,6 @@
 //! The CPU device runs batched work only on threads it starts itself. This file holds a single
-//! test, so no other test starts threads beside it.
+//! test, so no other test starts threads beside it. Threads are counted on Linux and macOS.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 #[path = "../examples/common/mod.rs"]
 mod common;
@@ -23,7 +24,6 @@ fn threads() -> usize {
     info.pti_threadnum as usize
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_one_thread_device_works_on_its_one_thread() {
     let at_start = threads();
