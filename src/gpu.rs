@@ -19,6 +19,8 @@ use crate::types::{JointPaths, Pose};
 use crate::world::{Obstacle, World};
 
 const WORKGROUP: u32 = 64;
+// traj_search prices the line-search steps in the components of one vec4.
+const _: () = assert!(LINE_SEARCH.len() <= 4);
 /// Storage buffers in bind group 0: bindings 1..=9 are read-only, 10..=12 read-write (see kernels.wgsl).
 const READ_ONLY_STORAGE: u32 = 9;
 const READ_WRITE_STORAGE: u32 = 3;
@@ -394,6 +396,7 @@ fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: 
         "alias Vec4 = vec4<f32>;\n",
         &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
         &format!("const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"),
+        &format!("const WORKGROUP: u32 = {WORKGROUP}u;\n"),
         &format!(
             "const MAX_HISTORY: u32 = {MAX_HISTORY}u;\nconst LINE_STEPS: u32 = {}u;\n\
              fn line_search(c: u32) -> f32 {{\n    var steps = array<f32, {}>({});\n    return steps[c];\n}}\n",
@@ -938,7 +941,7 @@ impl GpuBackend {
                     pass.set_pipeline(&self.kernels.traj_costs);
                     dispatch(pass, samples * LINE_SEARCH.len());
                     pass.set_pipeline(&self.kernels.traj_search);
-                    dispatch(pass, items);
+                    dispatch_groups(pass, items);
                     if round + 1 == rounds {
                         break;
                     }
@@ -947,7 +950,7 @@ impl GpuBackend {
                     pass.set_pipeline(&self.kernels.traj_grad);
                     dispatch(pass, items * (points - 6));
                     pass.set_pipeline(&self.kernels.lbfgs_direction);
-                    dispatch(pass, items);
+                    dispatch_groups(pass, items);
                 }
             });
             k = end;
@@ -981,7 +984,12 @@ fn unmet_limits(l: &wgpu::Limits) -> Vec<String> {
 }
 
 fn dispatch(pass: &mut wgpu::ComputePass, threads: usize) {
-    let groups = (threads as u32).div_ceil(WORKGROUP);
+    dispatch_groups(pass, threads.div_ceil(WORKGROUP as usize));
+}
+
+/// Dispatches `groups` workgroups, folded into two dimensions past the per-dimension limit.
+fn dispatch_groups(pass: &mut wgpu::ComputePass, groups: usize) {
+    let groups = groups as u32;
     if groups == 0 {
         return;
     }

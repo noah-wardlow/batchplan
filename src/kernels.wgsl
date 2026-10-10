@@ -449,11 +449,63 @@ fn traj_costs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     aux[costs_at(item) + c * per_item + sample] = c3.x;
 }
 
-// One invocation per path: the trajectory cost of each line-search step; the cheapest moves the
-// path if it lowers the cost, otherwise the history resets.
-@compute @workgroup_size(64)
-fn traj_search(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let item = item_index(gid, nwg);
+// Per-path kernels run one workgroup per path, each invocation owning every WORKGROUP-th element,
+// so their loads coalesce; sums over a path go through workgroup memory.
+var<workgroup> partial: array<vec4<f32>, WORKGROUP>;
+var<workgroup> reduced: vec4<f32>;
+
+// The component-wise sum of `v` over the workgroup, uniform in every invocation. Every invocation
+// must call it.
+fn workgroup_sum(lid: u32, v: vec4<f32>) -> vec4<f32> {
+    partial[lid] = v;
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        reduced = partial[0];
+    }
+    return workgroupUniformLoad(&reduced);
+}
+
+// The component-wise maximum of `v` over the workgroup, like workgroup_sum.
+fn workgroup_max(lid: u32, v: vec4<f32>) -> vec4<f32> {
+    partial[lid] = v;
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] = max(partial[lid], partial[lid + stride]);
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        reduced = partial[0];
+    }
+    return workgroupUniformLoad(&reduced);
+}
+
+// `aux[at]`, uniform in every invocation.
+fn uniform_aux(lid: u32, at: u32) -> f32 {
+    // No invocation may still be reading the previous value.
+    workgroupBarrier();
+    if (lid == 0u) {
+        reduced = vec4<f32>(aux[at]);
+    }
+    return workgroupUniformLoad(&reduced).x;
+}
+
+// One workgroup per path: the trajectory cost of each line-search step (up to four, one per
+// component); the cheapest moves the path if it lowers the cost, otherwise the history resets.
+@compute @workgroup_size(WORKGROUP)
+fn traj_search(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let item = wid.x + wid.y * nwg.x;
     if (item >= P.n_items) {
         return;
     }
@@ -461,115 +513,129 @@ fn traj_search(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let tn = P.points;
     let per_item = path_samples();
     let sc = scalars_at(item);
-    let started = aux[sc + 3u] > 0.5;
-    var cost = aux[sc];
-    var best = -1;
-    for (var c = 0u; c < LINE_STEPS; c++) {
-        let alpha = line_search(c);
-        var total = 0.0;
-        for (var s = 0u; s < per_item; s++) {
-            total += aux[costs_at(item) + c * per_item + s];
+    var part = vec4<f32>(0.0);
+    for (var s = lid; s < per_item; s += WORKGROUP) {
+        for (var c = 0u; c < LINE_STEPS; c++) {
+            part[c] += aux[costs_at(item) + c * per_item + s];
         }
-        for (var j = 0u; j < n; j++) {
-            // Each candidate point once, sliding along the path.
-            var before = 0.0;
-            var previous = candidate(item, 0u, j, alpha);
-            for (var t = 1u; t < tn; t++) {
-                let current = candidate(item, t, j, alpha);
-                let v = current - previous;
-                total += P.w_vel * v * v;
-                if (t >= 2u) {
-                    let a = current - 2.0 * previous + before;
-                    total += P.w_acc * a * a;
-                }
-                before = previous;
-                previous = current;
+    }
+    // Velocity and acceleration ending at each control point.
+    for (var k = n + lid; k < tn * n; k += WORKGROUP) {
+        let t = k / n;
+        let j = k % n;
+        for (var c = 0u; c < LINE_STEPS; c++) {
+            let alpha = line_search(c);
+            let current = candidate(item, t, j, alpha);
+            let previous = candidate(item, t - 1u, j, alpha);
+            let v = current - previous;
+            part[c] += P.w_vel * v * v;
+            if (t >= 2u) {
+                let a = current - 2.0 * previous + candidate(item, t - 2u, j, alpha);
+                part[c] += P.w_acc * a * a;
             }
         }
-        if ((best < 0 && !started) || total < cost) {
-            cost = total;
+    }
+    let totals = workgroup_sum(lid, part);
+    let started = uniform_aux(lid, sc + 3u) > 0.5;
+    var cost = uniform_aux(lid, sc);
+    var best = -1;
+    for (var c = 0u; c < LINE_STEPS; c++) {
+        if ((best < 0 && !started) || totals[c] < cost) {
+            cost = totals[c];
             best = i32(c);
         }
     }
     if (best < 0) {
-        aux[sc + 4u] = 0.0;
-        aux[sc + 1u] = 0.0;
+        if (lid == 0u) {
+            aux[sc + 4u] = 0.0;
+            aux[sc + 1u] = 0.0;
+        }
         return;
     }
     let alpha = line_search(u32(best));
-    for (var t = 3u; t < tn - 3u; t++) {
-        for (var j = 0u; j < n; j++) {
-            let i = t * n + j;
-            let moved = candidate(item, t, j, alpha);
-            let x = item * tn * n + i;
-            aux[pending_step_at(item) + i] = moved - qbuf[x];
-            qbuf[x] = moved;
-        }
+    for (var i = 3u * n + lid; i < (tn - 3u) * n; i += WORKGROUP) {
+        let moved = candidate(item, i / n, i % n, alpha);
+        let x = item * tn * n + i;
+        aux[pending_step_at(item) + i] = moved - qbuf[x];
+        qbuf[x] = moved;
     }
-    aux[sc] = cost;
-    aux[sc + 3u] = 1.0;
-    aux[sc + 4u] = 1.0;
+    if (lid == 0u) {
+        aux[sc] = cost;
+        aux[sc + 3u] = 1.0;
+        aux[sc + 4u] = 1.0;
+    }
 }
 
-fn lbfgs_dot(a: u32, b: u32) -> f32 {
-    var sum = 0.0;
-    for (var i = 3u * P.n_dof; i < (P.points - 3u) * P.n_dof; i++) {
-        sum += aux[a + i] * aux[b + i];
+// The dot products a.b and c.e over a path's free control points, uniform in every invocation.
+fn lbfgs_dots(lid: u32, a: u32, b: u32, c: u32, e: u32) -> vec2<f32> {
+    var part = vec4<f32>(0.0);
+    for (var i = 3u * P.n_dof + lid; i < (P.points - 3u) * P.n_dof; i += WORKGROUP) {
+        part.x += aux[a + i] * aux[b + i];
+        part.y += aux[c + i] * aux[e + i];
     }
-    return sum;
+    return workgroup_sum(lid, part).xy;
 }
 
-// One invocation per path: records the last step and the gradient change it caused, then the
+// One workgroup per path: records the last step and the gradient change it caused, then the
 // L-BFGS two-loop recursion for the next direction; steepest descent scaled to initial_step
 // without history or when the recursion fails to descend.
-@compute @workgroup_size(64)
-fn lbfgs_direction(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let item = item_index(gid, nwg);
+@compute @workgroup_size(WORKGROUP)
+fn lbfgs_direction(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let item = wid.x + wid.y * nwg.x;
     if (item >= P.n_items) {
         return;
     }
-    let first = 3u * P.n_dof;
+    let first = 3u * P.n_dof + lid;
     let end = (P.points - 3u) * P.n_dof;
     let m = P.history;
     let sc = scalars_at(item);
     let g = grad_at(item);
     let gp = prev_grad_at(item);
     let d = dir_at(item);
-    var count = u32(aux[sc + 1u]);
-    var newest = u32(aux[sc + 2u]);
-    if (aux[sc + 4u] > 0.5) {
+    var count = u32(uniform_aux(lid, sc + 1u));
+    var newest = u32(uniform_aux(lid, sc + 2u));
+    if (uniform_aux(lid, sc + 4u) > 0.5) {
         let s = pending_step_at(item);
-        var sy = 0.0;
-        for (var i = first; i < end; i++) {
-            sy += aux[s + i] * (aux[g + i] - aux[gp + i]);
+        var part = 0.0;
+        for (var i = first; i < end; i += WORKGROUP) {
+            part += aux[s + i] * (aux[g + i] - aux[gp + i]);
         }
+        let sy = workgroup_sum(lid, vec4<f32>(part, 0.0, 0.0, 0.0)).x;
         if (sy > 1e-10) {
             var slot = 0u;
             if (count > 0u) {
                 slot = (newest + 1u) % m;
             }
-            for (var i = first; i < end; i++) {
+            for (var i = first; i < end; i += WORKGROUP) {
                 aux[steps_at(item, slot) + i] = aux[s + i];
                 aux[changes_at(item, slot) + i] = aux[g + i] - aux[gp + i];
             }
             newest = slot;
             count = min(count + 1u, m);
         }
-        aux[sc + 4u] = 0.0;
+        if (lid == 0u) {
+            aux[sc + 4u] = 0.0;
+        }
     }
-    var largest = 0.0;
-    for (var i = first; i < end; i++) {
+    var big = 0.0;
+    for (var i = first; i < end; i += WORKGROUP) {
         aux[gp + i] = aux[g + i];
         aux[d + i] = -aux[g + i];
-        largest = max(largest, abs(aux[g + i]));
+        big = max(big, abs(aux[g + i]));
     }
+    let largest = workgroup_max(lid, vec4<f32>(big)).x;
     var alpha: array<f32, MAX_HISTORY>;
     for (var a = 0u; a < count; a++) {
         let slot = (newest + m - a) % m;
         let s = steps_at(item, slot);
         let y = changes_at(item, slot);
-        alpha[a] = lbfgs_dot(s, d) / lbfgs_dot(y, s);
-        for (var i = first; i < end; i++) {
+        let dots = lbfgs_dots(lid, s, d, y, s);
+        alpha[a] = dots.x / dots.y;
+        for (var i = first; i < end; i += WORKGROUP) {
             aux[d + i] -= alpha[a] * aux[y + i];
         }
     }
@@ -577,11 +643,12 @@ fn lbfgs_direction(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
     if (count > 0u) {
         let s = steps_at(item, newest);
         let y = changes_at(item, newest);
-        gamma = lbfgs_dot(s, y) / lbfgs_dot(y, y);
+        let dots = lbfgs_dots(lid, s, y, y, y);
+        gamma = dots.x / dots.y;
     } else if (largest > 0.0) {
         gamma = P.initial_step / largest;
     }
-    for (var i = first; i < end; i++) {
+    for (var i = first; i < end; i += WORKGROUP) {
         aux[d + i] *= gamma;
     }
     for (var k = 0u; k < count; k++) {
@@ -589,19 +656,24 @@ fn lbfgs_direction(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_w
         let slot = (newest + m - a) % m;
         let s = steps_at(item, slot);
         let y = changes_at(item, slot);
-        let beta = lbfgs_dot(y, d) / lbfgs_dot(y, s);
-        for (var i = first; i < end; i++) {
+        let dots = lbfgs_dots(lid, y, d, y, s);
+        let beta = dots.x / dots.y;
+        for (var i = first; i < end; i += WORKGROUP) {
             aux[d + i] += (alpha[a] - beta) * aux[s + i];
         }
     }
-    if (largest > 0.0 && lbfgs_dot(d, g) >= 0.0) {
-        count = 0u;
-        for (var i = first; i < end; i++) {
-            aux[d + i] = -aux[g + i] * (P.initial_step / largest);
+    if (largest > 0.0) {
+        if (lbfgs_dots(lid, d, g, d, g).x >= 0.0) {
+            count = 0u;
+            for (var i = first; i < end; i += WORKGROUP) {
+                aux[d + i] = -aux[g + i] * (P.initial_step / largest);
+            }
         }
     }
-    aux[sc + 1u] = f32(count);
-    aux[sc + 2u] = f32(newest);
+    if (lid == 0u) {
+        aux[sc + 1u] = f32(count);
+        aux[sc + 2u] = f32(newest);
+    }
 }
 
 // One invocation per collision sample: writes d(collision cost)/dq at that point of the curve.

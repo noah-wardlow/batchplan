@@ -100,12 +100,12 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - Work is split per queue submission (`EVAL_CHUNK`, `IK_ITERS_PER_SUBMIT`, `TRAJ_ITERS_PER_SUBMIT`) to stay under driver watchdogs.
 - Trajectory optimization is L-BFGS with a parallel line search. Each round dispatches five passes:
   1. `traj_costs`: the collision cost at every sample of every path moved by each line-search step;
-  2. `traj_search` (one invocation per path): the cheapest step moves the path if it lowers the cost, otherwise the history resets;
+  2. `traj_search` (one workgroup per path): the cheapest step moves the path if it lowers the cost, otherwise the history resets;
   3. `traj_samples`: the collision gradient at every sample;
   4. `traj_grad`: per free control point, basis-weighted sample gradients plus smoothness;
-  5. `lbfgs_direction` (one per path): record the last step and gradient change, then the two-loop recursion.
+  5. `lbfgs_direction` (one workgroup per path): record the last step and gradient change, then the two-loop recursion.
 
-  The first round only prices the seeds (their direction is still zero). `aux` holds each path's L-BFGS state (`lbfgs_stride`, mirrored by the `Lbfgs` struct in `cpu.rs`); paths are optimized in chunks whose state fits one storage binding.
+  The first round only prices the seeds (their direction is still zero). The per-path passes run one workgroup per path: each invocation owns every `WORKGROUP`-th element (coalesced loads), and sums go through `workgroup_sum`/`workgroup_max`, whose results come back through `workgroupUniformLoad` so later barriers stay in uniform control flow. `aux` holds each path's L-BFGS state (`lbfgs_stride`, mirrored by the `Lbfgs` struct in `cpu.rs`); paths are optimized in chunks whose state fits one storage binding.
 
 **Planning flow.** In `trajopt::plan`:
 1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Seed 0's free points lie on the straight line; the others bend through random via points.
