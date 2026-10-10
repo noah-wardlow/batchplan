@@ -1,8 +1,13 @@
 //! Collision worlds: obstacles and their signed distance functions. Batched queries reference
 //! worlds by index, so one call can cover thousands of different environments.
 
+use std::path::Path;
+
+use anyhow::{Result, bail};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
+
+use crate::description::Geometry;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,6 +45,46 @@ pub struct World {
 
 /// Value returned for clearances when there is nothing to collide with.
 pub(crate) const FAR: f32 = 1e30;
+
+/// Half thickness of the slab a plane becomes, and its half extent when the file gives none.
+const PLANE_SLAB: f32 = 0.05;
+const PLANE_EXTENT: f32 = 50.0;
+
+impl World {
+    /// The static collision geometry of a scene file: MJCF (`.xml`, `.mjcf`) geoms in the world
+    /// body and in bodies without joints, or OpenUSD (`.usd*`, feature `usd`) colliders outside
+    /// rigid bodies. Planes become slabs below their surface; ellipsoids become their bounding
+    /// boxes. Robots in the same file are left out.
+    pub fn load(path: impl AsRef<Path>) -> Result<World> {
+        let scene = crate::description::load_scene(path.as_ref())?;
+        let obstacles = scene
+            .iter()
+            .map(|s| {
+                let (center, rotation) = (s.origin.trans, Quat::from_mat3(&s.origin.rot));
+                Ok(match &s.geometry {
+                    Geometry::Box { half } => Obstacle::Cuboid { center, half_extents: *half, rotation },
+                    Geometry::Sphere { radius } => Obstacle::Sphere { center, radius: *radius },
+                    Geometry::Cylinder { radius, half_length } => {
+                        Obstacle::Cylinder { center, rotation, radius: *radius, half_height: *half_length }
+                    }
+                    Geometry::Capsule { radius, half_length } => {
+                        Obstacle::Capsule { center, rotation, radius: *radius, half_length: *half_length }
+                    }
+                    Geometry::Ellipsoid { radii } => Obstacle::Cuboid { center, half_extents: *radii, rotation },
+                    Geometry::Plane => Obstacle::Cuboid {
+                        center: center - s.origin.rot * Vec3::Z * PLANE_SLAB,
+                        half_extents: Vec3::new(PLANE_EXTENT, PLANE_EXTENT, PLANE_SLAB),
+                        rotation,
+                    },
+                    Geometry::Mesh { .. } | Geometry::TriMesh(_) => {
+                        bail!("mesh obstacles are not supported yet; replace them with primitives")
+                    }
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(World { obstacles })
+    }
+}
 
 impl Obstacle {
     /// Signed distance from `p` to the obstacle surface and its gradient (unit outward direction).

@@ -10,6 +10,13 @@ use glam::Vec3;
 
 use crate::robot::Transform;
 
+/// A model file's robot and scene.
+pub(crate) struct Model {
+    pub(crate) robot: RobotDescription,
+    /// Static collision geometry, with origins in the world frame.
+    pub(crate) scene: Vec<Shape>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RobotDescription {
     pub(crate) name: String,
@@ -52,6 +59,25 @@ pub(crate) struct JointDesc {
     pub(crate) mimic: Option<Mimic>,
 }
 
+impl JointDesc {
+    pub(crate) fn fixed(name: &str, parent: &str, child: &str, origin: Transform) -> Self {
+        JointDesc {
+            name: name.to_string(),
+            kind: JointType::Fixed,
+            parent: parent.to_string(),
+            child: child.to_string(),
+            origin,
+            axis: Vec3::Z,
+            lower: 0.0,
+            upper: 0.0,
+            max_velocity: f32::INFINITY,
+            max_acceleration: f32::INFINITY,
+            max_jerk: f32::INFINITY,
+            mimic: None,
+        }
+    }
+}
+
 /// `value = multiplier * value(joint) + offset`.
 #[derive(Clone, Debug)]
 pub(crate) struct Mimic {
@@ -70,11 +96,32 @@ pub(crate) struct Shape {
 /// Primitive sizes are half extents; round primitives are aligned with their local z axis.
 #[derive(Clone, Debug)]
 pub(crate) enum Geometry {
-    Box { half: Vec3 },
-    Sphere { radius: f32 },
-    Cylinder { radius: f32, half_length: f32 },
-    Capsule { radius: f32, half_length: f32 },
-    Mesh { path: PathBuf, scale: Vec3 },
+    Box {
+        half: Vec3,
+    },
+    Sphere {
+        radius: f32,
+    },
+    Cylinder {
+        radius: f32,
+        half_length: f32,
+    },
+    Capsule {
+        radius: f32,
+        half_length: f32,
+    },
+    Ellipsoid {
+        radii: Vec3,
+    },
+    /// The local z = 0 plane, solid below; only scenes have planes.
+    Plane,
+    Mesh {
+        path: PathBuf,
+        scale: Vec3,
+    },
+    /// A mesh given inline (USD) rather than by file.
+    #[cfg_attr(not(feature = "usd"), allow(dead_code))]
+    TriMesh(TriMesh),
 }
 
 /// A triangle mesh with outward-facing (counterclockwise) triangles.
@@ -116,10 +163,9 @@ impl Shape {
     pub(crate) fn mesh(&self) -> Result<TriMesh> {
         let mut mesh = match &self.geometry {
             Geometry::Box { half } => box_mesh(*half),
-            Geometry::Sphere { radius } => {
-                let profile: Vec<(f32, f32)> = (0..=12).map(|k| polar(*radius, PI * k as f32 / 12.0, 0.0)).collect();
-                lathe(&profile)
-            }
+            Geometry::Sphere { radius } => sphere_mesh(Vec3::splat(*radius)),
+            Geometry::Ellipsoid { radii } => sphere_mesh(*radii),
+            Geometry::Plane => bail!("a plane has no finite surface to fit spheres to"),
             Geometry::Cylinder { radius, half_length } => {
                 lathe(&[(0.0, -half_length), (*radius, -half_length), (*radius, *half_length), (0.0, *half_length)])
             }
@@ -130,6 +176,7 @@ impl Shape {
                 lathe(&profile)
             }
             Geometry::Mesh { path, scale } => load_mesh(path, *scale)?,
+            Geometry::TriMesh(mesh) => mesh.clone(),
         };
         if mesh.signed_volume6() < 0.0 {
             mesh.triangles.iter_mut().for_each(|t| t.swap(1, 2));
@@ -139,6 +186,13 @@ impl Shape {
         }
         Ok(mesh)
     }
+}
+
+fn sphere_mesh(radii: Vec3) -> TriMesh {
+    let profile: Vec<(f32, f32)> = (0..=12).map(|k| polar(1.0, PI * k as f32 / 12.0, 0.0)).collect();
+    let mut mesh = lathe(&profile);
+    mesh.vertices.iter_mut().for_each(|v| *v *= radii);
+    mesh
 }
 
 /// Point of a profile running from the bottom pole (`angle` 0) to the top pole (`angle` pi),
@@ -226,9 +280,38 @@ fn load_mesh(path: &Path, scale: Vec3) -> Result<TriMesh> {
 }
 
 /// Loads a robot description, choosing the format by file extension.
-pub(crate) fn load_robot(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescription> {
-    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+pub(crate) fn load_robot(
+    path: &Path,
+    package_dirs: &[PathBuf],
+    variants: &[(String, String)],
+) -> Result<RobotDescription> {
+    match extension(path).as_deref() {
         Some("urdf") => crate::urdf::load(path, package_dirs),
-        _ => bail!("{}: unsupported robot description format (expected .urdf)", path.display()),
+        Some("xml" | "mjcf") => Ok(crate::mjcf::load(path)?.robot),
+        Some("usd" | "usda" | "usdc" | "usdz") => Ok(load_usd(path, variants)?.robot),
+        _ => bail!("{}: unsupported robot description format (expected .urdf, .xml, .mjcf or .usd*)", path.display()),
     }
+}
+
+/// Loads a scene's static geometry, choosing the format by file extension.
+pub(crate) fn load_scene(path: &Path) -> Result<Vec<Shape>> {
+    match extension(path).as_deref() {
+        Some("xml" | "mjcf") => Ok(crate::mjcf::load(path)?.scene),
+        Some("usd" | "usda" | "usdc" | "usdz") => Ok(load_usd(path, &[])?.scene),
+        _ => bail!("{}: unsupported scene format (expected .xml, .mjcf or .usd*)", path.display()),
+    }
+}
+
+fn extension(path: &Path) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
+}
+
+#[cfg(feature = "usd")]
+fn load_usd(path: &Path, variants: &[(String, String)]) -> Result<Model> {
+    crate::usd::load(path, variants)
+}
+
+#[cfg(not(feature = "usd"))]
+fn load_usd(path: &Path, _: &[(String, String)]) -> Result<Model> {
+    bail!("{}: rebuild with `--features usd` to load OpenUSD files", path.display())
 }

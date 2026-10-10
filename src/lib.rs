@@ -31,6 +31,7 @@ mod gpu;
 pub mod ik;
 #[cfg(feature = "lerobot")]
 pub mod lerobot;
+mod mjcf;
 pub mod npy;
 pub mod rng;
 pub mod robot;
@@ -40,6 +41,8 @@ pub mod timing;
 pub mod trajopt;
 pub mod types;
 mod urdf;
+#[cfg(feature = "usd")]
+mod usd;
 pub mod world;
 
 pub use device::{CollisionWeights, Device, Evaluation};

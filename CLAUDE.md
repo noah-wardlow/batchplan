@@ -17,18 +17,21 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 37 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 42 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 2 export tests
-cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory)
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 5 OpenUSD tests
+cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
-cargo clippy --release --all-targets [--features lerobot]       # keep at zero warnings, both configurations
-cargo doc --no-deps --features lerobot                          # keep at zero warnings
+cargo clippy --release --all-targets [--features lerobot,usd]   # keep at zero warnings in every feature combination
+cargo doc --no-deps --features lerobot,usd                      # keep at zero warnings
 cargo run --release --example bench -- 512                      # GPU vs CPU throughput; BENCH_LLVMPIPE=1 adds the WGSL kernels on Mesa's CPU Vulkan driver
 scripts/fetch_benchmark.sh && cargo run --release --example benchmark   # MotionBenchMaker + MπNets (2,600 Panda problems), GPU and CPU
 cargo run --release --example datagen -- data/demo 512 20       # .npy dataset: <out_dir> [worlds] [fps]
 cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20
 REMOTE=user@host SSH_OPTS='...' scripts/sync.sh '<command>'     # rsync to ~/batchplan on a GPU box and run there
 ```
+
+Checking USD loading against Pixar's `usd-core` (in the same `.venv`): `uv pip install --python .venv/bin/python usd-core && .venv/bin/python scripts/validate_usd.py`.
 
 Checking a LeRobot export with the real package requires a `.venv`, which is git-ignored:
 
@@ -50,7 +53,8 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - Algorithm modules own seeding (the shared `rng::Rng`), validation and selection. Both devices therefore see bit-identical inputs.
 - **Results carry their problems.** Use `IkResult::solved()` / `PlanResult::solved()`, which yield each problem with its best solution. Take the world from the problem, never from the problem's position in the list.
 - **Small interfaces.** `Robot` exposes accessors and pose queries only; its internals are `pub(crate)`. Prefer deepening an existing module to adding a new public one.
-- **Loaders stay thin.** A loader (`urdf.rs`) only translates a file into the crate-private `RobotDescription` (`description.rs`). Kinematics, sphere fitting and self-collision analysis work on the description, never on a file format.
+- **Loaders stay thin.** A loader (`urdf.rs`, `mjcf.rs`, `usd.rs` behind feature `usd`) only translates a file into the crate-private `Model` (`description.rs`): a `RobotDescription` and static scene shapes. Kinematics, sphere fitting, self-collision analysis and `World::load` work on those, never on a file format.
+- **USD stays optional.** The `openusd` crates are pinned exactly (`=0.7.0`, pre-1.0) and only built with feature `usd`.
 - **Standalone, with optional bridges.**
   - The core has no middleware and reads no environment variables. Env vars appear only in tests and examples (`BATCHPLAN_REQUIRE_GPU`, `BENCH_LLVMPIPE`).
   - LeRobot export is behind the `lerobot` cargo feature, so the Arrow/Parquet dependencies stay optional.

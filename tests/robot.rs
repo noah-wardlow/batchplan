@@ -366,9 +366,13 @@ fn tabletop(robot: &Robot, cpu: &Device, rng: &mut Rng) -> World {
 #[test]
 fn every_test_arm_loads_spherizes_and_plans() {
     let panda = RobotOptions { collision_model: None, ..common::panda_options() };
-    for (path, options) in
-        [(UR5E, RobotOptions::default()), (SO101, RobotOptions::default()), ("franka/franka_panda.urdf", panda)]
-    {
+    let arms = [
+        (UR5E, RobotOptions::default()),
+        ("menagerie/universal_robots_ur5e/ur5e.xml", RobotOptions::default()),
+        (SO101, RobotOptions::default()),
+        ("franka/franka_panda.urdf", panda),
+    ];
+    for (path, options) in arms {
         let robot = Robot::load(common::asset(path), &options).unwrap();
         let cpu = Device::cpu(&robot);
         let mut rng = Rng::new(12);

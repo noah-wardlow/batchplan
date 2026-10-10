@@ -29,8 +29,8 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
-| `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `CollisionModel::{load, save}` | Any URDF, with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
-| `world`, `types` | `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles. Shared data types with documented row-major shapes. |
+| `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
+| `world`, `types` | `World::load(path)`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles; static geometry from MJCF or USD scenes. Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
@@ -91,7 +91,17 @@ Performance claims come from alternating runs of two builds on one machine. Two 
 
 ## Robots
 
-`Robot::load` reads a URDF, resolving `package://` paths through `RobotOptions::package_dirs` and then through the directories above the file. Everything after loading works on a format-agnostic description, so other formats only need a loader.
+`Robot::load` picks a loader by file extension. Each loader only translates its format into one crate-private description; kinematics, spheres and self-collision analysis never see the format.
+- **URDF.** `package://` paths resolve through `RobotOptions::package_dirs` and then through the directories above the file.
+- **MJCF (`.xml`, `.mjcf`).** A native parser covering what kinematics and collision need: `<include>`, `<default>` classes and `childclass`, the compiler's angle units (degrees unless told otherwise), mesh directory and Euler sequence, every orientation form, bodies with several joints, `fromto`, and `<equality><joint>` as mimic joints. Body subtrees with a joint are the robot; jointless bodies and world geoms are the scene. `connect`/`weld` loops cannot be represented in a tree and are ignored. MJCF has no velocity limits, so `RobotOptions::max_velocity` (2 rad/s) applies.
+- **OpenUSD (`.usd`, `.usda`, `.usdc`, `.usdz`; feature `usd`).** Built on the pure-Rust `openusd` crates (0.7.0, pinned).
+  - **Links and joints:** UsdPhysics rigid bodies are links. The tree grows from the world over Revolute, Prismatic and Fixed joints, using `localPos`/`localRot` on both sides. Joints authored from child to parent are flipped; loop-closing and excluded joints are skipped.
+  - **Units:** stage units (`metersPerUnit`, centimeters when unset) and Y-up stages are converted. Revolute limits and angular velocity limits are degrees.
+  - **Mimic joints:** from `NewtonMimicAPI` or `PhysxMimicJointAPI`.
+  - **Collision geometry:** from `PhysicsCollisionAPI` prims, including instanced ones, with unauthored schema sizes and transform scale applied.
+  - **Frames:** ghost-link `Xform`s (such as an end-effector frame) become fixed frames.
+  - **Variants:** `RobotOptions::variants` selects variants where the file authors no selection.
+- **Scenes.** `World::load` reads the static geometry of an MJCF or USD scene as obstacles; planes become slabs, ellipsoids their bounding boxes, and mesh obstacles are refused for now.
 
 - **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Up to 16 actuated joints, 16 moving joints (actuated plus mimic), 32 links and 128 spheres.
 - **Collision spheres.** Without a collision model, spheres are fitted to each link's collision geometry (or its visual geometry) with cuRobo's voxel method:
@@ -109,7 +119,10 @@ Performance claims come from alternating runs of two builds on one machine. Two 
   `RobotOptions::srdf` adds a MoveIt SRDF's disabled pairs.
 - **Collision-model files.** `robot.collision_model().save(path)` writes the spheres, self-collision buffers and ignored pairs as JSON. Commit the file, tune it by hand if needed, and load it back through `RobotOptions::collision_model`.
 
-Test robots live in `assets/` with their licences ([assets/README.md](assets/README.md)): the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints).
+Test robots live in `assets/` with their licences ([assets/README.md](assets/README.md)):
+- URDF: the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints);
+- MJCF: MuJoCo Menagerie's Panda, UR5e and 2F-85;
+- USD: newton-assets' UR5e and 2F-85, a Franka converted from our URDF with NVIDIA's urdf-usd-converter, and handwritten fixtures for each UsdPhysics convention.
 
 ## Executable trajectories
 
@@ -155,7 +168,7 @@ GPU latency at batch size 1 is dominated by per-call setup and readback, which i
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 37 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 42 tests; `--features lerobot` adds 2 export tests and `--features usd` adds 5 OpenUSD tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
@@ -180,6 +193,19 @@ GPU latency at batch size 1 is dominated by per-call setup and readback, which i
   - Fitted spheres contain independently sampled link surfaces, and fitting is deterministic.
   - Collision-model files round-trip, SRDF pairs stop being checked, and `package://` paths resolve.
   - The UR5e, SO-101 and Panda (with fitted spheres) each plan 12 of 12 tabletop motions on the CPU and the GPU.
+- **MJCF:**
+  - Menagerie's Panda matches our URDF Panda link for link to 1e-5.
+  - Menagerie's UR5e matches the UR5e URDF up to constant per-link frame offsets (within 3 mm; Menagerie rounds a few dimensions), and plans like the others.
+  - A handwritten model pins MuJoCo's conventions against hand-composed transforms: degrees by default, intrinsic Euler sequences, `axisangle`, `xyaxes`, `zaxis`, joint anchors, several joints per body, includes, default classes and `fromto`. Planting radians as the default, extrinsic Euler composition, ignored anchors, or static bodies in the robot fails a test.
+- **OpenUSD:**
+  - Handwritten fixtures pin UsdPhysics conventions against hand-composed transforms:
+    - Y-up centimeters, a payload and a variant fallback;
+    - flat and nested bodies, `localPos1` ≠ 0, a joint authored child to parent;
+    - both mimic schemas, an instanced collider, and unauthored primitive sizes.
+  - Planting a wrong up-axis rotation, ignored units, an unflipped swapped joint, an ignored `localPos1`, mimic offsets left in degrees, a wrong PhysX gearing sign, skipped instance proxies or a wrong default cube size fails a test.
+  - newton-assets' UR5e matches the Menagerie MJCF it was converted from exactly. Their 2F-85 mimics its driver and fits spheres to mesh colliders read from a binary layer.
+  - The Franka converted from our URDF matches it to 1e-5, with identical self-collision results under the same collision model.
+  - `scripts/validate_usd.py` rebuilds every fixture's kinematics with Pixar's `usd-core` and agrees with batchplan to within 6e-6.
 - **Adapter errors:** adapters below the required limits are rejected with the reason, and an unknown adapter name is a clear error.
 
 ## Training data
@@ -229,7 +255,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 ## Limits of the MVP
 
 - **Geometry.** The robot is modeled as spheres only, and obstacles as boxes, spheres, cylinders and capsules. There are no meshes, point clouds or depth-derived distance fields yet.
-- **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating and planar joints aren't supported.
+- **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating, planar and ball joints aren't supported; closed loops (MJCF `connect`, USD loop joints) are dropped from the tree.
 - **Long motions.** Trajectory optimization alone does not escape seeds that sweep through obstacles. Goals across the UR5e's full ±2π joint ranges in a tabletop world fail this way.
 - **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search.
 - **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.

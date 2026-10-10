@@ -137,6 +137,10 @@ pub struct RobotOptions {
     pub spheres: SphereOptions,
     /// A MoveIt SRDF whose disabled collision pairs are added to the collision model's.
     pub srdf: Option<PathBuf>,
+    /// OpenUSD variant selections, as (variant set, variant), used where the file authors none.
+    pub variants: Vec<(String, String)>,
+    /// Velocity limit (rad/s or m/s) for joints whose description gives none (MJCF has none).
+    pub max_velocity: f32,
     /// Acceleration limit (rad/s² or m/s²) for joints whose description gives none.
     pub max_acceleration: f32,
     /// Jerk limit (rad/s³ or m/s³) for joints whose description gives none.
@@ -154,6 +158,8 @@ impl Default for RobotOptions {
             collision_model: None,
             spheres: SphereOptions::default(),
             srdf: None,
+            variants: vec![],
+            max_velocity: 2.0,
             max_acceleration: 5.0,
             max_jerk: 50.0,
         }
@@ -200,10 +206,10 @@ impl Fk {
 }
 
 impl Robot {
-    /// Loads a robot from a URDF file.
+    /// Loads a robot from URDF, MJCF (`.xml`, `.mjcf`) or OpenUSD (`.usd*`, feature `usd`).
     pub fn load(path: impl AsRef<Path>, o: &RobotOptions) -> Result<Self> {
         let path = path.as_ref();
-        let description = description::load_robot(path, &o.package_dirs)?;
+        let description = description::load_robot(path, &o.package_dirs, &o.variants)?;
         Self::from_description(&description, o).with_context(|| format!("building the robot in {}", path.display()))
     }
 
@@ -470,7 +476,7 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         };
         lower.push(lo);
         upper.push(hi);
-        max_velocity.push(joint.max_velocity);
+        max_velocity.push(or_default(joint.max_velocity, o.max_velocity));
         max_acceleration.push(or_default(joint.max_acceleration, o.max_acceleration));
         max_jerk.push(or_default(joint.max_jerk, o.max_jerk));
     }
@@ -539,9 +545,6 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         (0..dof_names.len()).find(|&d| lower[d] > upper[d] || !(lower[d].is_finite() && upper[d].is_finite()))
     {
         bail!("joint '{}' has an empty range once its mimic joints' limits apply", dof_names[dof]);
-    }
-    if let Some(dof) = (0..dof_names.len()).find(|&d| !max_velocity[d].is_finite()) {
-        bail!("joint '{}' has no velocity limit", dof_names[dof]);
     }
 
     let ee_link = match &o.ee_link {

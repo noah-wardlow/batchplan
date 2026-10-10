@@ -13,3 +13,16 @@ descriptions reference are not.
 
 The UR5e and 2F-85 sit inside their ROS packages, so their `package://` mesh paths resolve by
 searching upward for `package.xml`.
+
+## MJCF and USD
+
+| Folder | Source | Licence | Changes |
+|---|---|---|---|
+| `menagerie/franka_emika_panda/` | google-deepmind/mujoco_menagerie at `0059d43` (`panda.xml`, `scene.xml`) | Apache-2.0 (its `LICENSE`) | none; meshes not included |
+| `menagerie/universal_robots_ur5e/` | mujoco_menagerie at `0059d43` (`ur5e.xml`) | BSD-3-Clause (its `LICENSE`) | none; meshes not included |
+| `menagerie/robotiq_2f85/` | mujoco_menagerie at `0059d43` (`2f85.xml`) | BSD-2-Clause (its `LICENSE`) | none; meshes not included |
+| `newton/universal_robots_ur5e/` | newton-physics/newton-assets at `a054754` | BSD-3-Clause (its `LICENSE`) | `GeometryLibrary.usdc` and `MaterialsLibrary.usdc` (visual meshes) not included; collision geometry is primitives |
+| `newton/robotiq_2f85_v4/` | newton-assets at `a054754` | BSD-2-Clause (its `LICENSE`) | `README.md` not included |
+| `franka/usd/` | Converted from `franka/franka_panda.urdf` with NVIDIA's urdf-usd-converter 0.3.3 | Apache-2.0 (`franka/LICENSE`) | visual meshes absent (as in the URDF assets) |
+| `usd/` | Written for batchplan's tests | MIT OR Apache-2.0 | |
+
