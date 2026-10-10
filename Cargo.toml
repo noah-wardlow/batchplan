@@ -11,8 +11,11 @@ publish = false
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.33", features = ["serde"] }
+mesh-loader = "0.1"
+parry3d = { version = "0.31", default-features = false, features = ["required-features", "std", "alloc"] }
 pollster = "1"
 rayon = "1"
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 urdf-rs = "0.10"

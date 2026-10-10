@@ -8,7 +8,7 @@ use batchplan::*;
 use glam::Vec3;
 
 fn panda() -> Robot {
-    Robot::from_config_file(common::panda_config()).unwrap()
+    common::panda().unwrap()
 }
 
 fn devices(robot: &Robot) -> Vec<Device> {

@@ -22,7 +22,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use batchplan::timing::{RetimeOptions, retime};
 use batchplan::*;
-use glam::{Affine3A, Quat, Vec3};
+use glam::{Quat, Vec3};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -118,27 +118,6 @@ fn args() -> Result<Args> {
     Ok(a)
 }
 
-/// Converts `panda_hand` goals into goals for the robot's IK frame.
-struct Frames {
-    hand_to_ee: Affine3A,
-}
-
-impl Frames {
-    fn new(robot: &Robot) -> Self {
-        let q = robot.default_q();
-        let affine = |p: Pose| Affine3A::from_rotation_translation(p.rotation, p.position);
-        let hand = affine(robot.link_pose(q, "panda_hand").expect("the Panda has a panda_hand link"));
-        Self { hand_to_ee: hand.inverse() * affine(robot.ee_pose(q)) }
-    }
-
-    fn ee_goal(&self, hand: Pose) -> Pose {
-        let (_, rotation, position) = (Affine3A::from_rotation_translation(hand.rotation, hand.position)
-            * self.hand_to_ee)
-            .to_scale_rotation_translation();
-        Pose { position, rotation }
-    }
-}
-
 #[derive(Default)]
 struct Outcome {
     success: usize,
@@ -208,17 +187,13 @@ fn percentile(v: &mut [f64], p: f64) -> f64 {
     v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
-fn ik_problems(problems: &[Problem], frames: &Frames) -> Vec<IkProblem> {
-    problems
-        .iter()
-        .enumerate()
-        .map(|(i, p)| IkProblem { world: i as u32, target: frames.ee_goal(p.hand_goal()) })
-        .collect()
+fn ik_problems(problems: &[Problem]) -> Vec<IkProblem> {
+    problems.iter().enumerate().map(|(i, p)| IkProblem { world: i as u32, target: p.hand_goal() }).collect()
 }
 
 /// IK for every goal, then a plan from each start to its best IK solution.
-fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem], frames: &Frames) -> Result<PlanResult> {
-    let ik = solve_ik(device, worlds, &ik_problems(problems, frames), &IkOptions::default())?;
+fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem]) -> Result<PlanResult> {
+    let ik = solve_ik(device, worlds, &ik_problems(problems), &IkOptions::default())?;
     let plans: Vec<PlanProblem> = ik
         .solved()
         .map(|s| PlanProblem {
@@ -232,8 +207,9 @@ fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem], frames: 
 
 fn main() -> Result<()> {
     let args = args()?;
-    let robot = Robot::from_config_file(common::panda_config())?;
-    let frames = Frames::new(&robot);
+    // Goals are poses of the hand frame.
+    let options = RobotOptions { ee_link: Some("panda_hand".into()), ..common::panda_options() };
+    let robot = Robot::load(common::asset("franka/franka_panda.urdf"), &options)?;
     let cpu = Device::cpu(&robot);
     let mut devices = vec![];
     if args.device != "cpu" {
@@ -291,7 +267,7 @@ fn main() -> Result<()> {
                 Outcome { seconds: t.elapsed().as_secs_f64(), ..score(&robot, &cpu, &worlds, problems, &planned)? };
 
             let t = Instant::now();
-            let full_result = ik_and_plan(device, &worlds, problems, &frames)?;
+            let full_result = ik_and_plan(device, &worlds, problems)?;
             let full =
                 Outcome { seconds: t.elapsed().as_secs_f64(), ..score(&robot, &cpu, &worlds, problems, &full_result)? };
 
@@ -306,7 +282,7 @@ fn main() -> Result<()> {
             let mut latency = vec![];
             for i in 0..args.latency.min(problems.len()) {
                 let t = Instant::now();
-                ik_and_plan(device, &worlds[i..i + 1], &problems[i..i + 1], &frames)?;
+                ik_and_plan(device, &worlds[i..i + 1], &problems[i..i + 1])?;
                 latency.push(t.elapsed().as_secs_f64() * 1e3);
             }
             all_latency.extend(&latency);

@@ -3,12 +3,31 @@
 
 use std::f32::consts::PI;
 
+use std::collections::HashMap;
+
 use batchplan::rng::Rng;
-use batchplan::{Obstacle, Pose, World};
+use batchplan::{CollisionModel, Obstacle, Pose, Robot, RobotOptions, World};
 use glam::{Quat, Vec3};
 
-pub fn panda_config() -> String {
-    format!("{}/assets/franka/panda.json", env!("CARGO_MANIFEST_DIR"))
+pub fn asset(path: &str) -> String {
+    format!("{}/assets/{path}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The Franka Panda with its fingers held open, a 10 cm tool frame below the hand as the IK
+/// frame, and hand-tuned collision spheres converted from cuRobo.
+pub fn panda_options() -> RobotOptions {
+    let fingers = [("panda_finger_joint1".to_string(), 0.04), ("panda_finger_joint2".to_string(), 0.04)];
+    RobotOptions {
+        ee_link: Some("ee_link".into()),
+        lock_joints: HashMap::from(fingers),
+        default_q: Some(vec![0.0, -1.3, 0.0, -2.5, 0.0, 1.5, 0.8]),
+        collision_model: Some(CollisionModel::load(asset("franka/panda_collision.json")).expect("Panda spheres")),
+        ..Default::default()
+    }
+}
+
+pub fn panda() -> anyhow::Result<Robot> {
+    Robot::load(asset("franka/franka_panda.urdf"), &panda_options())
 }
 
 /// A table at z = 0 (the robot base height) with 2-6 random boxes in front of the robot.

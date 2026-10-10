@@ -17,9 +17,9 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 21 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 32 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 2 export tests
-cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export)
+cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot]       # keep at zero warnings, both configurations
 cargo doc --no-deps --features lerobot                          # keep at zero warnings
@@ -50,6 +50,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - Algorithm modules own seeding (the shared `rng::Rng`), validation and selection. Both devices therefore see bit-identical inputs.
 - **Results carry their problems.** Use `IkResult::solved()` / `PlanResult::solved()`, which yield each problem with its best solution. Take the world from the problem, never from the problem's position in the list.
 - **Small interfaces.** `Robot` exposes accessors and pose queries only; its internals are `pub(crate)`. Prefer deepening an existing module to adding a new public one.
+- **Loaders stay thin.** A loader (`urdf.rs`) only translates a file into the crate-private `RobotDescription` (`description.rs`). Kinematics, sphere fitting and self-collision analysis work on the description, never on a file format.
 - **Standalone, with optional bridges.**
   - The core has no middleware and reads no environment variables. Env vars appear only in tests and examples (`BATCHPLAN_REQUIRE_GPU`, `BENCH_LLVMPIPE`).
   - LeRobot export is behind the `lerobot` cargo feature, so the Arrow/Parquet dependencies stay optional.
@@ -69,7 +70,8 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   2. Fill it in `GpuBackend`.
   3. Read it in WGSL as `P.<field>` (or `IT.<field>` for per-iteration values).
   4. Mirror it in `cpu.rs`.
-- The kernel limits (`MAX_DOF` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) are defined in `robot.rs` and enforced when a robot loads.
+- The kernel limits (`MAX_DOF` = 16, `MAX_JOINTS` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) are defined in `robot.rs` and enforced when a robot loads.
+- Per-joint kernel state (`jaxis`, `janchor`) is indexed by `Link.joint`, the moving-joint number, and sized `MAX_JOINTS`. Arrays that small stay in registers on AMD; indexing them per link (32 entries) cost 20% of GPU planning time.
 
 **GPU details.**
 - Bind group 0 has 11 storage buffers. `unmet_limits` skips adapters that can't provide them, and the error names each rejected adapter and what it lacks.
@@ -97,7 +99,10 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - `action` is the next frame's state. `observation.environment_state` holds the goal plus padded obstacles.
   - Extension columns use names outside `observation.*` and `action*`, so LeRobot policies ignore them.
 
-**Robot model.** `assets/franka/panda.json` points at the URDF and supplies collision spheres, self-collision buffers and ignore pairs, all converted from cuRobo. Both are Apache-2.0, credited in the README; keep that credit when touching assets.
+**Robot model.**
+- `Robot::load` → `description::load_robot` (by extension) → `kinematics` (breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a multiplier and offset, locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
+- Gradients and Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order.
+- `assets/franka/panda_collision.json` holds cuRobo's hand-tuned Panda spheres (Apache-2.0, credited in the README and `assets/README.md`); keep that credit when touching assets. `examples/common/mod.rs` has the Panda's options (locked fingers, `ee_link`, default pose).
 
 ## Working rules
 

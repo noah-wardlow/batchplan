@@ -1,21 +1,5 @@
 {
- "_source": "Collision spheres, self-collision buffers/ignores and default pose converted from NVlabs/curobo curobo/content/configs/robot/franka.yml (Apache-2.0, Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES).",
- "urdf": "franka_panda.urdf",
- "base_link": "base_link",
- "ee_link": "ee_link",
- "lock_joints": {
-  "panda_finger_joint1": 0.04,
-  "panda_finger_joint2": 0.04
- },
- "default_q": [
-  0.0,
-  -1.3,
-  0.0,
-  -2.5,
-  0.0,
-  1.5,
-  0.8
- ],
+ "source": "Collision spheres, self-collision buffers/ignores and default pose converted from NVlabs/curobo curobo/content/configs/robot/franka.yml (Apache-2.0, Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES).",
  "spheres": {
   "panda_link0": [
    [

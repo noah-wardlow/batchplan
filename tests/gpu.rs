@@ -8,7 +8,7 @@ use batchplan::rng::Rng;
 use batchplan::*;
 
 fn setup() -> Option<(Robot, Device, Device)> {
-    let robot = Robot::from_config_file(common::panda_config()).unwrap();
+    let robot = common::panda().unwrap();
     match Device::gpu(&robot) {
         Ok(gpu) => {
             eprintln!("using {}", gpu.name());
@@ -25,7 +25,7 @@ fn setup() -> Option<(Robot, Device, Device)> {
 
 #[test]
 fn unknown_adapter_is_a_clear_error() {
-    let robot = Robot::from_config_file(common::panda_config()).unwrap();
+    let robot = common::panda().unwrap();
     let err = Device::gpu_named(&robot, "no-such-gpu").err().expect("should fail").to_string();
     assert!(err.contains("no-such-gpu"), "{err}");
 }

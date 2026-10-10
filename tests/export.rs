@@ -11,7 +11,7 @@ use batchplan::rng::Rng;
 use batchplan::*;
 
 fn demos(dt: f32) -> (Robot, Vec<World>, Vec<Demonstration>) {
-    let robot = Robot::from_config_file(common::panda_config()).unwrap();
+    let robot = common::panda().unwrap();
     let device = Device::cpu(&robot);
     let mut rng = Rng::new(3);
     let worlds: Vec<World> = (0..6).map(|_| common::tabletop(&mut rng)).collect();

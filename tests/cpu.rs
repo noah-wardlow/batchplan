@@ -11,7 +11,7 @@ use batchplan::*;
 use glam::{DMat3, DVec3, Quat, Vec3};
 
 fn panda() -> Robot {
-    Robot::from_config_file(common::panda_config()).unwrap()
+    common::panda().unwrap()
 }
 
 fn random_q(robot: &Robot, rng: &mut Rng) -> Vec<f32> {

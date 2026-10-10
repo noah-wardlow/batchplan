@@ -7,15 +7,16 @@
 //!   the exporters ([`npy`], `lerobot`) are independent modules that take a `Device` and exchange
 //!   the [`types`]; there are no planner plugins or runtime configuration. Results keep the
 //!   problems they answer (`solved()`).
-//! - **Standalone.** No middleware; robots load from URDF plus a collision-sphere config.
-//!   Datasets export to LeRobot v3.0 with the optional `lerobot` feature.
+//! - **Standalone.** No middleware. Robots load from URDF; collision spheres are fitted to their
+//!   geometry or loaded from a committed collision-model file. Datasets export to LeRobot v3.0
+//!   with the optional `lerobot` feature.
 //!
 //! ```no_run
 //! use batchplan::*;
-//! let robot = Robot::from_config_file("assets/franka/panda.json")?;
+//! let robot = Robot::load("assets/ur5e/ur_description/urdf/ur5e.urdf", &RobotOptions::default())?;
 //! let device = Device::gpu(&robot)?;
 //! let worlds = vec![World::default()];
-//! let goal = vec![0.5, -0.5, 0.0, -2.0, 0.0, 1.6, 0.8];
+//! let goal = vec![0.5, -1.2, 1.0, -1.4, -1.5, 0.3];
 //! let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal }];
 //! let result = plan(&device, &worlds, &problems, &PlanOptions::default())?;
 //! println!("solved: {}", result.best(0).is_some());
@@ -24,6 +25,7 @@
 
 mod cpu;
 pub mod datagen;
+mod description;
 pub mod device;
 mod gpu;
 pub mod ik;
@@ -32,14 +34,17 @@ pub mod lerobot;
 pub mod npy;
 pub mod rng;
 pub mod robot;
+pub mod spheres;
 pub mod timing;
 pub mod trajopt;
 pub mod types;
+mod urdf;
 pub mod world;
 
 pub use device::{CollisionWeights, Device, Evaluation};
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
-pub use robot::Robot;
+pub use robot::{CollisionModel, Robot, RobotOptions};
+pub use spheres::{SphereGeometry, SphereOptions};
 pub use trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
 pub use types::{JointPaths, JointTrajectory, Pose, Solved};
 pub use world::{Obstacle, World};

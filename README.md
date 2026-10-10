@@ -29,7 +29,8 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
-| `robot`, `world`, `types` | `Robot::from_config_file`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | URDF + collision-sphere config. Box, sphere, cylinder and capsule obstacles. Shared data types with documented row-major shapes. |
+| `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `CollisionModel::{load, save}` | Any URDF, with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
+| `world`, `types` | `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles. Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
@@ -51,7 +52,7 @@ Set `BENCH_LLVMPIPE=1` to also run the WGSL kernels on the CPU through Mesa's ll
 
 ```rust
 use batchplan::*;
-let robot = Robot::from_config_file("assets/franka/panda.json")?;
+let robot = Robot::load("assets/ur5e/ur_description/urdf/ur5e.urdf", &RobotOptions::default())?;
 let device = Device::gpu(&robot)?;
 let ik = solve_ik(&device, &worlds, &ik_problems, &IkOptions::default())?;
 // Each solved IK problem carries its world, so the handoff can't mix up worlds.
@@ -90,6 +91,28 @@ All three machines were measured at commit `950e06c` on otherwise idle machines.
 
 `datagen -- data/demo 512 20` produced 481 nominal and 932 recovery episodes from 512 worlds on the Framework, in about 3.3 s of planning. Peak joint speed reaches 0.99 of the limit, and recovery starts sit a median 0.35 rad off the nominal path.
 
+## Robots
+
+`Robot::load` reads a URDF, resolving `package://` paths through `RobotOptions::package_dirs` and then through the directories above the file. Everything after loading works on a format-agnostic description, so other formats only need a loader.
+
+- **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Up to 16 actuated joints, 16 moving joints (actuated plus mimic), 32 links and 128 spheres.
+- **Collision spheres.** Without a collision model, spheres are fitted to each link's collision geometry (or its visual geometry) with cuRobo's voxel method:
+  1. Interior grid points become candidate spheres that touch the surface.
+  2. A greedy cover picks the candidates that reach the most surface samples.
+  3. One overhang is searched for across the whole robot, the smallest at which the cover fits the budget (64 spheres by default).
+  4. Spheres grow until 20,000 surface samples per link are inside them, so the model is conservative.
+
+  The model's `source` records how far its spheres reach beyond the geometry. With 64 spheres that is 3.0 cm on the UR5e and the Panda, 1.9 cm on the SO-101 and 1.2 cm on the 2F-85. Sharp convex edges cost the most spheres. Fresh surface samples land at most 0.8 mm outside the UR5e's spheres.
+- **Self-collision pairs** follow MoveIt's setup assistant:
+  - adjacent links are skipped;
+  - so are pairs whose spheres already overlap at the default configuration;
+  - so are pairs whose geometry never touches across 10,000 random configurations. This test uses the meshes, not the spheres, so sphere overhang does not keep pairs that cannot really collide.
+
+  `RobotOptions::srdf` adds a MoveIt SRDF's disabled pairs.
+- **Collision-model files.** `robot.collision_model().save(path)` writes the spheres, self-collision buffers and ignored pairs as JSON. Commit the file, tune it by hand if needed, and load it back through `RobotOptions::collision_model`.
+
+Test robots live in `assets/` with their licences ([assets/README.md](assets/README.md)): the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints).
+
 ## Benchmark
 
 `scripts/fetch_benchmark.sh` downloads the standard Panda problem sets that [robometrics](https://github.com/fishbotics/robometrics) packages as plain YAML (MIT): MotionBenchMaker's 800 problems in 8 sets and MπNets' 1,800 in 12, at a pinned commit with checksums. No ROS is involved. `cargo run --release --example benchmark` runs every set on the GPU and the CPU in two modes:
@@ -111,7 +134,7 @@ Baseline before the improvements below, all 2,600 problems:
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 21 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 32 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
@@ -125,6 +148,12 @@ Baseline before the improvements below, all 2,600 problems:
 - **CPU IK and retiming:** IK solves targets taken from collision-free configurations; retiming respects velocity limits and keeps the endpoints.
 - **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
 - **Obstacle distances:** every obstacle kind returns unit gradients that match finite differences, stepping back along the gradient lands on the surface, and cylinder and capsule distances match closed forms. The GPU agrees with the CPU for each kind.
+- **Robots from URDF:**
+  - The 2F-85's link poses match an independent composition of its URDF with mimic joints applied. Its collision gradient matches finite differences, and the GPU agrees with the CPU. Planting a dropped multiplier in the CPU kinematics, the CPU gradient or the GPU gradient fails a test.
+  - Mimic limits intersect into the leader's range and velocity.
+  - Fitted spheres contain independently sampled link surfaces, and fitting is deterministic.
+  - Collision-model files round-trip, SRDF pairs stop being checked, and `package://` paths resolve.
+  - The UR5e, SO-101 and Panda (with fitted spheres) each plan 12 of 12 tabletop motions on the CPU and the GPU.
 - **Adapter errors:** adapters below the required limits are rejected with the reason, and an unknown adapter name is a clear error.
 
 ## Training data
@@ -174,15 +203,16 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 ## Limits of the MVP
 
 - **Geometry.** The robot is modeled as spheres only, and obstacles as boxes, spheres, cylinders and capsules. There are no meshes, point clouds or depth-derived distance fields yet.
-- **Kinematics.** The tree is limited to 16 actuated joints, 32 links and 128 spheres. Mimic joints must be locked.
+- **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating and planar joints aren't supported.
+- **Long motions.** Trajectory optimization alone does not escape seeds that sweep through obstacles. Goals across the UR5e's full ±2π joint ranges in a tabletop world fail this way.
 - **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search. Validation follows the linear interpolation between waypoints. Retiming does not bound accelerations at waypoint corners.
 - **Kernel performance.** Kernels run one invocation per configuration (or per waypoint), with no shared memory or subgroup work. Buffers are allocated per call. This leaves performance on the table.
 - **Training data.** Demonstrations are state-only reaches with the gripper held open, and every episode shares one task string. The LeRobot export writes all episode metadata to a single file, which caps it at roughly 100k episodes.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. The bundled Franka assets under `assets/franka` are Apache-2.0 (see below).
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. The test robots under `assets/` keep their own licences (see below).
 
 ## Attribution
 
-`assets/franka/franka_panda.urdf` is from franka_ros (Apache-2.0; see `assets/franka/LICENSE`). The collision spheres, self-collision buffers, ignore pairs and default pose in `assets/franka/panda.json` are converted from NVlabs/curobo `franka.yml` (Apache-2.0, © NVIDIA).
+[assets/README.md](assets/README.md) lists each test robot's source, licence and changes. In short: the Franka Panda is from franka_ros and NVlabs/curobo (Apache-2.0); its collision spheres in `assets/franka/panda_collision.json` are converted from cuRobo's `franka.yml` (Apache-2.0, © NVIDIA). The UR5e is from Universal Robots' ROS 2 description (BSD-3-Clause), the Robotiq 2F-85 from PickNik's ros2_robotiq_gripper (BSD-3-Clause), and the SO-101 from TheRobotStudio's SO-ARM100 (Apache-2.0).

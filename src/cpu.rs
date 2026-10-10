@@ -114,11 +114,8 @@ fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, g
         if gc[s] == Vec3::ZERO {
             continue;
         }
-        let mask = robot.links[robot.spheres[s].link].dof_mask;
-        for (j, gj) in grad.iter_mut().enumerate() {
-            if mask >> j & 1 == 1 {
-                *gj += gc[s].dot(fk.dpoint(j, sc[s]));
-            }
+        for (i, dof, m) in robot.chain(robot.spheres[s].link) {
+            grad[dof] += m * gc[s].dot(fk.dpoint(i, sc[s]));
         }
     }
     CollisionOut { cost, world_clearance: wmin, self_clearance: smin }
@@ -196,15 +193,12 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     let fk = robot.fk(q);
     let (e, _, _) = pose_error(robot, &fk, target, o.rot_weight);
     let ee = robot.ee_link;
-    let mask = robot.links[ee].dof_mask;
     let mut jac = [[0.0f32; MAX_DOF]; 6];
-    for j in 0..n {
-        if mask >> j & 1 == 1 {
-            let jp = fk.dpoint(j, fk.pos[ee]);
-            let jo = if fk.prismatic >> j & 1 == 1 { Vec3::ZERO } else { fk.axis[j] * o.rot_weight };
-            for (r, v) in [jp.x, jp.y, jp.z, jo.x, jo.y, jo.z].into_iter().enumerate() {
-                jac[r][j] = v;
-            }
+    for (i, dof, m) in robot.chain(ee) {
+        let jp = m * fk.dpoint(i, fk.pos[ee]);
+        let jo = if fk.prismatic >> i & 1 == 1 { Vec3::ZERO } else { m * fk.axis[i] * o.rot_weight };
+        for (r, v) in [jp.x, jp.y, jp.z, jo.x, jo.y, jo.z].into_iter().enumerate() {
+            jac[r][dof] += v;
         }
     }
     let mut a = [0.0f32; 36];

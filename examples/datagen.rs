@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     let episodes: usize = args.next().map_or(Ok(256), |a| a.parse())?;
     let fps: u32 = args.next().map_or(Ok(20), |a| a.parse())?;
 
-    let robot = Robot::from_config_file(common::panda_config())?;
+    let robot = common::panda()?;
     let device = Device::gpu(&robot).unwrap_or_else(|e| {
         eprintln!("no GPU ({e}); using the CPU");
         Device::cpu(&robot)

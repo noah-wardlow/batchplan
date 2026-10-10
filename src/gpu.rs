@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 
 use crate::device::{Backend, CollisionWeights, Evaluation};
 use crate::ik::IkOptions;
-use crate::robot::{JointKind, MAX_DOF, MAX_LINKS, MAX_SPHERES, Robot};
+use crate::robot::{JointKind, MAX_DOF, MAX_JOINTS, MAX_LINKS, MAX_SPHERES, Robot};
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
 use crate::world::{Obstacle, World};
@@ -58,8 +58,14 @@ shader_struct! {
 
 shader_struct! {
     /// One kinematic link: joint origin rotation columns and translation, joint axis, and
-    /// `kind` 0 fixed / 1 revolute / 2 prismatic.
-    GpuLink => Link { c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, parent: i32, kind: u32, dof: u32, mask: u32 }
+    /// `kind` 0 fixed / 1 revolute / 2 prismatic. A moving joint's value is
+    /// `axis.w * q[dof] + trans.w` (multiplier and offset, for mimic joints), and `joint` numbers
+    /// it among the moving joints. Bit `i` of `chain` marks link `i` as this link or an ancestor
+    /// with a moving joint.
+    GpuLink => Link {
+        c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4,
+        parent: i32, kind: u32, dof: u32, chain: u32, joint: u32, pad0: u32, pad1: u32, pad2: u32,
+    }
 }
 
 shader_struct! {
@@ -175,6 +181,7 @@ impl GpuBackend {
         let source = [
             "alias Vec4 = vec4<f32>;\n",
             &format!("const MAX_DOF: u32 = {MAX_DOF}u;\nconst MAX_LINKS: u32 = {MAX_LINKS}u;\n"),
+            &format!("const MAX_JOINTS: u32 = {MAX_JOINTS}u;\n"),
             &format!("const MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * MAX_DOF),
             &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
             &format!("const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\n"),
@@ -237,25 +244,30 @@ impl GpuBackend {
             bail!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend);
         }
 
+        let mut moving = 0;
         let gpu_links: Vec<GpuLink> = robot
             .links
             .iter()
             .map(|l| {
-                let (kind, dof, axis) = match l.joint {
-                    JointKind::Fixed => (0, 0, glam::Vec3::ZERO),
-                    JointKind::Revolute { dof, axis } => (1, dof as u32, axis),
-                    JointKind::Prismatic { dof, axis } => (2, dof as u32, axis),
+                let joint = moving;
+                moving += u32::from(l.joint.actuation().is_some());
+                let (kind, dof, axis, multiplier, offset) = match l.joint {
+                    JointKind::Fixed => (0, 0, glam::Vec3::ZERO, 0.0, 0.0),
+                    JointKind::Revolute { dof, axis, multiplier, offset } => (1, dof as u32, axis, multiplier, offset),
+                    JointKind::Prismatic { dof, axis, multiplier, offset } => (2, dof as u32, axis, multiplier, offset),
                 };
                 GpuLink {
                     c0: v4(l.origin.rot.x_axis, 0.0),
                     c1: v4(l.origin.rot.y_axis, 0.0),
                     c2: v4(l.origin.rot.z_axis, 0.0),
-                    trans: v4(l.origin.trans, 0.0),
-                    axis: v4(axis, 0.0),
+                    trans: v4(l.origin.trans, offset),
+                    axis: v4(axis, multiplier),
                     parent: l.parent.map_or(-1, |p| p as i32),
                     kind,
                     dof,
-                    mask: l.dof_mask,
+                    chain: l.chain,
+                    joint,
+                    ..Default::default()
                 }
             })
             .collect();

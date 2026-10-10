@@ -14,7 +14,7 @@ use batchplan::*;
 
 fn main() -> Result<()> {
     let count: usize = std::env::args().nth(1).map_or(Ok(512), |a| a.parse())?;
-    let robot = Robot::from_config_file(common::panda_config())?;
+    let robot = common::panda()?;
     let mut rng = Rng::new(42);
     let worlds: Vec<World> = (0..count).map(|_| common::tabletop(&mut rng)).collect();
     let ik_problems: Vec<IkProblem> = worlds

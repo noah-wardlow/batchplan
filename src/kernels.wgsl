@@ -1,7 +1,7 @@
 // Batched kinematics, collision cost/gradient, IK and trajectory optimization.
 // Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (MAX_DOF, MAX_LINKS,
-// MAX_SPHERES, JAC_LEN, obstacle kinds) and the shared structs (Params, Link, Sphere, Obstacle, Iter), generated
-// from their Rust definitions so the two sides cannot drift apart.
+// MAX_JOINTS, MAX_SPHERES, JAC_LEN, obstacle kinds) and the shared structs (Params, Link, Sphere,
+// Obstacle, Iter), generated from their Rust definitions so the two sides cannot drift apart.
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> links: array<Link>;
@@ -23,8 +23,10 @@ const FAR: f32 = 1e30;
 
 var<private> lrot: array<mat3x3<f32>, MAX_LINKS>;
 var<private> lpos: array<vec3<f32>, MAX_LINKS>;
-var<private> jaxis: array<vec3<f32>, MAX_DOF>;
-var<private> janchor: array<vec3<f32>, MAX_DOF>;
+// World axis and anchor of each moving joint (numbered by `Link.joint`); bit j of `prismatic` is
+// set when joint j slides. Kept to MAX_JOINTS entries so they stay in registers.
+var<private> jaxis: array<vec3<f32>, MAX_JOINTS>;
+var<private> janchor: array<vec3<f32>, MAX_JOINTS>;
 var<private> prismatic: u32;
 var<private> q: array<f32, MAX_DOF>;
 var<private> grad: array<f32, MAX_DOF>;
@@ -60,17 +62,17 @@ fn fk() {
         let jrot = prot * mat3x3<f32>(l.c0.xyz, l.c1.xyz, l.c2.xyz);
         let jpos = prot * l.trans.xyz + ppos;
         if (l.kind == 1u) {
-            lrot[i] = jrot * rodrigues(l.axis.xyz, q[l.dof]);
+            lrot[i] = jrot * rodrigues(l.axis.xyz, l.axis.w * q[l.dof] + l.trans.w);
             lpos[i] = jpos;
-            jaxis[l.dof] = jrot * l.axis.xyz;
-            janchor[l.dof] = jpos;
+            jaxis[l.joint] = jrot * l.axis.xyz;
+            janchor[l.joint] = jpos;
         } else if (l.kind == 2u) {
             let a = jrot * l.axis.xyz;
             lrot[i] = jrot;
-            lpos[i] = jpos + a * q[l.dof];
-            jaxis[l.dof] = a;
-            janchor[l.dof] = jpos;
-            prismatic |= 1u << l.dof;
+            lpos[i] = jpos + a * (l.axis.w * q[l.dof] + l.trans.w);
+            jaxis[l.joint] = a;
+            janchor[l.joint] = jpos;
+            prismatic |= 1u << l.joint;
         } else {
             lrot[i] = jrot;
             lpos[i] = jpos;
@@ -78,6 +80,7 @@ fn fk() {
     }
 }
 
+// Derivative of a point rigidly attached downstream of moving joint j, per unit of joint motion.
 fn dpoint(j: u32, p: vec3<f32>) -> vec3<f32> {
     if (((prismatic >> j) & 1u) == 1u) {
         return jaxis[j];
@@ -200,11 +203,12 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
         if (all(g == vec3<f32>(0.0))) {
             continue;
         }
-        let mask = links[spheres[s].link].mask;
-        for (var j = 0u; j < P.n_dof; j++) {
-            if (((mask >> j) & 1u) == 1u) {
-                grad[j] += dot(g, dpoint(j, sc[s]));
-            }
+        // Every moving joint at or above the sphere's link, mimic joints adding into their leader.
+        var chain = links[spheres[s].link].chain;
+        while (chain != 0u) {
+            let i = firstTrailingBit(chain);
+            chain &= chain - 1u;
+            grad[links[i].dof] += links[i].axis.w * dot(g, dpoint(links[i].joint, sc[s]));
         }
     }
     return vec3<f32>(cost, wmin, smin);
@@ -285,22 +289,29 @@ fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
     let ep = tp - lpos[ee];
     let eo = rot_log(tr * transpose(lrot[ee])).xyz * P.rot_weight;
     let e = array<f32, 6>(ep.x, ep.y, ep.z, eo.x, eo.y, eo.z);
-    let mask = links[ee].mask;
-    for (var j = 0u; j < n; j++) {
-        var jp = vec3<f32>(0.0);
-        var jo = vec3<f32>(0.0);
-        if (((mask >> j) & 1u) == 1u) {
-            jp = dpoint(j, lpos[ee]);
-            if (((prismatic >> j) & 1u) == 0u) {
-                jo = jaxis[j] * P.rot_weight;
+    for (var k = 0u; k < JAC_LEN; k++) {
+        jac[k] = 0.0;
+    }
+    var chain = links[ee].chain;
+    while (chain != 0u) {
+        let i = firstTrailingBit(chain);
+        chain &= chain - 1u;
+        {
+            let j = links[i].dof;
+            let k = links[i].joint;
+            let m = links[i].axis.w;
+            let jp = m * dpoint(k, lpos[ee]);
+            var jo = vec3<f32>(0.0);
+            if (((prismatic >> k) & 1u) == 0u) {
+                jo = m * jaxis[k] * P.rot_weight;
             }
+            jac[0u * MAX_DOF + j] += jp.x;
+            jac[1u * MAX_DOF + j] += jp.y;
+            jac[2u * MAX_DOF + j] += jp.z;
+            jac[3u * MAX_DOF + j] += jo.x;
+            jac[4u * MAX_DOF + j] += jo.y;
+            jac[5u * MAX_DOF + j] += jo.z;
         }
-        jac[0u * MAX_DOF + j] = jp.x;
-        jac[1u * MAX_DOF + j] = jp.y;
-        jac[2u * MAX_DOF + j] = jp.z;
-        jac[3u * MAX_DOF + j] = jo.x;
-        jac[4u * MAX_DOF + j] = jo.y;
-        jac[5u * MAX_DOF + j] = jo.z;
     }
     for (var r = 0u; r < 6u; r++) {
         for (var c = 0u; c <= r; c++) {
