@@ -5,8 +5,10 @@
 //! - `observation.state`: joint positions.
 //! - `action`: joint positions at the next frame (the last frame repeats its own).
 //! - `observation.environment_state`: the goal pose (position xyz, quaternion xyzw with w >= 0),
-//!   then every obstacle of the episode's world as `[present, is_sphere, center xyz, half extents
-//!   xyz (radius for spheres), quaternion xyzw]`, zero-padded to the largest world.
+//!   then every obstacle of the episode's world as `[present, kind, center xyz, size xyz,
+//!   quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder,
+//!   3 capsule; `size` is the half extents of a cuboid, else (radius, radius, half height or half
+//!   length).
 //! - `is_recovery`, `parent_episode_index` (-1 for nominal episodes) and `world_index`: extra
 //!   columns that LeRobot policies ignore.
 //!
@@ -120,7 +122,7 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
         "environment_state": {
             "goal": "[0:7] position xyz, quaternion xyzw (w >= 0)",
             "obstacles": format!(
-                "[7 + {OBSTACLE_WIDTH}k : 7 + {OBSTACLE_WIDTH}(k+1)] obstacle k: present, is_sphere, center xyz, half extents xyz (radius for spheres), quaternion xyzw"
+                "[7 + {OBSTACLE_WIDTH}k : 7 + {OBSTACLE_WIDTH}(k+1)] obstacle k: present, kind (0 cuboid, 1 sphere, 2 cylinder, 3 capsule), center xyz, size xyz (cuboid half extents, else radius, radius, half height or half length), quaternion xyzw"
             ),
             "max_obstacles": max_obstacles,
         },
@@ -293,11 +295,19 @@ fn environment_state(world: &World, demo: &Demonstration, max_obstacles: usize) 
     let (p, q) = (demo.goal.position, canonical(demo.goal.rotation));
     let mut env = vec![p.x, p.y, p.z, q.x, q.y, q.z, q.w];
     for o in &world.obstacles {
-        let (is_sphere, center, half, rot) = match *o {
-            Obstacle::Cuboid { center, half_extents, rotation } => (0.0, center, half_extents, canonical(rotation)),
+        let round = |radius: f32, half: f32| glam::Vec3::new(radius, radius, half);
+        let (kind, center, size, rot) = match *o {
+            Obstacle::Cuboid { center, half_extents, rotation } => (0.0, center, half_extents, rotation),
             Obstacle::Sphere { center, radius } => (1.0, center, glam::Vec3::splat(radius), glam::Quat::IDENTITY),
+            Obstacle::Cylinder { center, rotation, radius, half_height } => {
+                (2.0, center, round(radius, half_height), rotation)
+            }
+            Obstacle::Capsule { center, rotation, radius, half_length } => {
+                (3.0, center, round(radius, half_length), rotation)
+            }
         };
-        env.extend([1.0, is_sphere, center.x, center.y, center.z, half.x, half.y, half.z, rot.x, rot.y, rot.z, rot.w]);
+        let rot = canonical(rot);
+        env.extend([1.0, kind, center.x, center.y, center.z, size.x, size.y, size.z, rot.x, rot.y, rot.z, rot.w]);
     }
     env.resize(GOAL_WIDTH + OBSTACLE_WIDTH * max_obstacles, 0.0);
     env
@@ -306,7 +316,7 @@ fn environment_state(world: &World, demo: &Demonstration, max_obstacles: usize) 
 fn environment_names(max_obstacles: usize) -> Vec<String> {
     let mut names: Vec<String> = ["x", "y", "z", "qx", "qy", "qz", "qw"].iter().map(|s| format!("goal.{s}")).collect();
     for k in 0..max_obstacles {
-        let fields = ["present", "is_sphere", "x", "y", "z", "hx", "hy", "hz", "qx", "qy", "qz", "qw"];
+        let fields = ["present", "kind", "x", "y", "z", "sx", "sy", "sz", "qx", "qy", "qz", "qw"];
         names.extend(fields.iter().map(|f| format!("obstacle{k}.{f}")));
     }
     names

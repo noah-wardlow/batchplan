@@ -17,13 +17,14 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 18 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 21 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 2 export tests
 cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot]       # keep at zero warnings, both configurations
 cargo doc --no-deps --features lerobot                          # keep at zero warnings
 cargo run --release --example bench -- 512                      # GPU vs CPU throughput; BENCH_LLVMPIPE=1 adds the WGSL kernels on Mesa's CPU Vulkan driver
+scripts/fetch_benchmark.sh && cargo run --release --example benchmark   # MotionBenchMaker + MπNets (2,600 Panda problems), GPU and CPU
 cargo run --release --example datagen -- data/demo 512 20       # .npy dataset: <out_dir> [worlds] [fps]
 cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20
 REMOTE=user@host SSH_OPTS='...' scripts/sync.sh '<command>'     # rsync to ~/batchplan on a GPU box and run there

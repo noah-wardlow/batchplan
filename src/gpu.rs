@@ -67,9 +67,16 @@ shader_struct! {
     GpuSphere => Sphere { c: Vec4, link: u32, self_buf: f32, pad0: u32, pad1: u32 }
 }
 
+/// Obstacle kinds as stored in `GpuObstacle::center.w`.
+const CUBOID: u32 = 0;
+const SPHERE: u32 = 1;
+const CYLINDER: u32 = 2;
+const CAPSULE: u32 = 3;
+
 shader_struct! {
-    /// `center.w` is 0 for a cuboid and 1 for a sphere (radius in `half.x`); r0..r2 are the
-    /// world-from-box rotation columns.
+    /// `center.w` is the kind (`CUBOID`, `SPHERE`, ...). `half` holds the half extents of a cuboid,
+    /// or the radius (x) and half height or half length (y) of the round kinds. r0..r2 are the
+    /// world-from-local rotation columns.
     GpuObstacle => Obstacle { center: Vec4, half: Vec4, r0: Vec4, r1: Vec4, r2: Vec4 }
 }
 
@@ -169,6 +176,8 @@ impl GpuBackend {
             "alias Vec4 = vec4<f32>;\n",
             &format!("const MAX_DOF: u32 = {MAX_DOF}u;\nconst MAX_LINKS: u32 = {MAX_LINKS}u;\n"),
             &format!("const MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * MAX_DOF),
+            &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
+            &format!("const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\n"),
             GpuParams::WGSL,
             GpuLink::WGSL,
             GpuSphere::WGSL,
@@ -302,19 +311,30 @@ impl GpuBackend {
         let mut ranges: Vec<[u32; 2]> = vec![];
         for s in worlds {
             ranges.push([obstacles.len() as u32, s.obstacles.len() as u32]);
-            obstacles.extend(s.obstacles.iter().map(|o| match *o {
-                Obstacle::Cuboid { center, half_extents, rotation } => {
+            obstacles.extend(s.obstacles.iter().map(|o| {
+                let rotated = |kind: u32, center: glam::Vec3, half: [f32; 4], rotation: glam::Quat| {
                     let r = Mat3::from_quat(rotation);
                     GpuObstacle {
-                        center: v4(center, 0.0),
-                        half: v4(half_extents, 0.0),
+                        center: v4(center, kind as f32),
+                        half,
                         r0: v4(r.x_axis, 0.0),
                         r1: v4(r.y_axis, 0.0),
                         r2: v4(r.z_axis, 0.0),
                     }
-                }
-                Obstacle::Sphere { center, radius } => {
-                    GpuObstacle { center: v4(center, 1.0), half: [radius, 0.0, 0.0, 0.0], ..Zeroable::zeroed() }
+                };
+                match *o {
+                    Obstacle::Cuboid { center, half_extents, rotation } => {
+                        rotated(CUBOID, center, v4(half_extents, 0.0), rotation)
+                    }
+                    Obstacle::Sphere { center, radius } => {
+                        rotated(SPHERE, center, [radius, 0.0, 0.0, 0.0], glam::Quat::IDENTITY)
+                    }
+                    Obstacle::Cylinder { center, rotation, radius, half_height } => {
+                        rotated(CYLINDER, center, [radius, half_height, 0.0, 0.0], rotation)
+                    }
+                    Obstacle::Capsule { center, rotation, radius, half_length } => {
+                        rotated(CAPSULE, center, [radius, half_length, 0.0, 0.0], rotation)
+                    }
                 }
             }));
         }

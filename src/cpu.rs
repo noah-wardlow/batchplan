@@ -13,7 +13,7 @@ use crate::ik::IkOptions;
 use crate::robot::{Fk, MAX_DOF, MAX_SPHERES, Robot};
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
-use crate::world::{FAR, Obstacle, World, box_distance, sphere_distance};
+use crate::world::{FAR, Obstacle, World, box_distance, capsule_distance, cylinder_distance, sphere_distance};
 
 pub(crate) struct CpuBackend {
     robot: Robot,
@@ -30,6 +30,8 @@ impl CpuBackend {
 enum Prepared {
     Cuboid { rot: Mat3, center: Vec3, half: Vec3 },
     Sphere { center: Vec3, radius: f32 },
+    Cylinder { rot: Mat3, center: Vec3, radius: f32, half_height: f32 },
+    Capsule { rot: Mat3, center: Vec3, radius: f32, half_length: f32 },
 }
 
 fn prepare(worlds: &[World]) -> Vec<Vec<Prepared>> {
@@ -43,6 +45,12 @@ fn prepare(worlds: &[World]) -> Vec<Vec<Prepared>> {
                         Prepared::Cuboid { rot: Mat3::from_quat(rotation), center, half: half_extents }
                     }
                     Obstacle::Sphere { center, radius } => Prepared::Sphere { center, radius },
+                    Obstacle::Cylinder { center, rotation, radius, half_height } => {
+                        Prepared::Cylinder { rot: Mat3::from_quat(rotation), center, radius, half_height }
+                    }
+                    Obstacle::Capsule { center, rotation, radius, half_length } => {
+                        Prepared::Capsule { rot: Mat3::from_quat(rotation), center, radius, half_length }
+                    }
                 })
                 .collect()
         })
@@ -70,6 +78,12 @@ fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, g
             let (dist, g) = match *o {
                 Prepared::Cuboid { rot, center, half } => box_distance(rot, center, half, sc[s]),
                 Prepared::Sphere { center, radius } => sphere_distance(center, radius, sc[s]),
+                Prepared::Cylinder { rot, center, radius, half_height } => {
+                    cylinder_distance(rot, center, radius, half_height, sc[s])
+                }
+                Prepared::Capsule { rot, center, radius, half_length } => {
+                    capsule_distance(rot, center, radius, half_length, sc[s])
+                }
             };
             let d = dist - r;
             wmin = wmin.min(d);

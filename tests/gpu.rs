@@ -80,6 +80,47 @@ fn evaluate_matches_cpu() {
 }
 
 #[test]
+fn evaluate_matches_cpu_for_every_obstacle_kind() {
+    let Some((robot, gpu, cpu)) = setup() else { return };
+    let n = robot.dof();
+    let rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.7, 1.1);
+    let center = glam::Vec3::new(0.45, 0.0, 0.4);
+    let worlds: Vec<World> = [
+        Obstacle::Cuboid { center, half_extents: glam::Vec3::new(0.1, 0.2, 0.08), rotation },
+        Obstacle::Sphere { center, radius: 0.15 },
+        Obstacle::Cylinder { center, rotation, radius: 0.1, half_height: 0.2 },
+        Obstacle::Capsule { center, rotation, radius: 0.08, half_length: 0.15 },
+    ]
+    .into_iter()
+    .map(|o| World { obstacles: vec![o] })
+    .collect();
+    let mut rng = Rng::new(19);
+    let items = 8000;
+    let q: Vec<f32> = (0..items * n).map(|i| rng.range(robot.lower()[i % n], robot.upper()[i % n])).collect();
+    let item_world: Vec<u32> = (0..items as u32).map(|i| i % 4).collect();
+    let w = CollisionWeights { world: 1000.0, self_collision: 0.0, margin: 0.02, self_margin: 0.0 };
+    let a = cpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
+    let b = gpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
+    for (kind, world) in worlds.iter().enumerate() {
+        let (mut colliding, mut worst_clearance, mut worst_grad) = (0, 0.0f32, 0.0f32);
+        for i in (kind..items).step_by(4) {
+            colliding += usize::from(a.cost[i] > 0.0);
+            worst_clearance = worst_clearance.max((a.world_clearance[i] - b.world_clearance[i]).abs());
+            let (ga, gb) = (&a.grad[i * n..(i + 1) * n], &b.grad[i * n..(i + 1) * n]);
+            let norm = ga.iter().map(|v| v * v).sum::<f32>().sqrt().max(1.0);
+            let diff = ga.iter().zip(gb).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            worst_grad = worst_grad.max(diff / norm);
+        }
+        eprintln!(
+            "{:?}: {colliding} colliding, clearance {worst_clearance:.2e}, grad {worst_grad:.2e}",
+            world.obstacles[0]
+        );
+        assert!(colliding > items / 4 / 20, "only {colliding} configurations touch obstacle kind {kind}");
+        assert!(worst_clearance < 1e-4 && worst_grad < 1e-3, "kind {kind} differs between devices");
+    }
+}
+
+#[test]
 fn ik_matches_cpu() {
     let Some((robot, gpu, cpu)) = setup() else { return };
     let worlds = worlds(64, 4);

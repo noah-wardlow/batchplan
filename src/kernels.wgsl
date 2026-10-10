@@ -1,6 +1,6 @@
 // Batched kinematics, collision cost/gradient, IK and trajectory optimization.
 // Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (MAX_DOF, MAX_LINKS,
-// MAX_SPHERES, JAC_LEN) and the shared structs (Params, Link, Sphere, Obstacle, Iter), generated
+// MAX_SPHERES, JAC_LEN, obstacle kinds) and the shared structs (Params, Link, Sphere, Obstacle, Iter), generated
 // from their Rust definitions so the two sides cannot drift apart.
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -85,10 +85,11 @@ fn dpoint(j: u32, p: vec3<f32>) -> vec3<f32> {
     return cross(jaxis[j], p - janchor[j]);
 }
 
-// Returns (gradient direction, signed distance).
+// Returns (gradient direction, signed distance). Mirrors the distance functions in world.rs.
 fn obstacle_distance(o: Obstacle, p: vec3<f32>) -> vec4<f32> {
     let v = p - o.center.xyz;
-    if (o.center.w > 0.5) {
+    let kind = u32(o.center.w);
+    if (kind == SPHERE) {
         let len = length(v);
         var g = vec3<f32>(0.0, 0.0, 1.0);
         if (len > 1e-9) {
@@ -97,24 +98,53 @@ fn obstacle_distance(o: Obstacle, p: vec3<f32>) -> vec4<f32> {
         return vec4<f32>(g, len - o.half.x);
     }
     let lp = vec3<f32>(dot(o.r0.xyz, v), dot(o.r1.xyz, v), dot(o.r2.xyz, v));
-    let sgn = select(vec3<f32>(-1.0), vec3<f32>(1.0), lp >= vec3<f32>(0.0));
-    let qd = abs(lp) - o.half.xyz;
-    let outside = max(qd, vec3<f32>(0.0));
-    let olen = length(outside);
     var gl: vec3<f32>;
     var d: f32;
-    if (olen > 0.0) {
-        d = olen;
-        gl = sgn * outside / olen;
-    } else if (qd.x >= qd.y && qd.x >= qd.z) {
-        d = qd.x;
-        gl = vec3<f32>(sgn.x, 0.0, 0.0);
-    } else if (qd.y >= qd.z) {
-        d = qd.y;
-        gl = vec3<f32>(0.0, sgn.y, 0.0);
+    if (kind == CUBOID) {
+        let sgn = select(vec3<f32>(-1.0), vec3<f32>(1.0), lp >= vec3<f32>(0.0));
+        let qd = abs(lp) - o.half.xyz;
+        let outside = max(qd, vec3<f32>(0.0));
+        let olen = length(outside);
+        if (olen > 0.0) {
+            d = olen;
+            gl = sgn * outside / olen;
+        } else if (qd.x >= qd.y && qd.x >= qd.z) {
+            d = qd.x;
+            gl = vec3<f32>(sgn.x, 0.0, 0.0);
+        } else if (qd.y >= qd.z) {
+            d = qd.y;
+            gl = vec3<f32>(0.0, sgn.y, 0.0);
+        } else {
+            d = qd.z;
+            gl = vec3<f32>(0.0, 0.0, sgn.z);
+        }
+    } else if (kind == CYLINDER) {
+        let rho = sqrt(lp.x * lp.x + lp.y * lp.y);
+        var radial = vec3<f32>(1.0, 0.0, 0.0);
+        if (rho > 1e-9) {
+            radial = vec3<f32>(lp.x / rho, lp.y / rho, 0.0);
+        }
+        let axial = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, lp.z >= 0.0));
+        let dr = rho - o.half.x;
+        let dz = abs(lp.z) - o.half.y;
+        if (dr > 0.0 && dz > 0.0) {
+            d = sqrt(dr * dr + dz * dz);
+            gl = (radial * dr + axial * dz) / d;
+        } else if (dr >= dz) {
+            d = dr;
+            gl = radial;
+        } else {
+            d = dz;
+            gl = axial;
+        }
     } else {
-        d = qd.z;
-        gl = vec3<f32>(0.0, 0.0, sgn.z);
+        let w = lp - vec3<f32>(0.0, 0.0, clamp(lp.z, -o.half.y, o.half.y));
+        let len = length(w);
+        d = len - o.half.x;
+        gl = vec3<f32>(1.0, 0.0, 0.0);
+        if (len > 1e-9) {
+            gl = w / len;
+        }
     }
     return vec4<f32>(o.r0.xyz * gl.x + o.r1.xyz * gl.y + o.r2.xyz * gl.z, d);
 }

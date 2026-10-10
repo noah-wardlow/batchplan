@@ -8,7 +8,7 @@ use std::f64::consts::FRAC_PI_2;
 use batchplan::rng::Rng;
 use batchplan::timing::{RetimeOptions, retime};
 use batchplan::*;
-use glam::{DMat3, DVec3};
+use glam::{DMat3, DVec3, Quat, Vec3};
 
 fn panda() -> Robot {
     Robot::from_config_file(common::panda_config()).unwrap()
@@ -54,6 +54,72 @@ fn fk_matches_franka_dh_parameters() {
             (DMat3::from_quat(pose.rotation.as_dquat()) - r).to_cols_array().iter().fold(0.0f64, |m, v| m.max(v.abs()));
         assert!(r_err < 1e-5, "rotation mismatch {r_err} at {q:?}");
     }
+}
+
+/// One obstacle of every kind, rotated off the world axes.
+fn every_obstacle_kind() -> Vec<Obstacle> {
+    let rotation = Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.7, 1.1);
+    let center = Vec3::new(0.1, -0.2, 0.3);
+    vec![
+        Obstacle::Cuboid { center, half_extents: Vec3::new(0.1, 0.2, 0.05), rotation },
+        Obstacle::Sphere { center, radius: 0.15 },
+        Obstacle::Cylinder { center, rotation, radius: 0.12, half_height: 0.2 },
+        Obstacle::Capsule { center, rotation, radius: 0.08, half_length: 0.15 },
+    ]
+}
+
+#[test]
+fn obstacle_distances_are_exact_and_differentiable() {
+    let mut rng = Rng::new(17);
+    for o in every_obstacle_kind() {
+        let (mut outside, mut inside) = (0, 0);
+        for _ in 0..2000 {
+            let p = Vec3::new(rng.range(-0.3, 0.5), rng.range(-0.6, 0.2), rng.range(-0.1, 0.7));
+            let (d, g) = o.distance(p);
+            assert!((g.length() - 1.0).abs() < 1e-4, "{o:?}: gradient {g} at {p} is not a unit vector");
+            // Stepping back along the gradient by the distance lands on the surface.
+            let (on_surface, _) = o.distance(p - d * g);
+            assert!(on_surface.abs() < 1e-4, "{o:?}: {p} - {d} * {g} is {on_surface} from the surface");
+            // The distance is only piecewise smooth (edges, the medial axis inside), so accept
+            // agreement with finite differences at either of two step sizes.
+            let fd_error = |h: f32| {
+                let fd = Vec3::new(
+                    o.distance(p + Vec3::X * h).0 - o.distance(p - Vec3::X * h).0,
+                    o.distance(p + Vec3::Y * h).0 - o.distance(p - Vec3::Y * h).0,
+                    o.distance(p + Vec3::Z * h).0 - o.distance(p - Vec3::Z * h).0,
+                ) / (2.0 * h);
+                (fd - g).length()
+            };
+            let err = fd_error(1e-3).min(fd_error(1e-4));
+            assert!(err < 2e-2 || d < 0.0, "{o:?}: gradient {g} off by {err} at {p}");
+            if d > 0.0 { outside += 1 } else { inside += 1 }
+        }
+        assert!(outside > 100 && inside > 20, "{o:?}: {outside} samples outside, {inside} inside");
+    }
+}
+
+#[test]
+fn round_obstacle_distances_match_closed_forms() {
+    let center = Vec3::new(1.0, 2.0, 3.0);
+    let cylinder = Obstacle::Cylinder { center, rotation: Quat::IDENTITY, radius: 0.5, half_height: 1.0 };
+    let capsule = Obstacle::Capsule { center, rotation: Quat::IDENTITY, radius: 0.5, half_length: 1.0 };
+    let cases = [
+        (cylinder, Vec3::new(0.8, 0.0, 0.2), 0.3), // beside the side wall
+        (cylinder, Vec3::new(0.0, 0.0, 1.4), 0.4), // above the cap
+        (cylinder, Vec3::new(0.8, 0.0, 1.4), (0.09f32 + 0.16).sqrt()), // past the rim
+        (cylinder, Vec3::new(0.3, 0.0, 0.0), -0.2), // inside, nearest the wall
+        (capsule, Vec3::new(0.0, 0.0, 1.9), 0.4),  // above the end cap
+        (capsule, Vec3::new(0.6, 0.0, 1.8), 0.5),  // diagonal from the end
+        (capsule, Vec3::new(0.2, 0.0, -0.3), -0.3), // inside the shaft
+    ];
+    for (o, offset, expected) in cases {
+        let (d, _) = o.distance(center + offset);
+        assert!((d - expected).abs() < 1e-5, "{o:?} at offset {offset}: {d}, expected {expected}");
+    }
+    // Rotating the obstacle and the query point together leaves the distance unchanged.
+    let r = Quat::from_rotation_y(0.9);
+    let rotated = Obstacle::Cylinder { center, rotation: r, radius: 0.5, half_height: 1.0 };
+    assert!((rotated.distance(center + r * Vec3::new(0.8, 0.0, 1.4)).0 - 0.5).abs() < 1e-5);
 }
 
 #[test]

@@ -29,7 +29,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
-| `robot`, `world`, `types` | `Robot::from_config_file`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | URDF + collision-sphere config. Box and sphere obstacles. Shared data types with documented row-major shapes. |
+| `robot`, `world`, `types` | `Robot::from_config_file`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | URDF + collision-sphere config. Box, sphere, cylinder and capsule obstacles. Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
@@ -90,9 +90,28 @@ All three machines were measured at commit `950e06c` on otherwise idle machines.
 
 `datagen -- data/demo 512 20` produced 481 nominal and 932 recovery episodes from 512 worlds on the Framework, in about 3.3 s of planning. Peak joint speed reaches 0.99 of the limit, and recovery starts sit a median 0.35 rad off the nominal path.
 
+## Benchmark
+
+`scripts/fetch_benchmark.sh` downloads the standard Panda problem sets that [robometrics](https://github.com/fishbotics/robometrics) packages as plain YAML (MIT): MotionBenchMaker's 800 problems in 8 sets and MπNets' 1,800 in 12, at a pinned commit with checksums. No ROS is involved. `cargo run --release --example benchmark` runs every set on the GPU and the CPU in two modes:
+- **plan:** plan from the start to the set's first IK solution (planning only);
+- **ik+plan:** solve IK for the goal pose, then plan to the best solution.
+
+A problem succeeds when the final `panda_hand` position is within 1 cm of the goal, every joint is within its limits, and an independent CPU check at 4× the planner's validation density finds no collision. That check uses the same sphere model the planner uses. "Free ends" counts the problems whose start and given IK goal are collision-free under that model, which caps the achievable success. Throughput runs each set as one batch; batch-1 latency runs IK and planning for one problem at a time (first 20 problems of each set).
+
+Baseline before the improvements below, all 2,600 problems:
+
+| Device | Free ends | Plan | IK + plan | Batched | Batch-1 latency (mean / p75 / p98) |
+|---|---|---|---|---|---|
+| Radeon 8060S (Vulkan) | 98.1% | 81.2% | 74.2% | 196 problems/s | 162 / 197 / 503 ms |
+| M4 Pro (Metal) | 98.1% | 81.3% | 73.7% | 178 problems/s | 129 / 137 / 238 ms |
+| Ryzen AI Max+ 395 CPU (32 threads) | 98.1% | 81.3% | 74.2% | 31 problems/s | 88 / 104 / 251 ms |
+| M4 Pro CPU (14 threads) | 98.1% | 81.3% | 73.9% | 29 problems/s | 38 / 43 / 86 ms |
+
+`table_under_pick` (24%) and `cubby_task_oriented` (37–40%) are the weakest sets. GPU latency is dominated by per-call setup and readback, which is why the CPU wins at batch size 1. Retimed paths keep unbounded accelerations at waypoint corners: the median peak jerk, by finite differences at 100 Hz, is about 2,000 rad/s³.
+
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 18 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 21 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
@@ -105,6 +124,7 @@ All three machines were measured at commit `950e06c` on otherwise idle machines.
   - Plans keep the worlds of their problems when one world holds several targets.
 - **CPU IK and retiming:** IK solves targets taken from collision-free configurations; retiming respects velocity limits and keeps the endpoints.
 - **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
+- **Obstacle distances:** every obstacle kind returns unit gradients that match finite differences, stepping back along the gradient lands on the surface, and cylinder and capsule distances match closed forms. The GPU agrees with the CPU for each kind.
 - **Adapter errors:** adapters below the required limits are rejected with the reason, and an unknown adapter name is a clear error.
 
 ## Training data
@@ -137,7 +157,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 |---|---|
 | `observation.state` | joint positions |
 | `action` | joint positions of the next frame (absolute targets); the last frame repeats its own |
-| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle as `[present, is_sphere, center xyz, half extents xyz, quaternion xyzw]`, zero-padded to the largest world |
+| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule; `size` is a cuboid's half extents, else (radius, radius, half height or half length) |
 | `is_recovery`, `parent_episode_index`, `world_index` | extensions; LeRobot policies only read `observation.*` and `action`, so these are ignored in training |
 | `task` | "Move the gripper to the target pose." (`ExportOptions::task`) |
 
@@ -153,7 +173,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 ## Limits of the MVP
 
-- **Geometry.** The robot is modeled as spheres only, and obstacles as boxes and spheres. There are no meshes, point clouds or depth-derived distance fields yet.
+- **Geometry.** The robot is modeled as spheres only, and obstacles as boxes, spheres, cylinders and capsules. There are no meshes, point clouds or depth-derived distance fields yet.
 - **Kinematics.** The tree is limited to 16 actuated joints, 32 links and 128 spheres. Mimic joints must be locked.
 - **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search. Validation follows the linear interpolation between waypoints. Retiming does not bound accelerations at waypoint corners.
 - **Kernel performance.** Kernels run one invocation per configuration (or per waypoint), with no shared memory or subgroup work. Buffers are allocated per call. This leaves performance on the table.
