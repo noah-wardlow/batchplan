@@ -135,7 +135,7 @@ fn between_the_fingers(robot: &Robot) -> World {
 fn mimic_collision_gradients_match_finite_differences() {
     let robot = load(GRIPPER);
     let cpu = Device::cpu(&robot);
-    let worlds = [between_the_fingers(&robot)];
+    let worlds = cpu.upload(&[between_the_fingers(&robot)]).unwrap();
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 };
     let cost = |q: f32| cpu.evaluate(&worlds, &[0], &[q], &w).unwrap().cost[0];
     let (mut checked, mut worst) = (0, 0.0f32);
@@ -157,15 +157,15 @@ fn mimic_collision_gradients_match_finite_differences() {
 #[test]
 fn mimic_gripper_evaluates_the_same_on_every_device() {
     let robot = load(GRIPPER);
-    let worlds = [between_the_fingers(&robot)];
+    let scene = [between_the_fingers(&robot)];
     let q: Vec<f32> = (0..2000).map(|k| 0.8 * k as f32 / 1999.0).collect();
     let item_world = vec![0; q.len()];
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 };
     let devices = devices(&robot);
-    let reference = devices[0].evaluate(&worlds, &item_world, &q, &w).unwrap();
+    let reference = devices[0].evaluate(&devices[0].upload(&scene).unwrap(), &item_world, &q, &w).unwrap();
     assert!(reference.cost.iter().filter(|&&c| c > 0.0).count() > 500, "too few configurations carry cost");
     for d in &devices[1..] {
-        let e = d.evaluate(&worlds, &item_world, &q, &w).unwrap();
+        let e = d.evaluate(&d.upload(&scene).unwrap(), &item_world, &q, &w).unwrap();
         for (i, qi) in q.iter().enumerate() {
             assert!(
                 (e.world_clearance[i] - reference.world_clearance[i]).abs() < 1e-4,
@@ -257,8 +257,10 @@ fn collision_models_round_trip_through_files() {
     let mut rng = Rng::new(4);
     let q: Vec<f32> = (0..200).flat_map(|_| random_q(&fitted, &mut rng)).collect();
     let item_world = vec![0; 200];
-    let evaluate =
-        |r: &Robot| Device::cpu(r).evaluate(&[World::default()], &item_world, &q, &CollisionWeights::NONE).unwrap();
+    let evaluate = |r: &Robot| {
+        let cpu = Device::cpu(r);
+        cpu.evaluate(&cpu.upload(&[World::default()]).unwrap(), &item_world, &q, &CollisionWeights::NONE).unwrap()
+    };
     assert_eq!(evaluate(&fitted).self_clearance, evaluate(&reloaded).self_clearance);
 }
 
@@ -280,7 +282,10 @@ fn srdf_disabled_pairs_are_not_checked() {
     let q: Vec<f32> = (0..5000).flat_map(|_| random_q(&plain, &mut rng)).collect();
     let item_world = vec![0; 5000];
     let clearance = |r: &Robot| {
-        Device::cpu(r).evaluate(&[World::default()], &item_world, &q, &CollisionWeights::NONE).unwrap().self_clearance
+        let cpu = Device::cpu(r);
+        cpu.evaluate(&cpu.upload(&[World::default()]).unwrap(), &item_world, &q, &CollisionWeights::NONE)
+            .unwrap()
+            .self_clearance
     };
     let (a, b) = (clearance(&plain), clearance(&with_srdf));
     assert!(a.iter().zip(&b).all(|(x, y)| y >= x), "disabling pairs can only increase self clearance");
@@ -356,7 +361,8 @@ fn tabletop(robot: &Robot, cpu: &Device, rng: &mut Rng) -> World {
         };
         let mut trial = world.clone();
         trial.obstacles.push(candidate);
-        if cpu.evaluate(&[trial.clone()], &[0], robot.default_q(), &CollisionWeights::NONE).unwrap().collision_free(0) {
+        let uploaded = cpu.upload(std::slice::from_ref(&trial)).unwrap();
+        if cpu.evaluate(&uploaded, &[0], robot.default_q(), &CollisionWeights::NONE).unwrap().collision_free(0) {
             world = trial;
         }
     }
@@ -376,7 +382,8 @@ fn every_test_arm_loads_spherizes_and_plans() {
         let robot = Robot::load(common::asset(path), &options).unwrap();
         let cpu = Device::cpu(&robot);
         let mut rng = Rng::new(12);
-        let worlds: Vec<World> = (0..4).map(|_| tabletop(&robot, &cpu, &mut rng)).collect();
+        let scene: Vec<World> = (0..4).map(|_| tabletop(&robot, &cpu, &mut rng)).collect();
+        let worlds = cpu.upload(&scene).unwrap();
         // Goals within 1.5 rad of the default pose per joint: tabletop motions. Goals across the
         // UR5e's full +-2 pi range swing the arm through the table, which trajectory optimization
         // alone does not escape.
@@ -395,7 +402,7 @@ fn every_test_arm_loads_spherizes_and_plans() {
             }
         }
         for d in devices(&robot) {
-            let result = plan(&d, &worlds, &problems, &PlanOptions::default()).unwrap();
+            let result = plan(&d, &d.upload(&scene).unwrap(), &problems, &PlanOptions::default()).unwrap();
             let solved = result.solved().count();
             eprintln!("{path} on {}: planned {solved}/{}", d.name(), problems.len());
 

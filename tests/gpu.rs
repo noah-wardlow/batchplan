@@ -48,7 +48,8 @@ fn ik_problems(worlds: &[World], seed: u64) -> Vec<IkProblem> {
 fn evaluate_matches_cpu() {
     let Some((robot, gpu, cpu)) = setup() else { return };
     let n = robot.dof();
-    let worlds = worlds(16, 3);
+    let scene = worlds(16, 3);
+    let (on_cpu, on_gpu) = (cpu.upload(&scene).unwrap(), gpu.upload(&scene).unwrap());
     let mut rng = Rng::new(9);
     let items = 20_000;
     let q: Vec<f32> = (0..items)
@@ -56,8 +57,8 @@ fn evaluate_matches_cpu() {
         .collect();
     let item_world: Vec<u32> = (0..items as u32).map(|i| i % 16).collect();
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 };
-    let a = cpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
-    let b = gpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
+    let a = cpu.evaluate(&on_cpu, &item_world, &q, &w).unwrap();
+    let b = gpu.evaluate(&on_gpu, &item_world, &q, &w).unwrap();
     let mut worst = [0.0f32; 4];
     for i in 0..items {
         worst[0] = worst[0].max((a.world_clearance[i] - b.world_clearance[i]).abs());
@@ -85,25 +86,52 @@ fn evaluate_matches_cpu_for_every_obstacle_kind() {
     let n = robot.dof();
     let rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.7, 1.1);
     let center = glam::Vec3::new(0.45, 0.0, 0.4);
+    // Distance grids: a torus with an odd number of points (its last word holds one value) and a
+    // box after it in the grid buffer; the last world places both, one grid shared with world 4.
+    let sampled = |dims: [u32; 3], origin: glam::Vec3, f: &dyn Fn(glam::Vec3) -> f32| {
+        let mut values = vec![];
+        for k in 0..dims[2] {
+            for j in 0..dims[1] {
+                for i in 0..dims[0] {
+                    values.push(f(origin + glam::Vec3::new(i as f32, j as f32, k as f32) * 0.01));
+                }
+            }
+        }
+        std::sync::Arc::new(SdfGrid::new(dims, 0.01, origin, &values).unwrap())
+    };
+    let torus = sampled([41, 41, 21], glam::Vec3::new(-0.2, -0.2, -0.1), &|p| {
+        glam::Vec2::new(p.truncate().length() - 0.15, p.z).length() - 0.05
+    });
+    let block = Obstacle::Cuboid {
+        center: glam::Vec3::ZERO,
+        half_extents: glam::Vec3::new(0.1, 0.05, 0.04),
+        rotation: glam::Quat::IDENTITY,
+    };
+    let boxed = sampled([30, 20, 16], glam::Vec3::new(-0.15, -0.1, -0.08), &|p| block.distance(p).0);
+    let grid =
+        |grid: &std::sync::Arc<SdfGrid>, center: glam::Vec3| Obstacle::Sdf { grid: grid.clone(), center, rotation };
     let worlds: Vec<World> = [
-        Obstacle::Cuboid { center, half_extents: glam::Vec3::new(0.1, 0.2, 0.08), rotation },
-        Obstacle::Sphere { center, radius: 0.15 },
-        Obstacle::Cylinder { center, rotation, radius: 0.1, half_height: 0.2 },
-        Obstacle::Capsule { center, rotation, radius: 0.08, half_length: 0.15 },
+        vec![Obstacle::Cuboid { center, half_extents: glam::Vec3::new(0.1, 0.2, 0.08), rotation }],
+        vec![Obstacle::Sphere { center, radius: 0.15 }],
+        vec![Obstacle::Cylinder { center, rotation, radius: 0.1, half_height: 0.2 }],
+        vec![Obstacle::Capsule { center, rotation, radius: 0.08, half_length: 0.15 }],
+        vec![grid(&torus, center)],
+        vec![grid(&boxed, center), grid(&torus, center + glam::Vec3::new(0.0, 0.3, 0.1))],
     ]
     .into_iter()
-    .map(|o| World { obstacles: vec![o] })
+    .map(|obstacles| World { obstacles })
     .collect();
+    let kinds = ["cuboid", "sphere", "cylinder", "capsule", "grid", "two grids"];
     let mut rng = Rng::new(19);
-    let items = 8000;
+    let items = 12_000;
     let q: Vec<f32> = (0..items * n).map(|i| rng.range(robot.lower()[i % n], robot.upper()[i % n])).collect();
-    let item_world: Vec<u32> = (0..items as u32).map(|i| i % 4).collect();
+    let item_world: Vec<u32> = (0..items as u32).map(|i| i % 6).collect();
     let w = CollisionWeights { world: 1000.0, self_collision: 0.0, margin: 0.02, self_margin: 0.0 };
-    let a = cpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
-    let b = gpu.evaluate(&worlds, &item_world, &q, &w).unwrap();
-    for (kind, world) in worlds.iter().enumerate() {
+    let a = cpu.evaluate(&cpu.upload(&worlds).unwrap(), &item_world, &q, &w).unwrap();
+    let b = gpu.evaluate(&gpu.upload(&worlds).unwrap(), &item_world, &q, &w).unwrap();
+    for (kind, name) in kinds.iter().enumerate() {
         let (mut colliding, mut worst_clearance, mut worst_grad) = (0, 0.0f32, 0.0f32);
-        for i in (kind..items).step_by(4) {
+        for i in (kind..items).step_by(6) {
             colliding += usize::from(a.cost[i] > 0.0);
             worst_clearance = worst_clearance.max((a.world_clearance[i] - b.world_clearance[i]).abs());
             let (ga, gb) = (&a.grad[i * n..(i + 1) * n], &b.grad[i * n..(i + 1) * n]);
@@ -111,23 +139,21 @@ fn evaluate_matches_cpu_for_every_obstacle_kind() {
             let diff = ga.iter().zip(gb).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
             worst_grad = worst_grad.max(diff / norm);
         }
-        eprintln!(
-            "{:?}: {colliding} colliding, clearance {worst_clearance:.2e}, grad {worst_grad:.2e}",
-            world.obstacles[0]
-        );
-        assert!(colliding > items / 4 / 20, "only {colliding} configurations touch obstacle kind {kind}");
-        assert!(worst_clearance < 1e-4 && worst_grad < 1e-3, "kind {kind} differs between devices");
+        eprintln!("{name}: {colliding} colliding, clearance {worst_clearance:.2e}, grad {worst_grad:.2e}");
+        assert!(colliding > items / 6 / 20, "only {colliding} configurations touch the {name}");
+        assert!(worst_clearance < 1e-4 && worst_grad < 1e-3, "the {name} differs between devices");
     }
 }
 
 #[test]
 fn ik_matches_cpu() {
     let Some((robot, gpu, cpu)) = setup() else { return };
-    let worlds = worlds(64, 4);
-    let problems = ik_problems(&worlds, 5);
+    let scene = worlds(64, 4);
+    let problems = ik_problems(&scene, 5);
     let o = IkOptions::default();
-    let a = solve_ik(&cpu, &worlds, &problems, &o).unwrap();
-    let b = solve_ik(&gpu, &worlds, &problems, &o).unwrap();
+    let (on_cpu, on_gpu) = (cpu.upload(&scene).unwrap(), gpu.upload(&scene).unwrap());
+    let a = solve_ik(&cpu, &on_cpu, &problems, &o).unwrap();
+    let b = solve_ik(&gpu, &on_gpu, &problems, &o).unwrap();
     let agree = a.success.iter().zip(&b.success).filter(|(x, y)| x == y).count();
     let (sa, sb) = (a.success.iter().filter(|&&s| s).count(), b.success.iter().filter(|&&s| s).count());
     eprintln!("seed successes cpu {sa} gpu {sb}, agreement {agree}/{}", a.success.len());
@@ -136,7 +162,7 @@ fn ik_matches_cpu() {
     // Every GPU success must be a real solution according to the CPU model.
     let eval = cpu
         .evaluate(
-            &worlds,
+            &on_cpu,
             &(0..b.success.len()).map(|i| (i / o.seeds) as u32).collect::<Vec<_>>(),
             &b.q,
             &CollisionWeights::NONE,
@@ -153,15 +179,16 @@ fn ik_matches_cpu() {
 fn gpu_plans_are_collision_free_under_cpu_check() {
     let Some((robot, gpu, cpu)) = setup() else { return };
     let n = robot.dof();
-    let worlds = worlds(128, 6);
-    let problems = ik_problems(&worlds, 7);
-    let ik = solve_ik(&gpu, &worlds, &problems, &IkOptions::default()).unwrap();
+    let scene = worlds(128, 6);
+    let problems = ik_problems(&scene, 7);
+    let (on_cpu, on_gpu) = (cpu.upload(&scene).unwrap(), gpu.upload(&scene).unwrap());
+    let ik = solve_ik(&gpu, &on_gpu, &problems, &IkOptions::default()).unwrap();
     let plan_problems: Vec<PlanProblem> = ik
         .solved()
         .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
         .collect();
     let o = PlanOptions::default();
-    let result = plan(&gpu, &worlds, &plan_problems, &o).unwrap();
+    let result = plan(&gpu, &on_gpu, &plan_problems, &o).unwrap();
     let solved = result.solved().count();
     eprintln!("ik solved {}/{}; planned {solved}/{}", plan_problems.len(), problems.len(), plan_problems.len());
     assert!(
@@ -185,7 +212,7 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
         dense.extend(&samples.positions);
         dense_world.extend(std::iter::repeat_n(prob.world, samples.len()));
     }
-    let eval = cpu.evaluate(&worlds, &dense_world, &dense, &CollisionWeights::NONE).unwrap();
+    let eval = cpu.evaluate(&on_cpu, &dense_world, &dense, &CollisionWeights::NONE).unwrap();
     let worst = eval.world_clearance.iter().chain(&eval.self_clearance).fold(f32::INFINITY, |m, &v| m.min(v));
     eprintln!("worst clearance along {} dense samples: {worst:.4} m", dense_world.len());
     assert!(worst > -2e-3, "trajectory penetrates by {worst}");
@@ -202,9 +229,10 @@ fn one_step_gradients(
     o: &PlanOptions,
 ) -> (Vec<f32>, Vec<bool>) {
     let (lr, eps) = (1e3, 1e7);
-    let seed = plan(d, worlds, problems, &PlanOptions { iterations: 0, ..*o }).unwrap().paths.positions;
+    let worlds = d.upload(worlds).unwrap();
+    let seed = plan(d, &worlds, problems, &PlanOptions { iterations: 0, ..*o }).unwrap().paths.positions;
     let step = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..*o };
-    let stepped = plan(d, worlds, problems, &step).unwrap().paths.positions;
+    let stepped = plan(d, &worlds, problems, &step).unwrap().paths.positions;
     let robot = d.robot();
     let n = robot.dof();
     let clamped =
@@ -217,7 +245,7 @@ fn trajopt_gradients_match_cpu_element_wise() {
     let Some((robot, gpu, cpu)) = setup() else { return };
     let n = robot.dof();
     let worlds = worlds(32, 8);
-    let ik = solve_ik(&cpu, &worlds, &ik_problems(&worlds, 9), &IkOptions::default()).unwrap();
+    let ik = solve_ik(&cpu, &cpu.upload(&worlds).unwrap(), &ik_problems(&worlds, 9), &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()
         .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })

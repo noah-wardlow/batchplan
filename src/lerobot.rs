@@ -7,12 +7,13 @@
 //! - `observation.environment_state`: the goal pose (position xyz, quaternion xyzw with w >= 0),
 //!   then every obstacle of the episode's world as `[present, kind, center xyz, size xyz,
 //!   quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder,
-//!   3 capsule; `size` is the half extents of a cuboid, else (radius, radius, half height or half
-//!   length).
+//!   3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of a grid's box, else
+//!   (radius, radius, half height or half length).
 //! - `is_recovery`, `parent_episode_index` (-1 for nominal episodes) and `world_index`: extra
 //!   columns that LeRobot policies ignore.
 //!
-//! `meta/batchplan.json` additionally holds the worlds and the environment-state layout.
+//! `meta/batchplan.json` additionally holds the worlds (`grids` and `worlds`, as in the `.npy`
+//! export's `worlds.json`) and the environment-state layout.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -30,7 +31,7 @@ use serde_json::{Map, Value, json};
 
 use crate::datagen::{Demonstration, Origin};
 use crate::robot::Robot;
-use crate::world::{Obstacle, World};
+use crate::world::{Obstacle, World, worlds_json};
 
 const CODEBASE_VERSION: &str = "v3.0";
 const CHUNKS_SIZE: usize = 1000;
@@ -122,7 +123,7 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
         "environment_state": {
             "goal": "[0:7] position xyz, quaternion xyzw (w >= 0)",
             "obstacles": format!(
-                "[7 + {OBSTACLE_WIDTH}k : 7 + {OBSTACLE_WIDTH}(k+1)] obstacle k: present, kind (0 cuboid, 1 sphere, 2 cylinder, 3 capsule), center xyz, size xyz (cuboid half extents, else radius, radius, half height or half length), quaternion xyzw"
+                "[7 + {OBSTACLE_WIDTH}k : 7 + {OBSTACLE_WIDTH}(k+1)] obstacle k: present, kind (0 cuboid, 1 sphere, 2 cylinder, 3 capsule, 4 distance grid), center xyz, size xyz (half extents of a cuboid or a grid's box, else radius, radius, half height or half length), quaternion xyzw"
             ),
             "max_obstacles": max_obstacles,
         },
@@ -130,7 +131,7 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
             Origin::Nominal => json!({"origin": "nominal"}),
             Origin::Recovery { parent, phase } => json!({"origin": "recovery", "parent": parent, "phase": phase}),
         }).collect::<Vec<_>>(),
-        "worlds": worlds,
+        "worlds": worlds_json(worlds)?,
     });
     fs::write(meta.join("info.json"), serde_json::to_string_pretty(&info)?)?;
     fs::write(meta.join("stats.json"), serde_json::to_string_pretty(&stats)?)?;
@@ -304,6 +305,10 @@ fn environment_state(world: &World, demo: &Demonstration, max_obstacles: usize) 
             }
             Obstacle::Capsule { center, rotation, radius, half_length } => {
                 (3.0, center, round(radius, half_length), rotation)
+            }
+            Obstacle::Sdf { ref grid, center, rotation } => {
+                let (lo, hi) = grid.bounds();
+                (4.0, center + rotation * (0.5 * (lo + hi)), 0.5 * (hi - lo), rotation)
             }
         };
         let rot = canonical(rot);

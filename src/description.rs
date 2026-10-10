@@ -5,7 +5,7 @@
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use glam::Vec3;
 
 use crate::robot::Transform;
@@ -122,6 +122,8 @@ pub(crate) enum Geometry {
     /// A mesh given inline (USD) rather than by file.
     #[cfg_attr(not(feature = "usd"), allow(dead_code))]
     TriMesh(TriMesh),
+    /// The convex hull of a geometry, as MuJoCo collides meshes.
+    ConvexHull(Box<Geometry>),
 }
 
 /// A triangle mesh with outward-facing (counterclockwise) triangles.
@@ -140,6 +142,13 @@ impl TriMesh {
 
     pub(crate) fn corners(&self, t: [u32; 3]) -> [Vec3; 3] {
         t.map(|i| self.vertices[i as usize])
+    }
+
+    /// Flips the triangles if they face inward.
+    pub(crate) fn orient_outward(&mut self) {
+        if self.signed_volume6() < 0.0 {
+            self.triangles.iter_mut().for_each(|t| t.swap(1, 2));
+        }
     }
 
     /// Six times the enclosed volume; negative when the triangles face inward.
@@ -161,7 +170,18 @@ pub(crate) fn triangle_area([a, b, c]: [Vec3; 3]) -> f32 {
 impl Shape {
     /// The shape as an outward-facing triangle mesh in its link's frame.
     pub(crate) fn mesh(&self) -> Result<TriMesh> {
-        let mut mesh = match &self.geometry {
+        let mut mesh = self.geometry.mesh()?;
+        for v in &mut mesh.vertices {
+            *v = self.origin.rot * *v + self.origin.trans;
+        }
+        Ok(mesh)
+    }
+}
+
+impl Geometry {
+    /// The geometry as an outward-facing triangle mesh in its own frame.
+    pub(crate) fn mesh(&self) -> Result<TriMesh> {
+        let mut mesh = match self {
             Geometry::Box { half } => box_mesh(*half),
             Geometry::Sphere { radius } => sphere_mesh(Vec3::splat(*radius)),
             Geometry::Ellipsoid { radii } => sphere_mesh(*radii),
@@ -177,13 +197,13 @@ impl Shape {
             }
             Geometry::Mesh { path, scale } => load_mesh(path, *scale)?,
             Geometry::TriMesh(mesh) => mesh.clone(),
+            Geometry::ConvexHull(inner) => {
+                let (vertices, triangles) = parry3d::transformation::try_convex_hull(&inner.mesh()?.vertices)
+                    .map_err(|e| anyhow!("no convex hull: {e}"))?;
+                TriMesh { vertices, triangles }
+            }
         };
-        if mesh.signed_volume6() < 0.0 {
-            mesh.triangles.iter_mut().for_each(|t| t.swap(1, 2));
-        }
-        for v in &mut mesh.vertices {
-            *v = self.origin.rot * *v + self.origin.trans;
-        }
+        mesh.orient_outward();
         Ok(mesh)
     }
 }

@@ -114,7 +114,7 @@ fn newton_2f85_mimics_its_driver_and_skips_loop_closures() {
 
 #[test]
 fn usd_scenes_load_with_schema_defaults() {
-    let world = World::load(common::asset("usd/scene.usda")).unwrap();
+    let world = World::load(common::asset("usd/scene.usda"), &SdfOptions::default()).unwrap();
     assert_eq!(world.obstacles.len(), 4, "the visual-only sphere has no CollisionAPI");
     let probe = |p: Vec3| world.obstacles.iter().map(|o| o.distance(p).0).fold(f32::INFINITY, f32::min);
     // Floor: a default cube (size 2) scaled to 2 m x 2 cm x 2 m, its top at z = 0.
@@ -159,8 +159,8 @@ fn franka_usd_converted_from_our_urdf_matches_it() {
     let (a, b) = (Device::cpu(&usd), Device::cpu(&urdf));
     let item_world = vec![0; 100];
     let (ea, eb) = (
-        a.evaluate(&[World::default()], &item_world, &q_all, &CollisionWeights::NONE).unwrap(),
-        b.evaluate(&[World::default()], &item_world, &q_all, &CollisionWeights::NONE).unwrap(),
+        a.evaluate(&a.upload(&[World::default()]).unwrap(), &item_world, &q_all, &CollisionWeights::NONE).unwrap(),
+        b.evaluate(&b.upload(&[World::default()]).unwrap(), &item_world, &q_all, &CollisionWeights::NONE).unwrap(),
     );
     assert!(ea.self_clearance.iter().zip(&eb.self_clearance).all(|(x, y)| (x - y).abs() < 1e-5));
 }

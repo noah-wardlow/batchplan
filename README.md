@@ -6,7 +6,7 @@ This is an MVP concept. It solves thousands of IK and trajectory-optimization pr
 
 ## Which GPUs
 
-The kernels use only core features: 32-bit floats, with no subgroups, atomics or extensions. Any adapter wgpu exposes through Vulkan, Metal or DX12 should work if it allows 11 storage buffers per shader stage. Desktop drivers allow far more. Browser WebGPU and some embedded GPUs don't.
+The kernels use only core features: 32-bit floats, with no subgroups, atomics or extensions. Any adapter wgpu exposes through Vulkan, Metal or DX12 should work if it allows 12 storage buffers per shader stage. Desktop drivers allow far more. Browser WebGPU and some embedded GPUs don't.
 
 `Device::gpu` skips adapters that fall short. If none qualifies, it returns an error naming each adapter and what it lacks. OpenGL adapters are not used.
 
@@ -22,7 +22,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 
 | Module | Interface | Behind it |
 |---|---|---|
-| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.evaluate(..)` | Robot uploaded once. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices), so malformed input is an `Err` on both devices. |
+| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.upload(&worlds)`, `device.evaluate(..)` | Robot uploaded once; worlds uploaded once into a `Worlds` handle that every algorithm takes. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices, worlds uploaded to this device), so malformed input is an `Err` on both devices. |
 | `ik` | `solve_ik(&device, &worlds, &problems, &IkOptions)` | Many seeds per target. Damped least squares, with the collision gradient projected into the Jacobian null space. Success = pose tolerance + collision-free. The result keeps its problems; `ik.solved()` yields each one with its best configuration. |
 | `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal, each a uniform cubic B-spline that starts and ends at rest. Adam on smoothness plus collision cost sampled along the curve, then validation by sampling the curve densely. `result.solved()` yields each problem with its shortest valid path's control points. |
 | `timing` | `Trajectory::new(&robot, path, speed_scale)`, `trajectory.at(t, &mut state)`, `.sample(hz)`, `.check(&robot)` | Executable trajectories: timing that keeps position, velocity, acceleration and jerk within the robot's limits everywhere; allocation-free sampling for control loops; a check a safety layer can run. See [Executable trajectories](#executable-trajectories). |
@@ -30,7 +30,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
 | `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
-| `world`, `types` | `World::load(path)`, `World`/`Obstacle`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles; static geometry from MJCF or USD scenes. Shared data types with documented row-major shapes. |
+| `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
@@ -45,6 +45,7 @@ Design choices:
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release                 # fail instead of skipping GPU tests without a GPU
 cargo run --release --example bench -- 512                   # GPU vs CPU throughput
 cargo run --release --example datagen -- data/demo 512 20    # demonstrations as .npy arrays (512 worlds, 20 fps)
+cargo run --release --example depth                         # plan around what a depth camera sees
 cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20   # as a LeRobot dataset
 ```
 
@@ -54,6 +55,7 @@ Set `BENCH_LLVMPIPE=1` to also run the WGSL kernels on the CPU through Mesa's ll
 use batchplan::*;
 let robot = Robot::load("assets/ur5e/ur_description/urdf/ur5e.urdf", &RobotOptions::default())?;
 let device = Device::gpu(&robot)?;
+let worlds = device.upload(&scenes)?; // obstacles and distance grids stay on the device
 let ik = solve_ik(&device, &worlds, &ik_problems, &IkOptions::default())?;
 // Each solved IK problem carries its world, so the handoff can't mix up worlds.
 let problems: Vec<PlanProblem> = ik
@@ -101,7 +103,7 @@ Performance claims come from alternating runs of two builds on one machine. Two 
   - **Collision geometry:** from `PhysicsCollisionAPI` prims, including instanced ones, with unauthored schema sizes and transform scale applied.
   - **Frames:** ghost-link `Xform`s (such as an end-effector frame) become fixed frames.
   - **Variants:** `RobotOptions::variants` selects variants where the file authors no selection.
-- **Scenes.** `World::load` reads the static geometry of an MJCF or USD scene as obstacles; planes become slabs, ellipsoids their bounding boxes, and mesh obstacles are refused for now.
+- **Scenes.** `World::load` reads the static geometry of an MJCF or USD scene as obstacles; planes become slabs and ellipsoids their bounding boxes. Meshes become [distance grids](#distance-grids) of their convex hulls where the format collides them that way: MJCF always (as MuJoCo does), USD when `physics:approximation` is `convexHull`. Other USD approximations use the exact mesh.
 
 - **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Up to 16 actuated joints, 16 moving joints (actuated plus mimic), 32 links and 128 spheres.
 - **Collision spheres.** Without a collision model, spheres are fitted to each link's collision geometry (or its visual geometry) with cuRobo's voxel method:
@@ -123,6 +125,19 @@ Test robots live in `assets/` with their licences ([assets/README.md](assets/REA
 - URDF: the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints);
 - MJCF: MuJoCo Menagerie's Panda, UR5e and 2F-85;
 - USD: newton-assets' UR5e and 2F-85, a Franka converted from our URDF with NVIDIA's urdf-usd-converter, and handwritten fixtures for each UsdPhysics convention.
+
+## Distance grids
+
+An `Obstacle::Sdf` places a signed distance grid in a world: distances on a regular grid in its own frame, stored as half floats and interpolated trilinearly on both devices. Worlds can share a grid; a device stores it once, and exports write it once (`worlds.json` holds `{"grids", "worlds"}`, with each `sdf` obstacle naming its grid by index). Three builders make grids, laid out by `SdfOptions` (1 cm voxels and 15 cm padding by default):
+- **`SdfGrid::from_mesh`:** exact signed distances of a closed triangle mesh, with inside and outside decided by parry3d's pseudo-normals. Open or non-manifold meshes have no inside and are refused with the reason.
+- **`SdfGrid::from_points`:** voxels holding a point are solid. A closed surface's inside reads as free beyond its shell.
+- **`SdfGrid::from_depth`:** one depth image, its pinhole intrinsics and the camera pose. Each voxel is classified by projecting its center into the image, so an 8×8 time-of-flight array gives solid surfaces, not 64 points; dense images also mark the voxel of every pixel. The rule for unobserved space is explicit: space outside the image and along pixels without a reading is free, and space behind observed surfaces is free or solid as `Occlusion` says.
+
+Grids err toward collision. Each grid point holds at most the true signed distance (for points and depth images, the distance to the solid voxels as cubes), lowered by half a voxel diagonal: the most trilinear interpolation can overestimate by. So a built grid never reads farther from an obstacle than its geometry, and a wall thinner than a voxel still blocks. Without the offset, interpolating exact samples across a 2 mm wall reads several millimeters of clearance inside it; a test pins both. The price is growth: up to a voxel diagonal for meshes, and about three voxels for points and depth images.
+
+Outside its box, a grid reads the value at the nearest box point plus the distance to it. That is exact for collision checking when the box reaches at least the collision margin plus the robot's largest sphere radius beyond every surface, which is what `SdfOptions::padding` is for.
+
+`examples/depth.rs` renders a 640×480 depth image of a tabletop scene, builds a grid from it (172×192×72 points in 38 ms on the M4 Pro), and plans Panda reaches with the grid as the only obstacle. IK reaches 49 of 64 grasp targets; the others lie in the camera's shadow, which `Occlusion::Occupied` treats as solid. All 49 plan, and their closest approach to the true scene is 38 mm. The arm is not in the rendered image; a real camera's pixels on the robot must be masked out first.
 
 ## Executable trajectories
 
@@ -166,9 +181,11 @@ The M4 Pro's GPU and CPU solve the same problems.
 
 GPU latency at batch size 1 is dominated by per-call setup and readback, which is why the CPU is competitive there.
 
+Uploading worlds once and adding distance grids changed no success rate. In alternating runs against the previous commit on the Framework Desktop, `bench -- 512` planned 4% faster on the GPU (1,775 against 1,708 seeds/s) and 8% faster on the CPU (320 against 296); the benchmark's throughput and latency stayed within run-to-run noise. On the M4 Pro, nothing changed measurably.
+
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 42 tests; `--features lerobot` adds 2 export tests and `--features usd` adds 5 OpenUSD tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 52 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 6 OpenUSD tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
@@ -176,12 +193,19 @@ GPU latency at batch size 1 is dominated by per-call setup and readback, which i
 - **GPU vs CPU IK:** the two agree on all 2,048 seeds.
 - **GPU plans under an independent check:** every GPU plan reported valid was re-checked on the CPU at 4× denser interpolation. None penetrates; the worst clearance is +0.1 mm.
 - **Every device behaves the same:**
-  - Malformed batches (wrong array lengths, a world index past the end) are an `Err` on both CPU and GPU.
+  - Malformed batches (wrong array lengths, a world index past the end, worlds uploaded to another device) are an `Err` on both CPU and GPU.
   - Obstacle-free worlds plan on both.
   - Plans keep the worlds of their problems when one world holds several targets.
 - **CPU IK and retiming:** IK solves targets taken from collision-free configurations; retiming respects velocity limits and keeps the endpoints.
 - **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
 - **Obstacle distances:** every obstacle kind returns unit gradients that match finite differences, stepping back along the gradient lands on the surface, and cylinder and capsule distances match closed forms. The GPU agrees with the CPU for each kind.
+- **Distance grids:**
+  - Gradients match finite differences inside the grid and beyond its box, away from cell faces; so do collision gradients through a grid.
+  - The GPU agrees with the CPU to 3e-7 m (Metal and RADV), including two grids in one world, one of them shared with another world and stored after a grid with an odd number of points.
+  - Mesh grids never read farther than the true distance and at most a voxel diagonal nearer. Point grids never read beyond their solid voxels. Open and non-manifold meshes are refused.
+  - Depth images from an 8×8 time-of-flight array and from a 640×480 camera both reproduce the table under them, follow both occlusion rules, and leave unobserved space free.
+  - MJCF scene meshes collide as their convex hulls; USD ones as `physics:approximation` says. Exports write each grid once, and LeRobot's environment state describes a grid by its box.
+  - Planting a wrong grid offset or half-float order in the kernel, a wrong gradient axis, a missing conservative offset, a depth builder that only marks pixel points, or ignored hull semantics fails a test.
 - **Trajectories:**
   - Planned trajectories stay within velocity, acceleration and jerk limits along their whole length, reach the binding limit, and start and end exactly at rest.
   - The analytic velocity and acceleration match finite differences.
@@ -226,7 +250,7 @@ Each `Demonstration` holds its origin (nominal, or recovery with its parent and 
 | `length.npy` | `[episodes]` int32, valid steps per episode |
 | `kind.npy` | `[episodes]` uint8: 0 = nominal, 1 = recovery |
 | `parent.npy` | `[episodes]` int32: for recoveries, the row of the nominal episode they branch from; -1 otherwise |
-| `world.npy`, `worlds.json` | world index per episode and the obstacles of every world |
+| `world.npy`, `worlds.json` | world index per episode, and `{"grids", "worlds"}`: the obstacles of every world, with each distance grid written once |
 | `goal_pose.npy` | `[episodes, 7]` target of the `ee_link` frame: xyz + quaternion xyzw |
 | `meta.json` | `dt`, joint names, velocity, acceleration and jerk limits, nominal/recovery counts, device |
 
@@ -238,7 +262,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 |---|---|
 | `observation.state` | joint positions |
 | `action` | joint positions of the next frame (absolute targets); the last frame repeats its own |
-| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule; `size` is a cuboid's half extents, else (radius, radius, half height or half length) |
+| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of a grid's box, else (radius, radius, half height or half length) |
 | `is_recovery`, `parent_episode_index`, `world_index` | extensions; LeRobot policies only read `observation.*` and `action`, so these are ignored in training |
 | `task` | "Move the gripper to the target pose." (`ExportOptions::task`) |
 
@@ -254,12 +278,12 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 ## Limits of the MVP
 
-- **Geometry.** The robot is modeled as spheres only, and obstacles as boxes, spheres, cylinders and capsules. There are no meshes, point clouds or depth-derived distance fields yet.
+- **Geometry.** The robot is modeled as spheres only. Distance grids are built on the CPU, from one depth image at a time (no fusion over frames), and depth images must have the robot masked out by the caller.
 - **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating, planar and ball joints aren't supported; closed loops (MJCF `connect`, USD loop joints) are dropped from the tree.
 - **Long motions.** Trajectory optimization alone does not escape seeds that sweep through obstacles. Goals across the UR5e's full ±2π joint ranges in a tabletop world fail this way.
 - **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search.
 - **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.
-- **Kernel performance.** Kernels run one invocation per configuration (or per collision sample, or per control point), with no shared memory or subgroup work. Buffers are allocated per call. This leaves performance on the table.
+- **Kernel performance.** Kernels run one invocation per configuration (or per collision sample, or per control point), with no shared memory or subgroup work. Worlds stay on the device, but per-call buffers (configurations, paths) are allocated per call. This leaves performance on the table.
 - **Training data.** Demonstrations are state-only reaches with the gripper held open, and every episode shares one task string. The LeRobot export writes all episode metadata to a single file, which caps it at roughly 100k episodes.
 
 ## License

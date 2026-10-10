@@ -1,22 +1,26 @@
 //! wgpu backend: one WGSL source runs on Vulkan (AMD, NVIDIA, Intel), Metal and DX12.
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat3;
 use wgpu::util::DeviceExt;
 
-use crate::device::{Backend, CollisionWeights, Evaluation};
+use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
 use crate::robot::{JointKind, MAX_DOF, MAX_JOINTS, MAX_LINKS, MAX_SPHERES, Robot};
+use crate::sdf::SdfGrid;
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
 use crate::world::{Obstacle, World};
 
 const WORKGROUP: u32 = 64;
-/// Storage buffers in bind group 0: bindings 1..=8 are read-only, 9..=11 read-write (see kernels.wgsl).
-const READ_ONLY_STORAGE: u32 = 8;
+/// Storage buffers in bind group 0: bindings 1..=9 are read-only, 10..=12 read-write (see kernels.wgsl).
+const READ_ONLY_STORAGE: u32 = 9;
 const READ_WRITE_STORAGE: u32 = 3;
 /// Upper bounds on work per queue submission, to stay clear of driver watchdogs.
 const EVAL_CHUNK: usize = 1 << 18;
@@ -79,12 +83,17 @@ const CUBOID: u32 = 0;
 const SPHERE: u32 = 1;
 const CYLINDER: u32 = 2;
 const CAPSULE: u32 = 3;
+const SDF: u32 = 4;
 
 shader_struct! {
     /// `center.w` is the kind (`CUBOID`, `SPHERE`, ...). `half` holds the half extents of a cuboid,
-    /// or the radius (x) and half height or half length (y) of the round kinds. r0..r2 are the
-    /// world-from-local rotation columns.
-    GpuObstacle => Obstacle { center: Vec4, half: Vec4, r0: Vec4, r1: Vec4, r2: Vec4 }
+    /// the radius (x) and half height or half length (y) of the round kinds, or a distance grid's
+    /// origin (xyz) and voxel size (w). r0..r2 are the world-from-local rotation columns. A grid
+    /// has `nx * ny * nz` points, two per `grid_data` word from word `grid`.
+    GpuObstacle => Obstacle {
+        center: Vec4, half: Vec4, r0: Vec4, r1: Vec4, r2: Vec4,
+        nx: u32, ny: u32, nz: u32, grid: u32,
+    }
 }
 
 shader_struct! {
@@ -115,11 +124,18 @@ pub(crate) struct GpuBackend {
     uniform_align: u64,
 }
 
+/// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
+/// and the distance grids they use, each stored once.
+struct GpuWorlds {
+    obstacles: wgpu::Buffer,
+    ranges: wgpu::Buffer,
+    grids: wgpu::Buffer,
+}
+
 /// Per-call buffers bound alongside the robot buffers.
 struct CallBuffers<'a> {
     params: &'a wgpu::Buffer,
-    obstacles: &'a wgpu::Buffer,
-    ranges: &'a wgpu::Buffer,
+    worlds: &'a GpuWorlds,
     item_world: &'a wgpu::Buffer,
     targets: &'a wgpu::Buffer,
     q: &'a wgpu::Buffer,
@@ -186,7 +202,9 @@ impl GpuBackend {
             &format!("const MAX_JOINTS: u32 = {MAX_JOINTS}u;\n"),
             &format!("const MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * MAX_DOF),
             &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
-            &format!("const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\n"),
+            &format!(
+                "const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"
+            ),
             GpuParams::WGSL,
             GpuLink::WGSL,
             GpuSphere::WGSL,
@@ -322,12 +340,14 @@ impl GpuBackend {
         }
     }
 
-    fn world_buffers(&self, worlds: &[World]) -> (wgpu::Buffer, wgpu::Buffer) {
+    fn upload_worlds(&self, worlds: &[World]) -> Result<GpuWorlds> {
         let mut obstacles = vec![];
         let mut ranges: Vec<[u32; 2]> = vec![];
+        let mut grid_words: Vec<u32> = vec![];
+        let mut grid_offsets: HashMap<*const SdfGrid, u32> = HashMap::new();
         for s in worlds {
             ranges.push([obstacles.len() as u32, s.obstacles.len() as u32]);
-            obstacles.extend(s.obstacles.iter().map(|o| {
+            for o in &s.obstacles {
                 let rotated = |kind: u32, center: glam::Vec3, half: [f32; 4], rotation: glam::Quat| {
                     let r = Mat3::from_quat(rotation);
                     GpuObstacle {
@@ -336,9 +356,10 @@ impl GpuBackend {
                         r0: v4(r.x_axis, 0.0),
                         r1: v4(r.y_axis, 0.0),
                         r2: v4(r.z_axis, 0.0),
+                        ..Default::default()
                     }
                 };
-                match *o {
+                obstacles.push(match *o {
                     Obstacle::Cuboid { center, half_extents, rotation } => {
                         rotated(CUBOID, center, v4(half_extents, 0.0), rotation)
                     }
@@ -351,10 +372,40 @@ impl GpuBackend {
                     Obstacle::Capsule { center, rotation, radius, half_length } => {
                         rotated(CAPSULE, center, [radius, half_length, 0.0, 0.0], rotation)
                     }
-                }
-            }));
+                    Obstacle::Sdf { ref grid, center, rotation } => {
+                        let offset =
+                            *grid_offsets.entry(Arc::as_ptr(grid)).or_insert_with(|| {
+                                let offset = grid_words.len() as u32;
+                                grid_words.extend(grid.values.chunks(2).map(|pair| {
+                                    u32::from(pair[0]) | u32::from(pair.get(1).copied().unwrap_or(0)) << 16
+                                }));
+                                offset
+                            });
+                        let [nx, ny, nz] = grid.dims;
+                        GpuObstacle {
+                            nx,
+                            ny,
+                            nz,
+                            grid: offset,
+                            ..rotated(SDF, center, v4(grid.origin, grid.voxel), rotation)
+                        }
+                    }
+                });
+            }
         }
-        (storage(&self.device, "obstacles", &obstacles), storage(&self.device, "world ranges", &ranges))
+        let limits = self.device.limits();
+        let bytes = (grid_words.len() * 4) as u64;
+        ensure!(
+            bytes <= limits.max_storage_buffer_binding_size.min(limits.max_buffer_size),
+            "the distance grids take {} MiB, more than {} can bind",
+            bytes >> 20,
+            self.info.name
+        );
+        Ok(GpuWorlds {
+            obstacles: storage(&self.device, "obstacles", &obstacles),
+            ranges: storage(&self.device, "world ranges", &ranges),
+            grids: storage(&self.device, "distance grids", &grid_words),
+        })
     }
 
     fn uniform(&self, params: &GpuParams) -> wgpu::Buffer {
@@ -372,10 +423,11 @@ impl GpuBackend {
             &self.spheres,
             &self.pairs,
             &self.limits,
-            b.obstacles,
-            b.ranges,
+            &b.worlds.obstacles,
+            &b.worlds.ranges,
             b.item_world,
             b.targets,
+            &b.worlds.grids,
             b.q,
             b.aux,
             b.out,
@@ -425,7 +477,7 @@ impl GpuBackend {
 
     fn evaluate_chunk(
         &self,
-        worlds: &[World],
+        worlds: &GpuWorlds,
         item_world: &[u32],
         q: &[f32],
         w: &CollisionWeights,
@@ -433,7 +485,6 @@ impl GpuBackend {
         let items = item_world.len();
         let stride = 3 + self.robot.dof();
         let params = self.uniform(&self.params(items, w));
-        let (obstacles, ranges) = self.world_buffers(worlds);
         let world_buf = storage(&self.device, "item world", item_world);
         let no_targets = storage::<[f32; 4]>(&self.device, "unused targets", &[]);
         let no_aux = storage::<f32>(&self.device, "unused aux", &[]);
@@ -441,8 +492,7 @@ impl GpuBackend {
         let out = storage_zeroed(&self.device, "out", items * stride);
         let bg = self.bind_main(&CallBuffers {
             params: &params,
-            obstacles: &obstacles,
-            ranges: &ranges,
+            worlds,
             item_world: &world_buf,
             targets: &no_targets,
             q: &q_buf,
@@ -467,7 +517,12 @@ impl Backend for GpuBackend {
         &self.robot
     }
 
-    fn evaluate(&self, worlds: &[World], item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
+    fn upload(&self, worlds: &[World]) -> Result<Box<dyn Any + Send + Sync>> {
+        Ok(Box::new(self.upload_worlds(worlds)?))
+    }
+
+    fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
+        let worlds: &GpuWorlds = worlds.prepared();
         let n = self.robot.dof();
         let stride = 3 + n;
         let mut out = Evaluation::default();
@@ -485,12 +540,13 @@ impl Backend for GpuBackend {
 
     fn ik(
         &self,
-        worlds: &[World],
+        worlds: &Worlds,
         item_world: &[u32],
         targets: &[Pose],
         q: &mut [f32],
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>> {
+        let worlds: &GpuWorlds = worlds.prepared();
         let items = item_world.len();
         if items == 0 {
             return Ok(vec![]);
@@ -501,7 +557,6 @@ impl Backend for GpuBackend {
         params.max_step = o.max_step;
         params.collision_step = o.collision_step;
         let params_buf = self.uniform(&params);
-        let (obstacles, ranges) = self.world_buffers(worlds);
         let world_buf = storage(&self.device, "item world", item_world);
         let target_data: Vec<[f32; 4]> = targets
             .iter()
@@ -516,8 +571,7 @@ impl Backend for GpuBackend {
         let out = storage_zeroed(&self.device, "ik errors", items * 2);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
-            obstacles: &obstacles,
-            ranges: &ranges,
+            worlds,
             item_world: &world_buf,
             targets: &target_buf,
             q: &q_buf,
@@ -548,7 +602,8 @@ impl Backend for GpuBackend {
         Ok(self.read(&out, items * 2)?.chunks(2).map(|e| [e[0], e[1]]).collect())
     }
 
-    fn trajopt(&self, worlds: &[World], item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
+    fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
+        let worlds: &GpuWorlds = worlds.prepared();
         let traj = &mut paths.positions[..];
         let items = item_world.len();
         if items == 0 || o.iterations == 0 {
@@ -562,7 +617,6 @@ impl Backend for GpuBackend {
         params.beta1 = o.beta1;
         params.beta2 = o.beta2;
         let params_buf = self.uniform(&params);
-        let (obstacles, ranges) = self.world_buffers(worlds);
         let world_buf = storage(&self.device, "item world", item_world);
         let dummy = storage::<f32>(&self.device, "unused", &[]);
         let q_buf = storage(&self.device, "trajectories", traj);
@@ -572,8 +626,7 @@ impl Backend for GpuBackend {
         let out = storage::<f32>(&self.device, "unused out", &[]);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
-            obstacles: &obstacles,
-            ranges: &ranges,
+            worlds,
             item_world: &world_buf,
             targets: &dummy,
             q: &q_buf,
@@ -684,6 +737,6 @@ mod tests {
     #[test]
     fn baseline_webgpu_limits_are_rejected_with_the_reason() {
         let unmet = unmet_limits(&wgpu::Limits::defaults());
-        assert_eq!(unmet, ["11 storage buffers per shader stage (has 8)"]);
+        assert_eq!(unmet, ["12 storage buffers per shader stage (has 8)"]);
     }
 }

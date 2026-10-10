@@ -5,12 +5,11 @@
 
 use anyhow::{Result, ensure};
 
-use crate::device::{CollisionWeights, Device};
+use crate::device::{CollisionWeights, Device, Worlds};
 use crate::rng::Rng;
 use crate::robot::Robot;
 use crate::spline;
 use crate::types::{JointPaths, Solved};
-use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanOptions {
@@ -105,7 +104,7 @@ impl PlanResult {
     }
 }
 
-pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &PlanOptions) -> Result<PlanResult> {
+pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &PlanOptions) -> Result<PlanResult> {
     let robot = device.robot();
     let n = robot.dof();
     let points = o.control_points;

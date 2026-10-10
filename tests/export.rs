@@ -20,7 +20,8 @@ fn demos(dt: f32) -> (Robot, Vec<World>, Vec<Demonstration>) {
         .enumerate()
         .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
         .collect();
-    let demos = demonstrations(&device, &worlds, &goals, &DemoOptions { dt, ..Default::default() }).unwrap();
+    let uploaded = device.upload(&worlds).unwrap();
+    let demos = demonstrations(&device, &uploaded, &goals, &DemoOptions { dt, ..Default::default() }).unwrap();
     assert!(demos.iter().any(|d| d.origin.parent().is_some()), "fixture should include recoveries");
     (robot, worlds, demos)
 }

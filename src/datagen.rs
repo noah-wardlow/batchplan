@@ -3,14 +3,13 @@
 
 use anyhow::Result;
 
-use crate::device::{CollisionWeights, Device};
+use crate::device::{CollisionWeights, Device, Worlds};
 use crate::ik::{IkOptions, IkProblem, solve_ik};
 use crate::rng::Rng;
 use crate::spline;
 use crate::timing::Trajectory;
 use crate::trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
 use crate::types::{JointTrajectory, Pose, Solved};
-use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryOptions {
@@ -43,7 +42,7 @@ pub struct Recovery {
 /// demonstrations of recovering from off-nominal states, which raw planner output never contains.
 pub fn recovery_problems(
     device: &Device,
-    worlds: &[World],
+    worlds: &Worlds,
     result: &PlanResult,
     o: &RecoveryOptions,
 ) -> Result<Vec<Recovery>> {
@@ -132,7 +131,7 @@ impl Default for DemoOptions {
 /// those demonstrations. Goals without a collision-free IK solution or plan are skipped.
 pub fn demonstrations(
     device: &Device,
-    worlds: &[World],
+    worlds: &Worlds,
     goals: &[IkProblem],
     o: &DemoOptions,
 ) -> Result<Vec<Demonstration>> {

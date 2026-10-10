@@ -103,13 +103,13 @@ fn round_obstacle_distances_match_closed_forms() {
     let cylinder = Obstacle::Cylinder { center, rotation: Quat::IDENTITY, radius: 0.5, half_height: 1.0 };
     let capsule = Obstacle::Capsule { center, rotation: Quat::IDENTITY, radius: 0.5, half_length: 1.0 };
     let cases = [
-        (cylinder, Vec3::new(0.8, 0.0, 0.2), 0.3), // beside the side wall
-        (cylinder, Vec3::new(0.0, 0.0, 1.4), 0.4), // above the cap
-        (cylinder, Vec3::new(0.8, 0.0, 1.4), (0.09f32 + 0.16).sqrt()), // past the rim
-        (cylinder, Vec3::new(0.3, 0.0, 0.0), -0.2), // inside, nearest the wall
-        (capsule, Vec3::new(0.0, 0.0, 1.9), 0.4),  // above the end cap
-        (capsule, Vec3::new(0.6, 0.0, 1.8), 0.5),  // diagonal from the end
-        (capsule, Vec3::new(0.2, 0.0, -0.3), -0.3), // inside the shaft
+        (&cylinder, Vec3::new(0.8, 0.0, 0.2), 0.3), // beside the side wall
+        (&cylinder, Vec3::new(0.0, 0.0, 1.4), 0.4), // above the cap
+        (&cylinder, Vec3::new(0.8, 0.0, 1.4), (0.09f32 + 0.16).sqrt()), // past the rim
+        (&cylinder, Vec3::new(0.3, 0.0, 0.0), -0.2), // inside, nearest the wall
+        (&capsule, Vec3::new(0.0, 0.0, 1.9), 0.4),  // above the end cap
+        (&capsule, Vec3::new(0.6, 0.0, 1.8), 0.5),  // diagonal from the end
+        (&capsule, Vec3::new(0.2, 0.0, -0.3), -0.3), // inside the shaft
     ];
     for (o, offset, expected) in cases {
         let (d, _) = o.distance(center + offset);
@@ -127,7 +127,8 @@ fn default_pose_is_collision_free_on_table() {
     let cpu = Device::cpu(&robot);
     let world = common::tabletop(&mut Rng::new(1));
     let table_only = World { obstacles: world.obstacles[..1].to_vec() };
-    let e = cpu.evaluate(&[table_only], &[0], robot.default_q(), &CollisionWeights::NONE).unwrap();
+    let e =
+        cpu.evaluate(&cpu.upload(&[table_only]).unwrap(), &[0], robot.default_q(), &CollisionWeights::NONE).unwrap();
     assert!(e.world_clearance[0] > 0.05, "world clearance {}", e.world_clearance[0]);
     assert!(e.self_clearance[0] > 0.0, "self clearance {}", e.self_clearance[0]);
 }
@@ -140,6 +141,7 @@ fn collision_gradient_matches_finite_differences() {
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.05, self_margin: 0.02 };
     let mut rng = Rng::new(11);
     let worlds: Vec<World> = (0..8).map(|_| common::tabletop(&mut rng)).collect();
+    let worlds = cpu.upload(&worlds).unwrap();
     let mut checked = 0;
     for trial in 0..400 {
         let q = random_q(&robot, &mut rng);
@@ -177,15 +179,16 @@ fn ik_reaches_targets_from_collision_free_configurations() {
     let robot = panda();
     let cpu = Device::cpu(&robot);
     let mut rng = Rng::new(5);
+    let empty = cpu.upload(&[World::default()]).unwrap();
     let mut problems = vec![];
     while problems.len() < 64 {
         let q = random_q(&robot, &mut rng);
-        if cpu.evaluate(&[World::default()], &[0], &q, &CollisionWeights::NONE).unwrap().collision_free(0) {
+        if cpu.evaluate(&empty, &[0], &q, &CollisionWeights::NONE).unwrap().collision_free(0) {
             problems.push(IkProblem { world: 0, target: robot.ee_pose(&q) });
         }
     }
     let o = IkOptions { seeds: 16, ..Default::default() };
-    let result = solve_ik(&cpu, &[World::default()], &problems, &o).unwrap();
+    let result = solve_ik(&cpu, &empty, &problems, &o).unwrap();
     let solved = (0..problems.len()).filter(|&p| result.best(p).is_some()).count();
     assert!(solved >= 60, "solved {solved}/64");
     for (p, problem) in problems.iter().enumerate() {

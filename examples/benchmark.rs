@@ -140,7 +140,7 @@ struct Outcome {
 fn score(
     robot: &Robot,
     cpu: &Device,
-    worlds: &[World],
+    worlds: &Worlds,
     problems: &[Problem],
     result: &PlanResult,
     o: &PlanOptions,
@@ -199,7 +199,7 @@ fn ik_problems(problems: &[Problem]) -> Vec<IkProblem> {
 }
 
 /// IK for every goal, then a plan from each start to its best IK solution.
-fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem], o: &PlanOptions) -> Result<PlanResult> {
+fn ik_and_plan(device: &Device, worlds: &Worlds, problems: &[Problem], o: &PlanOptions) -> Result<PlanResult> {
     let ik = solve_ik(device, worlds, &ik_problems(problems), &IkOptions::default())?;
     let plans: Vec<PlanProblem> = ik
         .solved()
@@ -257,35 +257,37 @@ fn main() -> Result<()> {
         let mut all_latency = vec![];
         solve_ik(
             device,
-            &[World::default()],
+            &device.upload(&[World::default()])?,
             &[IkProblem { world: 0, target: robot.ee_pose(robot.default_q()) }],
             &IkOptions::default(),
         )?;
         for (name, problems) in &sets {
-            let worlds: Vec<World> = problems.iter().map(Problem::world).collect();
+            // Timings include uploading the worlds.
+            let scene: Vec<World> = problems.iter().map(Problem::world).collect();
+            let on_cpu = cpu.upload(&scene)?;
             let to_ik: Vec<PlanProblem> = problems
                 .iter()
                 .enumerate()
                 .map(|(i, p)| PlanProblem { world: i as u32, start: p.start.clone(), goal: p.goal_ik[0].clone() })
                 .collect();
             let t = Instant::now();
-            let planned = plan(device, &worlds, &to_ik, &args.plan)?;
+            let planned = plan(device, &device.upload(&scene)?, &to_ik, &args.plan)?;
             let plan_only = Outcome {
                 seconds: t.elapsed().as_secs_f64(),
-                ..score(&robot, &cpu, &worlds, problems, &planned, &args.plan)?
+                ..score(&robot, &cpu, &on_cpu, problems, &planned, &args.plan)?
             };
 
             let t = Instant::now();
-            let full_result = ik_and_plan(device, &worlds, problems, &args.plan)?;
+            let full_result = ik_and_plan(device, &device.upload(&scene)?, problems, &args.plan)?;
             let full = Outcome {
                 seconds: t.elapsed().as_secs_f64(),
-                ..score(&robot, &cpu, &worlds, problems, &full_result, &args.plan)?
+                ..score(&robot, &cpu, &on_cpu, problems, &full_result, &args.plan)?
             };
 
             // Problems whose start and given IK goal are collision-free under this robot model.
             let ends: Vec<f32> = problems.iter().flat_map(|p| p.start.iter().chain(&p.goal_ik[0]).copied()).collect();
             let end_world: Vec<u32> = (0..problems.len() as u32).flat_map(|i| [i, i]).collect();
-            let eval = cpu.evaluate(&worlds, &end_world, &ends, &CollisionWeights::NONE)?;
+            let eval = cpu.evaluate(&on_cpu, &end_world, &ends, &CollisionWeights::NONE)?;
             let free_ends =
                 (0..problems.len()).filter(|&i| eval.collision_free(2 * i) && eval.collision_free(2 * i + 1)).count();
             total_free += free_ends;
@@ -293,7 +295,7 @@ fn main() -> Result<()> {
             let mut latency = vec![];
             for i in 0..args.latency.min(problems.len()) {
                 let t = Instant::now();
-                ik_and_plan(device, &worlds[i..i + 1], &problems[i..i + 1], &args.plan)?;
+                ik_and_plan(device, &device.upload(&scene[i..i + 1])?, &problems[i..i + 1], &args.plan)?;
                 latency.push(t.elapsed().as_secs_f64() * 1e3);
             }
             all_latency.extend(&latency);

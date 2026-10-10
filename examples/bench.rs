@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         ik_opts.seeds, ik_opts.iterations, plan_opts.seeds, plan_opts.control_points, plan_opts.iterations
     );
     for device in &devices {
+        let worlds = device.upload(&worlds)?;
         // Warm up (pipeline compilation, thread pool).
         solve_ik(device, &worlds, &ik_problems[..1], &IkOptions { iterations: 1, ..ik_opts })?;
 

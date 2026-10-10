@@ -4,17 +4,23 @@
 // Index loops here mirror kernels.wgsl line for line, which keeps the two easy to compare.
 #![allow(clippy::needless_range_loop)]
 
+use std::any::Any;
+use std::sync::Arc;
+
 use anyhow::Result;
 use glam::{Mat3, Vec3};
 use rayon::prelude::*;
 
-use crate::device::{Backend, CollisionWeights, Evaluation};
+use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
 use crate::robot::{Fk, MAX_DOF, MAX_SPHERES, Robot};
+use crate::sdf::SdfGrid;
 use crate::spline;
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
-use crate::world::{FAR, Obstacle, World, box_distance, capsule_distance, cylinder_distance, sphere_distance};
+use crate::world::{
+    FAR, Obstacle, World, box_distance, capsule_distance, cylinder_distance, sdf_distance, sphere_distance,
+};
 
 pub(crate) struct CpuBackend {
     robot: Robot,
@@ -27,15 +33,18 @@ impl CpuBackend {
 }
 
 /// Obstacle with its rotation matrix precomputed.
-#[derive(Clone, Copy)]
 enum Prepared {
     Cuboid { rot: Mat3, center: Vec3, half: Vec3 },
     Sphere { center: Vec3, radius: f32 },
     Cylinder { rot: Mat3, center: Vec3, radius: f32, half_height: f32 },
     Capsule { rot: Mat3, center: Vec3, radius: f32, half_length: f32 },
+    Sdf { rot: Mat3, center: Vec3, grid: Arc<SdfGrid> },
 }
 
-fn prepare(worlds: &[World]) -> Vec<Vec<Prepared>> {
+/// The obstacles of each world, prepared.
+type CpuWorlds = Vec<Vec<Prepared>>;
+
+fn prepare(worlds: &[World]) -> CpuWorlds {
     worlds
         .iter()
         .map(|s| {
@@ -51,6 +60,9 @@ fn prepare(worlds: &[World]) -> Vec<Vec<Prepared>> {
                     }
                     Obstacle::Capsule { center, rotation, radius, half_length } => {
                         Prepared::Capsule { rot: Mat3::from_quat(rotation), center, radius, half_length }
+                    }
+                    Obstacle::Sdf { ref grid, center, rotation } => {
+                        Prepared::Sdf { rot: Mat3::from_quat(rotation), center, grid: grid.clone() }
                     }
                 })
                 .collect()
@@ -85,6 +97,7 @@ fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, g
                 Prepared::Capsule { rot, center, radius, half_length } => {
                     capsule_distance(rot, center, radius, half_length, sc[s])
                 }
+                Prepared::Sdf { rot, center, ref grid } => sdf_distance(rot, center, grid, sc[s]),
             };
             let d = dist - r;
             wmin = wmin.min(d);
@@ -311,9 +324,13 @@ impl Backend for CpuBackend {
         &self.robot
     }
 
-    fn evaluate(&self, worlds: &[World], item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
+    fn upload(&self, worlds: &[World]) -> Result<Box<dyn Any + Send + Sync>> {
+        Ok(Box::new(prepare(worlds)))
+    }
+
+    fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
         let n = self.robot.dof();
-        let prepared = prepare(worlds);
+        let prepared: &CpuWorlds = worlds.prepared();
         let rows: Vec<(f32, f32, f32, Vec<f32>)> = q
             .par_chunks(n)
             .zip(item_world.par_iter())
@@ -335,14 +352,14 @@ impl Backend for CpuBackend {
 
     fn ik(
         &self,
-        worlds: &[World],
+        worlds: &Worlds,
         item_world: &[u32],
         targets: &[Pose],
         q: &mut [f32],
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>> {
         let n = self.robot.dof();
-        let prepared = prepare(worlds);
+        let prepared: &CpuWorlds = worlds.prepared();
         Ok(q.par_chunks_mut(n)
             .zip(item_world.par_iter().zip(targets.par_iter()))
             .map(|(qi, (&s, target))| {
@@ -357,11 +374,11 @@ impl Backend for CpuBackend {
             .collect())
     }
 
-    fn trajopt(&self, worlds: &[World], item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
+    fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
         let n = self.robot.dof();
         let t_count = paths.points;
         let samples = (t_count - 3) * o.samples_per_span;
-        let prepared = prepare(worlds);
+        let prepared: &CpuWorlds = worlds.prepared();
         paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(|(tr, &s)| {
             let world = &prepared[s as usize];
             let mut sample_grad = vec![0.0f32; samples * n];

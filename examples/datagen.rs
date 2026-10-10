@@ -45,7 +45,7 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let options = DemoOptions { dt: 1.0 / fps as f32, ..Default::default() };
-    let demos = demonstrations(&device, &worlds, &goals, &options)?;
+    let demos = demonstrations(&device, &device.upload(&worlds)?, &goals, &options)?;
     let planning_time = started.elapsed().as_secs_f64();
     let recoveries = demos.iter().filter(|d| matches!(d.origin, Origin::Recovery { .. })).count();
     println!(

@@ -209,6 +209,7 @@ dependencies = [
  "arrow-schema",
  "bytemuck",
  "glam",
+ "half",
  "mesh-loader",
  "openusd",
  "openusd-schemas",

@@ -244,7 +244,12 @@ impl Loader {
                     start += count as usize;
                 }
                 let vertices = points.iter().map(|&p| (p * s).as_vec3()).collect();
-                Geometry::TriMesh(TriMesh { vertices, triangles })
+                let mesh = Geometry::TriMesh(TriMesh { vertices, triangles });
+                // Other approximations stand in for the exact mesh, which is used instead.
+                match token(prim, "physics:approximation")?.as_deref() {
+                    Some("convexHull") => Geometry::ConvexHull(Box::new(mesh)),
+                    _ => mesh,
+                }
             }
             other => bail!("{path}: collider type '{other}' is not supported"),
         };

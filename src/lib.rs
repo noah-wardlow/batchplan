@@ -15,7 +15,7 @@
 //! use batchplan::*;
 //! let robot = Robot::load("assets/ur5e/ur_description/urdf/ur5e.urdf", &RobotOptions::default())?;
 //! let device = Device::gpu(&robot)?;
-//! let worlds = vec![World::default()];
+//! let worlds = device.upload(&[World::default()])?;
 //! let goal = vec![0.5, -1.2, 1.0, -1.4, -1.5, 0.3];
 //! let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal }];
 //! let result = plan(&device, &worlds, &problems, &PlanOptions::default())?;
@@ -35,6 +35,7 @@ mod mjcf;
 pub mod npy;
 pub mod rng;
 pub mod robot;
+pub mod sdf;
 pub mod spheres;
 mod spline;
 pub mod timing;
@@ -45,9 +46,10 @@ mod urdf;
 mod usd;
 pub mod world;
 
-pub use device::{CollisionWeights, Device, Evaluation};
+pub use device::{CollisionWeights, Device, Evaluation, Worlds};
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
 pub use robot::{CollisionModel, Robot, RobotOptions};
+pub use sdf::{Intrinsics, Occlusion, SdfGrid, SdfOptions};
 pub use spheres::{SphereGeometry, SphereOptions};
 pub use timing::{JointState, Trajectory};
 pub use trajopt::{PlanOptions, PlanProblem, PlanResult, plan};

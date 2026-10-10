@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::datagen::Demonstration;
 use crate::robot::Robot;
-use crate::world::World;
+use crate::world::{World, worlds_json};
 
 #[derive(Clone, Debug, Default)]
 pub struct ExportOptions {
@@ -23,7 +23,7 @@ pub struct ExportOptions {
 /// - `length.npy` (int32), `kind.npy` (uint8: 0 nominal, 1 recovery), `parent.npy` (int32: the
 ///   episode a recovery branches from, -1 otherwise), `world.npy` (int32): `[episodes]`.
 /// - `goal_pose.npy`: `[episodes, 7]` float32, target position xyz + quaternion xyzw.
-/// - `worlds.json` (the obstacles of every world) and `meta.json`.
+/// - `worlds.json` (the obstacles of every world, each distance grid written once) and `meta.json`.
 ///
 /// All demonstrations must share one sample period.
 pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
@@ -63,7 +63,7 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
         })
         .collect();
     write(root.join("goal_pose.npy"), &[m, 7], &poses)?;
-    std::fs::write(root.join("worlds.json"), serde_json::to_string(worlds)?)?;
+    std::fs::write(root.join("worlds.json"), serde_json::to_string(&worlds_json(worlds)?)?)?;
 
     let recoveries = kinds.iter().filter(|&&k| k == 1).count();
     let mut meta = json!({

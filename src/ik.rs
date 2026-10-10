@@ -3,10 +3,9 @@
 
 use anyhow::{Result, ensure};
 
-use crate::device::{CollisionWeights, Device};
+use crate::device::{CollisionWeights, Device, Worlds};
 use crate::rng::Rng;
 use crate::types::{Pose, Solved};
-use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct IkOptions {
@@ -87,7 +86,7 @@ impl IkResult {
 }
 
 /// Seed 0 starts from the robot's default configuration, the rest uniformly within joint limits.
-pub fn solve_ik(device: &Device, worlds: &[World], problems: &[IkProblem], o: &IkOptions) -> Result<IkResult> {
+pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &IkOptions) -> Result<IkResult> {
     let robot = device.robot();
     let n = robot.dof();
     ensure!(o.seeds > 0, "need at least one seed");

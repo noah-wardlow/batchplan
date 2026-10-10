@@ -25,10 +25,13 @@ fn devices(robot: &Robot) -> Vec<Device> {
 fn malformed_batches_are_errors_on_every_device() {
     let robot = panda();
     let q = robot.default_q().to_vec();
-    let worlds = vec![World { obstacles: vec![Obstacle::Sphere { center: Vec3::new(2.0, 0.0, 0.0), radius: 0.1 }] }];
+    let scene = vec![World { obstacles: vec![Obstacle::Sphere { center: Vec3::new(2.0, 0.0, 0.0), radius: 0.1 }] }];
     let none = CollisionWeights::NONE;
     for d in devices(&robot) {
         let name = d.name();
+        let worlds = d.upload(&scene).unwrap();
+        let elsewhere = Device::cpu(&robot).upload(&scene).unwrap();
+        assert!(d.evaluate(&elsewhere, &[0], &q, &none).is_err(), "{name}: worlds uploaded to another device");
         assert!(d.evaluate(&worlds, &[0, 0], &q, &none).is_err(), "{name}: two items, one configuration");
         assert!(d.evaluate(&worlds, &[0], &q[..6], &none).is_err(), "{name}: configuration missing a joint");
         assert!(d.evaluate(&worlds, &[1], &q, &none).is_err(), "{name}: world index past the end");
@@ -42,7 +45,6 @@ fn malformed_batches_are_errors_on_every_device() {
 #[test]
 fn obstacle_free_worlds_work_on_every_device() {
     let robot = panda();
-    let worlds = vec![World::default()];
     let start = robot.default_q().to_vec();
     let mut elsewhere = start.clone();
     elsewhere[0] += 0.8;
@@ -50,6 +52,7 @@ fn obstacle_free_worlds_work_on_every_device() {
     let target = robot.ee_pose(&elsewhere);
     for d in devices(&robot) {
         let name = d.name();
+        let worlds = d.upload(&[World::default()]).unwrap();
         let e = d.evaluate(&worlds, &[0], &start, &CollisionWeights::NONE).unwrap();
         assert!(e.world_clearance[0] > 1e29, "{name}: an empty world has nothing to hit");
         let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target }], &IkOptions::default()).unwrap();
@@ -66,13 +69,15 @@ fn results_keep_the_worlds_of_their_problems() {
     // Two targets in world 1 and one in world 0: problem index != world index.
     let robot = panda();
     let mut rng = batchplan::rng::Rng::new(21);
-    let worlds: Vec<World> = (0..2).map(|_| common::tabletop(&mut rng)).collect();
+    let scene: Vec<World> = (0..2).map(|_| common::tabletop(&mut rng)).collect();
     let goals: Vec<IkProblem> = [1u32, 1, 0]
         .iter()
-        .map(|&w| IkProblem { world: w, target: common::grasp_target(&worlds[w as usize], &mut rng) })
+        .map(|&w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng) })
         .collect();
     let cpu = Device::cpu(&robot);
+    let on_cpu = cpu.upload(&scene).unwrap();
     for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
         let ik = solve_ik(&d, &worlds, &goals, &IkOptions::default()).unwrap();
         assert_eq!(ik.problems.len(), goals.len());
         let problems: Vec<PlanProblem> = ik
@@ -97,7 +102,7 @@ fn results_keep_the_worlds_of_their_problems() {
             let trajectory = Trajectory::new(&robot, s.solution, 1.0);
             let q = trajectory.sample(32.0 / trajectory.knot_interval).positions;
             let item_world = vec![s.problem.world; q.len() / n];
-            let e = cpu.evaluate(&worlds, &item_world, &q, &CollisionWeights::NONE).unwrap();
+            let e = cpu.evaluate(&on_cpu, &item_world, &q, &CollisionWeights::NONE).unwrap();
             assert!(
                 (0..item_world.len()).all(|i| e.collision_free(i)),
                 "{}: path collides in world {}",
@@ -115,11 +120,11 @@ fn trajopt_smoothness_gradient_matches_its_cost() {
     // whose gradient one linearized optimizer step must reproduce (see tests/gpu.rs).
     let robot = panda();
     let n = robot.dof();
-    let worlds = vec![World::default()];
     let mut goal = robot.default_q().to_vec();
     goal[0] += 1.0;
     goal[2] -= 0.7;
     let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal }];
+    let scene = vec![World::default()];
     let o = PlanOptions { collision: CollisionWeights::NONE, ..Default::default() };
     let cost = |path: &[f64]| {
         let t_count = path.len() / n;
@@ -136,6 +141,7 @@ fn trajopt_smoothness_gradient_matches_its_cost() {
         c
     };
     for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
         let (lr, eps) = (1e3, 1e7);
         let seed = plan(&d, &worlds, &problems, &PlanOptions { iterations: 0, ..o }).unwrap().paths.positions;
         let one = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..o };
@@ -189,7 +195,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
     let middle: Vec<f32> = start.iter().zip(&goal).map(|(a, b)| 0.5 * (a + b)).collect();
     let center = robot.ee_pose(&middle).position;
     let post = Obstacle::Cylinder { center, rotation: glam::Quat::IDENTITY, radius: 0.05, half_height: 0.3 };
-    let worlds = vec![World { obstacles: vec![post] }];
+    let scene = vec![World { obstacles: vec![post] }];
     let problems = vec![PlanProblem { world: 0, start, goal }];
     let o = PlanOptions::default();
     let (points, k) = (o.control_points, o.samples_per_span);
@@ -217,7 +223,9 @@ fn trajopt_collision_gradient_matches_its_cost() {
         c
     };
     let cpu = Device::cpu(&robot);
+    let on_cpu = cpu.upload(&scene).unwrap();
     for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
         let (lr, eps) = (1e3, 1e7);
         let seed = plan(&d, &worlds, &problems, &PlanOptions { iterations: 0, ..o }).unwrap().paths.positions;
         let one = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..o };
@@ -238,7 +246,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
             }
             let per_path = (points - 3) * k;
             let items = perturbed.len() / n;
-            let costs = cpu.evaluate(&worlds, &vec![0; items], &perturbed, &o.collision).unwrap().cost;
+            let costs = cpu.evaluate(&on_cpu, &vec![0; items], &perturbed, &o.collision).unwrap().cost;
             let collision = |p: usize| costs[p * per_path..(p + 1) * per_path].iter().map(|&c| c as f64).sum::<f64>();
             free.iter()
                 .enumerate()
@@ -262,7 +270,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
         eprintln!("{}: largest gradient {largest:.1}, worst relative error {worst:.2e}", d.name());
         let seed_samples = samples_of(&path);
         let items = seed_samples.len() / n;
-        let touching = cpu.evaluate(&worlds, &vec![0; items], &seed_samples, &o.collision).unwrap().cost;
+        let touching = cpu.evaluate(&on_cpu, &vec![0; items], &seed_samples, &o.collision).unwrap().cost;
         assert!(touching.iter().filter(|&&c| c > 1.0).count() > 3, "{}: the straight seed misses the post", d.name());
         assert!(worst < 2e-2, "{}: trajectory gradient off by {worst:.2e} relative", d.name());
     }

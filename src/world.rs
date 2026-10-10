@@ -2,14 +2,16 @@
 //! worlds by index, so one call can cover thousands of different environments.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::description::Geometry;
+use crate::sdf::{SdfGrid, SdfOptions, grid_distance};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Obstacle {
     /// Oriented box; `rotation` maps box axes to world axes.
@@ -36,6 +38,13 @@ pub enum Obstacle {
         radius: f32,
         half_length: f32,
     },
+    /// A signed distance grid with its frame at `center`, turned by `rotation`. Worlds can share
+    /// a grid; a device uploads it once.
+    Sdf {
+        grid: Arc<SdfGrid>,
+        center: Vec3,
+        rotation: Quat,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -54,8 +63,10 @@ impl World {
     /// The static collision geometry of a scene file: MJCF (`.xml`, `.mjcf`) geoms in the world
     /// body and in bodies without joints, or OpenUSD (`.usd*`, feature `usd`) colliders outside
     /// rigid bodies. Planes become slabs below their surface; ellipsoids become their bounding
-    /// boxes. Robots in the same file are left out.
-    pub fn load(path: impl AsRef<Path>) -> Result<World> {
+    /// boxes; meshes become distance grids laid out by `grids`, as convex hulls where the format
+    /// collides them that way (MJCF always, USD with `physics:approximation = "convexHull"`).
+    /// Robots in the same file are left out.
+    pub fn load(path: impl AsRef<Path>, grids: &SdfOptions) -> Result<World> {
         let scene = crate::description::load_scene(path.as_ref())?;
         let obstacles = scene
             .iter()
@@ -76,8 +87,11 @@ impl World {
                         half_extents: Vec3::new(PLANE_EXTENT, PLANE_EXTENT, PLANE_SLAB),
                         rotation,
                     },
-                    Geometry::Mesh { .. } | Geometry::TriMesh(_) => {
-                        bail!("mesh obstacles are not supported yet; replace them with primitives")
+                    Geometry::Mesh { .. } | Geometry::TriMesh(_) | Geometry::ConvexHull(_) => {
+                        let mesh = s.geometry.mesh()?;
+                        let grid = SdfGrid::from_mesh(&mesh.vertices, &mesh.triangles, grids)
+                            .with_context(|| format!("the scene mesh at {center}"))?;
+                        Obstacle::Sdf { grid: Arc::new(grid), center, rotation }
                     }
                 })
             })
@@ -86,8 +100,36 @@ impl World {
     }
 }
 
+/// Worlds as JSON with each distance grid written once: `{"grids": [...], "worlds": [...]}`,
+/// where an `sdf` obstacle names its grid by index.
+pub(crate) fn worlds_json(worlds: &[World]) -> serde_json::Result<serde_json::Value> {
+    let mut grids: Vec<&Arc<SdfGrid>> = vec![];
+    let worlds = worlds
+        .iter()
+        .map(|w| {
+            let obstacles = w
+                .obstacles
+                .iter()
+                .map(|o| match o {
+                    Obstacle::Sdf { grid, center, rotation } => {
+                        let index = grids.iter().position(|g| Arc::ptr_eq(g, grid)).unwrap_or_else(|| {
+                            grids.push(grid);
+                            grids.len() - 1
+                        });
+                        Ok(serde_json::json!({"type": "sdf", "grid": index, "center": center, "rotation": rotation}))
+                    }
+                    o => serde_json::to_value(o),
+                })
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            Ok(serde_json::json!({ "obstacles": obstacles }))
+        })
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({ "grids": grids, "worlds": worlds }))
+}
+
 impl Obstacle {
-    /// Signed distance from `p` to the obstacle surface and its gradient (unit outward direction).
+    /// Signed distance from `p` to the obstacle surface and its gradient (the unit outward
+    /// direction, except inside distance grids, where it is the interpolation's gradient).
     pub fn distance(&self, p: Vec3) -> (f32, Vec3) {
         match *self {
             Obstacle::Cuboid { center, half_extents, rotation } => {
@@ -101,6 +143,7 @@ impl Obstacle {
             Obstacle::Capsule { center, rotation, radius, half_length } => {
                 capsule_distance(Mat3::from_quat(rotation), center, radius, half_length, p)
             }
+            Obstacle::Sdf { ref grid, center, rotation } => sdf_distance(Mat3::from_quat(rotation), center, grid, p),
         }
     }
 }
@@ -149,6 +192,13 @@ pub(crate) fn cylinder_distance(r: Mat3, center: Vec3, radius: f32, half_height:
         (dz, axial)
     };
     (d, r * gl)
+}
+
+/// Must stay in sync with `obstacle_distance` in kernels.wgsl.
+#[inline]
+pub(crate) fn sdf_distance(r: Mat3, center: Vec3, grid: &SdfGrid, p: Vec3) -> (f32, Vec3) {
+    let (d, g) = grid_distance(grid, r.transpose() * (p - center));
+    (d, r * g)
 }
 
 /// Must stay in sync with `obstacle_distance` in kernels.wgsl.

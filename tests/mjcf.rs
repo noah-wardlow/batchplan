@@ -176,7 +176,7 @@ fn mjcf_follows_mujoco_conventions() {
 
 #[test]
 fn scenes_load_as_worlds_without_their_robots() {
-    let floor = World::load(common::asset("menagerie/franka_emika_panda/scene.xml")).unwrap();
+    let floor = World::load(common::asset("menagerie/franka_emika_panda/scene.xml"), &SdfOptions::default()).unwrap();
     assert_eq!(floor.obstacles.len(), 1, "the floor only; the Panda is a robot, not scene");
     let (top, _) = floor.obstacles[0].distance(Vec3::new(0.3, 0.2, 0.0));
     assert!(top.abs() < 1e-6, "the floor's surface is z = 0");
@@ -197,7 +197,7 @@ fn scenes_load_as_worlds_without_their_robots() {
       </worldbody>
     </mujoco>"#;
     std::fs::write(dir.join("scene.xml"), scene).unwrap();
-    let world = World::load(dir.join("scene.xml")).unwrap();
+    let world = World::load(dir.join("scene.xml"), &SdfOptions::default()).unwrap();
     assert_eq!(world.obstacles.len(), 2, "the post and the table top; not the visual sphere or the arm");
     let robot = Robot::load(dir.join("scene.xml"), &RobotOptions::default()).unwrap();
     assert_eq!(robot.joint_names(), ["j"]);

@@ -407,7 +407,7 @@ impl Builder<'_> {
             "mesh" => {
                 let name = a.get("mesh").context("mesh geom without mesh")?;
                 let (path, scale) = self.meshes.get(name).with_context(|| format!("unknown mesh '{name}'"))?;
-                Geometry::Mesh { path: path.clone(), scale: *scale }
+                Geometry::ConvexHull(Box::new(Geometry::Mesh { path: path.clone(), scale: *scale }))
             }
             other => bail!("geom type '{other}' is not supported"),
         };
