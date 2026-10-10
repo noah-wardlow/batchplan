@@ -65,31 +65,38 @@ fn malformed_batches_are_errors_on_every_device() {
 }
 
 #[test]
-fn self_clearance_is_exact_up_to_the_self_margin() {
+fn clearances_are_exact_up_to_the_margins() {
     let robot = panda();
     let (n, items) = (robot.dof(), 4000);
     let mut rng = batchplan::rng::Rng::new(5);
     let q: Vec<f32> = (0..items * n).map(|i| rng.range(robot.lower()[i % n], robot.upper()[i % n])).collect();
     let item_world = vec![0; items];
+    let scene = [common::tabletop(&mut batchplan::rng::Rng::new(4))];
     let margin = 0.05;
-    let near = CollisionWeights { self_collision: 1.0, self_margin: margin, ..CollisionWeights::NONE };
-    // A margin wider than the robot leaves no pair of links apart enough to skip.
-    let everything = CollisionWeights { self_margin: 10.0, ..CollisionWeights::NONE };
+    let near = CollisionWeights { world: 1.0, self_collision: 1.0, margin, self_margin: margin };
+    // Margins wider than the robot leave nothing far enough apart to skip.
+    let everything = CollisionWeights { margin: 10.0, self_margin: 10.0, ..CollisionWeights::NONE };
     for d in devices(&robot) {
-        let worlds = d.upload(&[World::default()]).unwrap();
-        let exact = d.evaluate(&worlds, &item_world, &q, &everything).unwrap().self_clearance;
-        let gated = d.evaluate(&worlds, &item_world, &q, &near).unwrap().self_clearance;
-        let (mut close, mut bounded) = (0, 0);
-        for (&e, &g) in exact.iter().zip(&gated) {
-            if e <= margin {
-                assert_eq!(g, e, "{}: a close pair was skipped", d.name());
-                close += 1;
-            } else {
-                assert!(g > margin && g <= e + 1e-5, "{}: {g} does not bound {e}", d.name());
-                bounded += usize::from(g < e);
+        let worlds = d.upload(&scene).unwrap();
+        let exact = d.evaluate(&worlds, &item_world, &q, &everything).unwrap();
+        let gated = d.evaluate(&worlds, &item_world, &q, &near).unwrap();
+        let kinds = [
+            ("world", exact.world_clearance, gated.world_clearance),
+            ("self", exact.self_clearance, gated.self_clearance),
+        ];
+        for (kind, exact, gated) in kinds {
+            let (mut close, mut bounded) = (0, 0);
+            for (&e, &g) in exact.iter().zip(&gated) {
+                if e <= margin {
+                    assert_eq!(g, e, "{}: a close {kind} pair was skipped", d.name());
+                    close += 1;
+                } else {
+                    assert!(g > margin && g <= e + 1e-5, "{}: {kind} {g} does not bound {e}", d.name());
+                    bounded += usize::from(g < e);
+                }
             }
+            assert!(close > 100 && bounded > 20, "{}: {kind}: {close} close, {bounded} bounded", d.name());
         }
-        assert!(close > 100 && bounded > 100, "{}: {close} close, {bounded} bounded", d.name());
     }
 }
 

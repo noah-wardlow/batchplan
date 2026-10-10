@@ -127,8 +127,9 @@ fn default_pose_is_collision_free_on_table() {
     let cpu = Device::cpu(&robot).unwrap();
     let world = common::tabletop(&mut Rng::new(1));
     let table_only = World { obstacles: world.obstacles[..1].to_vec() };
-    let e =
-        cpu.evaluate(&cpu.upload(&[table_only]).unwrap(), &[0], robot.default_q(), &CollisionWeights::NONE).unwrap();
+    // Clearances are exact up to the margins.
+    let w = CollisionWeights { margin: 0.1, self_margin: 0.1, ..CollisionWeights::NONE };
+    let e = cpu.evaluate(&cpu.upload(&[table_only]).unwrap(), &[0], robot.default_q(), &w).unwrap();
     assert!(e.world_clearance[0] > 0.05, "world clearance {}", e.world_clearance[0]);
     assert!(e.self_clearance[0] > 0.0, "self clearance {}", e.self_clearance[0]);
 }

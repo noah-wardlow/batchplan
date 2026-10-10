@@ -82,6 +82,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   3. Read it in WGSL as `P.<field>`.
   4. Mirror it in `cpu.rs`.
 - The limits (`MAX_DOF` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) size the CPU kernels' arrays. They are defined in `robot.rs` and enforced when a robot loads.
+- World collision is gated per link: an obstacle farther from a link's bounding sphere (`link_bounds`, `GpuLink.bound`) than `max(margin, 0)` skips the link's spheres (`Robot::sphere_ranges`), and the gap stands in for their clearance. Distance grids are never gated: their interpolated distance is not 1-Lipschitz.
 - Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with one `(first, count)` entry per link pair, followed by the sphere pairs.
 
 **Per-robot GPU kernels.**

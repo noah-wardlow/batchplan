@@ -42,10 +42,13 @@ impl CollisionWeights {
 #[derive(Clone, Debug, Default)]
 pub struct Evaluation {
     /// Signed distance from the robot spheres to the nearest obstacle (negative = penetrating).
+    /// Exact up to the margin (or zero, if larger); above it, a lower bound that is still above it,
+    /// because a link whose bounding sphere is that far from an obstacle is not checked sphere by
+    /// sphere.
     pub world_clearance: Vec<f32>,
     /// Signed distance between the closest checked pair of robot spheres. Exact up to the self
-    /// margin (or zero, if larger); above it, a lower bound that is still above it, because links
-    /// whose bounding spheres are that far apart are not checked sphere by sphere.
+    /// margin (or zero, if larger); above it, a lower bound that is still above it, as for
+    /// `world_clearance` with pairs of links.
     pub self_clearance: Vec<f32>,
     pub cost: Vec<f32>,
     /// d(cost)/dq, `[items, dof]`.

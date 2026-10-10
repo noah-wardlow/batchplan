@@ -85,6 +85,20 @@ struct CollisionOut {
     self_clearance: f32,
 }
 
+/// Signed distance from `o` to `p` and its gradient. Mirrors `obstacle_distance` in kernels.wgsl.
+#[inline]
+fn obstacle_distance(o: &Prepared, p: Vec3) -> (f32, Vec3) {
+    match *o {
+        Prepared::Cuboid { rot, center, half } => box_distance(rot, center, half, p),
+        Prepared::Sphere { center, radius } => sphere_distance(center, radius, p),
+        Prepared::Cylinder { rot, center, radius, half_height } => {
+            cylinder_distance(rot, center, radius, half_height, p)
+        }
+        Prepared::Capsule { rot, center, radius, half_length } => capsule_distance(rot, center, radius, half_length, p),
+        Prepared::Sdf { rot, center, ref grid } => sdf_distance(rot, center, grid, p),
+    }
+}
+
 /// Collision cost of the configuration behind `fk`; adds d(cost)/dq into `grad`.
 /// Without `GRADIENT` only the cost and clearances are computed, as the WGSL `gradient` flag does.
 fn collision<const GRADIENT: bool>(
@@ -94,7 +108,6 @@ fn collision<const GRADIENT: bool>(
     w: &CollisionWeights,
     grad: &mut [f32],
 ) -> CollisionOut {
-    let ns = robot.spheres.len();
     let mut sc = [Vec3::ZERO; MAX_SPHERES];
     // Each link's collision wrench: force, and moment about the world origin.
     let mut force = [Vec3::ZERO; MAX_LINKS];
@@ -104,36 +117,42 @@ fn collision<const GRADIENT: bool>(
         sc[s] = fk.rot[sp.link] * sp.center + fk.pos[sp.link];
     }
     let (mut cost, mut wmin, mut smin) = (0.0f32, FAR, FAR);
-    for s in 0..ns {
-        let (r, link) = (robot.spheres[s].radius, robot.spheres[s].link);
+    // An obstacle farther from a link's bounding sphere than the margin cannot add cost through the
+    // link's spheres; the gap bounds their clearance from below. Distance grids are interpolated,
+    // not exact, so their spheres are always checked.
+    let world_gate = w.margin.max(0.0);
+    for (link, &[first, count]) in robot.sphere_ranges.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let b = robot.link_bounds[link];
+        let bc = fk.rot[link] * Vec3::new(b[0], b[1], b[2]) + fk.pos[link];
         for o in world {
-            let (dist, g) = match *o {
-                Prepared::Cuboid { rot, center, half } => box_distance(rot, center, half, sc[s]),
-                Prepared::Sphere { center, radius } => sphere_distance(center, radius, sc[s]),
-                Prepared::Cylinder { rot, center, radius, half_height } => {
-                    cylinder_distance(rot, center, radius, half_height, sc[s])
+            if !matches!(o, Prepared::Sdf { .. }) {
+                let gap = obstacle_distance(o, bc).0 - b[3];
+                if gap > world_gate {
+                    wmin = wmin.min(gap);
+                    continue;
                 }
-                Prepared::Capsule { rot, center, radius, half_length } => {
-                    capsule_distance(rot, center, radius, half_length, sc[s])
-                }
-                Prepared::Sdf { rot, center, ref grid } => sdf_distance(rot, center, grid, sc[s]),
-            };
-            let d = dist - r;
-            wmin = wmin.min(d);
-            let pen = w.margin - d;
-            if pen > 0.0 {
-                cost += w.world * pen * pen;
-                if GRADIENT {
-                    let f = -2.0 * w.world * pen * g;
-                    force[link] += f;
-                    moment[link] += sc[s].cross(f);
-                    touched = true;
+            }
+            for s in first as usize..(first + count) as usize {
+                let (dist, g) = obstacle_distance(o, sc[s]);
+                let d = dist - robot.spheres[s].radius;
+                wmin = wmin.min(d);
+                let pen = w.margin - d;
+                if pen > 0.0 {
+                    cost += w.world * pen * pen;
+                    if GRADIENT {
+                        let f = -2.0 * w.world * pen * g;
+                        force[link] += f;
+                        moment[link] += sc[s].cross(f);
+                        touched = true;
+                    }
                 }
             }
         }
     }
-    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their
-    // gap bounds their clearance from below.
+    // Likewise for link pairs whose bounding spheres are farther apart than the self margin.
     let gate = w.self_margin.max(0.0);
     for lp in &robot.self_link_pairs {
         let (ba, bb) = (robot.link_bounds[lp.a as usize], robot.link_bounds[lp.b as usize]);

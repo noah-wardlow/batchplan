@@ -195,6 +195,8 @@ pub struct Robot {
     /// Per link: a sphere around all its collision spheres and their self buffers (link frame
     /// centre, radius).
     pub(crate) link_bounds: Vec<[f32; 4]>,
+    /// Per link: its collision spheres, `first..first + count` of `spheres`.
+    pub(crate) sphere_ranges: Vec<[u32; 2]>,
     /// Link whose frame is the IK target frame.
     pub(crate) ee_link: usize,
     pub(crate) default_q: Vec<f32>,
@@ -347,6 +349,8 @@ impl Robot {
                 [center.x, center.y, center.z, radius]
             })
             .collect();
+        self.sphere_ranges =
+            (0..self.links.len()).map(|link| [on(link).next().unwrap_or(0) as u32, on(link).count() as u32]).collect();
         self.spheres = spheres;
         self.self_pairs = self_pairs;
         self.self_link_pairs = self_link_pairs;
@@ -705,6 +709,7 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         self_pairs: vec![],
         self_link_pairs: vec![],
         link_bounds: vec![],
+        sphere_ranges: vec![],
         ee_link,
         default_q,
         collision_model: CollisionModel::default(),

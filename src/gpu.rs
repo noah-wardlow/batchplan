@@ -174,24 +174,40 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
         let _ = writeln!(w, "        force_{i} = vec3<f32>(0.0);\n        moment_{i} = vec3<f32>(0.0);");
     }
     w += "    }\n";
-    for i in (0..links.len()).filter(|&i| robot.spheres.iter().any(|s| s.link == i)) {
+    w += "    // An obstacle farther from a link's bounding sphere than the margin cannot add cost through\n";
+    w += "    // the link's spheres; the gap bounds their clearance from below. Distance grids are\n";
+    w += "    // interpolated, not exact, so their spheres are always checked.\n";
+    w += "    let world_gate = max(margin, 0.0);\n";
+    for i in (0..links.len()).filter(|&i| robot.sphere_ranges[i][1] > 0) {
         let _ = write!(
             w,
-            r"    for (var s = links[{i}u].first_sphere; s < links[{i}u].first_sphere + links[{i}u].n_spheres; s++) {{
-        let sp = spheres[s];
-        let c = rot_{i} * sp.c.xyz + pos_{i};
+            r"    {{
+        let bl = links[{i}u].bound;
+        let bc = rot_{i} * bl.xyz + pos_{i};
         for (var k = 0u; k < range.y; k++) {{
-            let dg = obstacle_distance(obstacles[range.x + k], c);
-            let d = dg.w - sp.c.w;
-            wmin = min(wmin, d);
-            let pen = margin - d;
-            if (pen > 0.0) {{
-                cost += w_world * pen * pen;
-                if (gradient) {{
-                    let f = -2.0 * w_world * pen * dg.xyz;
-                    force_{i} += f;
-                    moment_{i} += cross(c, f);
-                    touched = true;
+            let o = obstacles[range.x + k];
+            if (u32(o.center.w) != SDF) {{
+                let gap = obstacle_distance(o, bc).w - bl.w;
+                if (gap > world_gate) {{
+                    wmin = min(wmin, gap);
+                    continue;
+                }}
+            }}
+            for (var s = links[{i}u].first_sphere; s < links[{i}u].first_sphere + links[{i}u].n_spheres; s++) {{
+                let sp = spheres[s];
+                let c = rot_{i} * sp.c.xyz + pos_{i};
+                let dg = obstacle_distance(o, c);
+                let d = dg.w - sp.c.w;
+                wmin = min(wmin, d);
+                let pen = margin - d;
+                if (pen > 0.0) {{
+                    cost += w_world * pen * pen;
+                    if (gradient) {{
+                        let f = -2.0 * w_world * pen * dg.xyz;
+                        force_{i} += f;
+                        moment_{i} += cross(c, f);
+                        touched = true;
+                    }}
                 }}
             }}
         }}
@@ -199,8 +215,8 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
 "
         );
     }
-    w += "    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their\n";
-    w += "    // gap bounds their clearance from below.\n    let gate = max(self_margin, 0.0);\n";
+    w += "    // Likewise for link pairs whose bounding spheres are farther apart than the self margin.\n";
+    w += "    let gate = max(self_margin, 0.0);\n";
     for (l, lp) in robot.self_link_pairs.iter().enumerate() {
         let (a, b) = (lp.a, lp.b);
         let _ = write!(
@@ -324,8 +340,8 @@ impl RobotBuffers {
                     trans: v4(l.origin.trans, offset),
                     axis: v4(axis, multiplier),
                     bound: robot.link_bounds[i],
-                    first_sphere: robot.spheres.iter().position(|s| s.link == i).unwrap_or(0) as u32,
-                    n_spheres: robot.spheres.iter().filter(|s| s.link == i).count() as u32,
+                    first_sphere: robot.sphere_ranges[i][0],
+                    n_spheres: robot.sphere_ranges[i][1],
                     ..Default::default()
                 }
             })
