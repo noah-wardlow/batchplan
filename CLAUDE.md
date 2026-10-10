@@ -17,10 +17,10 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 52 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 59 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
-cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf)
+cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot,usd]   # keep at zero warnings in every feature combination
 cargo doc --no-deps --features lerobot,usd                      # keep at zero warnings
@@ -40,7 +40,7 @@ Checking a LeRobot export with the real package requires a `.venv`, which is git
 uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python "lerobot[dataset,training]==0.6.1"
 .venv/bin/python scripts/validate_lerobot.py data/lerobot_demo
 .venv/bin/lerobot-train --dataset.repo_id=local/batchplan --dataset.root=data/lerobot_demo --policy.type=act \
-  --policy.device=cpu --policy.push_to_hub=false --steps=50 --batch_size=16 --num_workers=0 --save_checkpoint=false --wandb.enable=false
+  --policy.device=cpu --policy.push_to_hub=false --steps=50 --batch_size=16 --num_workers=0 --save_checkpoint=false --wandb.enable=false --log_freq=10
 ```
 
 ## Design rules
@@ -65,17 +65,17 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 ## Architecture that spans files
 
 **CPU/GPU twin.**
-- `src/kernels.wgsl` and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_samples`/`traj_sample_grad`, `traj_grad`) and the Adam update. `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
+- `src/kernels.wgsl` and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_costs`/`traj_cost`, `traj_search`, `traj_samples`/`traj_sample_grad`, `traj_grad`, `lbfgs_direction`). `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
 - `cpu.rs` keeps index loops on purpose so the two read side by side.
 - Any change to the math lands in both files in the same change. The parity tests in `tests/gpu.rs` and `tests/device.rs` catch drift.
 
 **Host/shader structs.**
-- Each struct the GPU reads is declared once with `shader_struct!` in `gpu.rs`: `GpuParams`, `GpuLink`, `GpuSphere`, `GpuObstacle` and `GpuIter`.
+- Each struct the GPU reads is declared once with `shader_struct!` in `gpu.rs`: `GpuParams`, `GpuLink`, `GpuSphere` and `GpuObstacle`. So are the constants (`MAX_HISTORY`, the line-search steps `LINE_SEARCH`, obstacle kinds).
 - Their WGSL declarations are generated from the same field list. `gpu.rs` builds the shader source as: generated prelude (`alias Vec4`, `MAX_DOF`, `MAX_LINKS`, `MAX_SPHERES`, `JAC_LEN`, the structs) + `kernels.wgsl`.
 - To add a kernel parameter:
   1. Add a field to the right `shader_struct!`.
   2. Fill it in `GpuBackend`.
-  3. Read it in WGSL as `P.<field>` (or `IT.<field>` for per-iteration values).
+  3. Read it in WGSL as `P.<field>`.
   4. Mirror it in `cpu.rs`.
 - The kernel limits (`MAX_DOF` = 16, `MAX_JOINTS` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) are defined in `robot.rs` and enforced when a robot loads.
 - Per-joint kernel state (`jaxis`, `janchor`) is indexed by `Link.joint`, the moving-joint number, and sized `MAX_JOINTS`. Arrays that small stay in registers on AMD; indexing them per link (32 entries) cost 20% of GPU planning time.
@@ -85,18 +85,21 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - `GpuWorlds` holds every world's obstacles, per-world ranges and `grid_data`: each distinct grid (by `Arc` pointer) once, two half floats per `u32`, read with `unpack2x16float`. Grids store subnormal halves as zero because GPUs may flush them.
 - Storage buffers are created by `storage::<T>()`, padded to at least one shader element. Empty obstacle lists previously crashed this way.
 - Work is split per queue submission (`EVAL_CHUNK`, `IK_ITERS_PER_SUBMIT`, `TRAJ_ITERS_PER_SUBMIT`) to stay under driver watchdogs.
-- Each trajopt iteration dispatches three passes:
-  1. `traj_samples`: the collision gradient at every sample along every spline;
-  2. `traj_grad`: per free control point, basis-weighted sample gradients plus smoothness;
-  3. `traj_update`: Adam.
+- Trajectory optimization is L-BFGS with a parallel line search. Each round dispatches five passes:
+  1. `traj_costs`: the collision cost at every sample of every path moved by each line-search step;
+  2. `traj_search` (one invocation per path): the cheapest step moves the path if it lowers the cost, otherwise the history resets;
+  3. `traj_samples`: the collision gradient at every sample;
+  4. `traj_grad`: per free control point, basis-weighted sample gradients plus smoothness;
+  5. `lbfgs_direction` (one per path): record the last step and gradient change, then the two-loop recursion.
 
-  `aux` holds [sample gradients | gradient | Adam m | Adam v]. Each iteration's Adam schedule comes from a dynamic-offset uniform (`GpuIter`).
+  The first round only prices the seeds (their direction is still zero). `aux` holds each path's L-BFGS state (`lbfgs_stride`, mirrored by the `Lbfgs` struct in `cpu.rs`); paths are optimized in chunks whose state fits one storage binding.
 
 **Planning flow.** In `trajopt::plan`:
 1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Seed 0's free points lie on the straight line; the others bend through random via points.
 2. Run the backend's trajopt on the free control points.
 3. Validate by sampling each spline densely (`validate_substeps` per span) and running `device.evaluate`.
 4. `best()` picks the shortest valid seed.
+5. Problems without a valid seed fall back (`PlanOptions::fallback`): `rrt::connect` (RRT-Connect, several extensions per problem per round, every problem's edges checked in one `evaluate`), `shortcut::shortcut`, then `trace` turns the waypoints into control points whose spline runs exactly along them (each waypoint tripled). The traced spline and its optimized version are validated; the shorter valid one replaces seed 0.
 
 `timing::Trajectory` times a path from bounds on its control-point differences (velocity, acceleration, jerk), so limits hold along the whole curve; `check` re-verifies them.
 
@@ -121,10 +124,10 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 
 ## Working rules
 
-- **A new test must fail on the unfixed code.** Prove it by planting the bug. For example, swapping `w_acc`/`w_vel` in the GPU packing must fail `trajopt_gradients_match_cpu_element_wise` and `trajopt_smoothness_gradient_matches_its_cost`.
+- **A new test must fail on the unfixed code.** Prove it by planting the bug. For example, swapping `w_acc`/`w_vel` in the GPU packing must fail `trajopt_directions_match_cpu_element_wise` and `trajopt_smoothness_gradient_matches_its_cost`.
 - **Assert that test inputs actually exercise the code.** The smoothness test asserts its path isn't straight, because a straight path has zero smoothness gradient.
 - **Test through the interface** (`Device`, `solve_ik`, `plan`, the exporters). Internal unit tests are only for internal seams, such as sphere pairs and `unmet_limits`.
-- **Never compare CPU and GPU element-wise after Adam steps.** Adam normalizes each coordinate, which amplifies rounding noise in near-zero coordinates. Compare evaluations or gradients instead: `one_step_gradients` uses a huge `adam_epsilon` so that one step is plain gradient descent.
+- **Compare optimizer steps by direction, not position.** The line search scales each L-BFGS step, so `step_directions` in `tests/gpu.rs` scales each path's step to its largest entry: step 1 is the negative gradient, later steps the two-loop recursion. Outcomes are compared through the full trajectory cost (`trajopt_lowers_the_cost_as_far_as_the_cpu`).
 - **Performance claims need an A/B comparison on one machine.**
   - Build the previous commit in a `git worktree` with its own `CARGO_TARGET_DIR`, and alternate runs with the current code.
   - Check the load first; the dev machines often run other heavy work.

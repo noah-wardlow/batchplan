@@ -16,7 +16,7 @@ use crate::ik::IkOptions;
 use crate::robot::{Fk, MAX_DOF, MAX_SPHERES, Robot};
 use crate::sdf::SdfGrid;
 use crate::spline;
-use crate::trajopt::PlanOptions;
+use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
 use crate::types::{JointPaths, Pose};
 use crate::world::{
     FAR, Obstacle, World, box_distance, capsule_distance, cylinder_distance, sdf_distance, sphere_distance,
@@ -315,6 +315,196 @@ fn traj_grad(cp: &[f32], sample_grad: &[f32], n: usize, t: usize, o: &PlanOption
     }
 }
 
+/// Control point `t`, joint `j` of the candidate path `x + alpha d`: free points move and are
+/// clamped to the joint range, the three pinned at each end stay. Must match `candidate` in
+/// kernels.wgsl.
+fn candidate(robot: &Robot, x: &[f32], d: &[f32], alpha: f32, t: usize, j: usize) -> f32 {
+    let n = robot.dof();
+    let i = t * n + j;
+    if t < 3 || t >= x.len() / n - 3 {
+        return x[i];
+    }
+    (x[i] + alpha * d[i]).clamp(robot.lower[j], robot.upper[j])
+}
+
+/// Collision cost at sample `s` of span `span` of the candidate path `x + alpha d`. Must match
+/// `traj_costs` in kernels.wgsl.
+#[allow(clippy::too_many_arguments)]
+fn traj_cost(
+    robot: &Robot,
+    world: &[Prepared],
+    x: &[f32],
+    d: &[f32],
+    alpha: f32,
+    span: usize,
+    s: usize,
+    o: &PlanOptions,
+) -> f32 {
+    let n = robot.dof();
+    let w = spline::basis(spline::sample_u(s, o.samples_per_span));
+    let mut q = [0.0f32; MAX_DOF];
+    for j in 0..n {
+        let c = |i: usize| candidate(robot, x, d, alpha, span + i, j);
+        q[j] = w[0] * c(0) + w[1] * c(1) + w[2] * c(2) + w[3] * c(3);
+    }
+    let mut unused = [0.0f32; MAX_DOF];
+    collision(robot, world, &robot.fk(&q[..n]), &o.collision, &mut unused[..n]).cost
+}
+
+/// One path's L-BFGS state, as kernels.wgsl keeps it in `aux`.
+struct Lbfgs {
+    /// Collision cost per line-search step and sample.
+    costs: Vec<f32>,
+    grad: Vec<f32>,
+    prev_grad: Vec<f32>,
+    dir: Vec<f32>,
+    /// The last accepted step, waiting for the gradient change it caused.
+    pending_step: Vec<f32>,
+    /// Ring buffers of `history` steps and gradient changes; `newest` is the latest slot.
+    steps: Vec<f32>,
+    changes: Vec<f32>,
+    cost: f32,
+    count: usize,
+    newest: usize,
+    started: bool,
+    pending: bool,
+}
+
+impl Lbfgs {
+    fn new(points: usize, n: usize, samples: usize, o: &PlanOptions) -> Self {
+        let tn = points * n;
+        Self {
+            costs: vec![0.0; LINE_SEARCH.len() * samples],
+            grad: vec![0.0; tn],
+            prev_grad: vec![0.0; tn],
+            dir: vec![0.0; tn],
+            pending_step: vec![0.0; tn],
+            steps: vec![0.0; o.history * tn],
+            changes: vec![0.0; o.history * tn],
+            cost: 0.0,
+            count: 0,
+            newest: 0,
+            started: false,
+            pending: false,
+        }
+    }
+}
+
+/// Line search: the trajectory cost of each step along the direction; the cheapest moves the path
+/// if it lowers the cost, otherwise the history resets. Must match `traj_search` in kernels.wgsl.
+fn traj_search(robot: &Robot, x: &mut [f32], st: &mut Lbfgs, o: &PlanOptions) {
+    let n = robot.dof();
+    let t_count = x.len() / n;
+    let samples = st.costs.len() / LINE_SEARCH.len();
+    let mut best = None;
+    for (c, &alpha) in LINE_SEARCH.iter().enumerate() {
+        let mut total = 0.0;
+        for s in 0..samples {
+            total += st.costs[c * samples + s];
+        }
+        for j in 0..n {
+            // Each candidate point once, sliding along the path: (before, previous, current).
+            let (mut before, mut previous) = (0.0, candidate(robot, x, &st.dir, alpha, 0, j));
+            for t in 1..t_count {
+                let current = candidate(robot, x, &st.dir, alpha, t, j);
+                let v = current - previous;
+                total += o.w_vel * v * v;
+                if t >= 2 {
+                    let a = current - 2.0 * previous + before;
+                    total += o.w_acc * a * a;
+                }
+                (before, previous) = (previous, current);
+            }
+        }
+        if (best.is_none() && !st.started) || total < st.cost {
+            st.cost = total;
+            best = Some(alpha);
+        }
+    }
+    let Some(alpha) = best else {
+        st.pending = false;
+        st.count = 0;
+        return;
+    };
+    for t in 3..t_count - 3 {
+        for j in 0..n {
+            let i = t * n + j;
+            let moved = candidate(robot, x, &st.dir, alpha, t, j);
+            st.pending_step[i] = moved - x[i];
+            x[i] = moved;
+        }
+    }
+    st.started = true;
+    st.pending = true;
+}
+
+/// Records the last step and the gradient change it caused, then the L-BFGS two-loop recursion
+/// for the next direction; steepest descent scaled to `initial_step` without history or when
+/// the recursion fails to descend. Must match `lbfgs_direction` in kernels.wgsl.
+fn lbfgs_direction(st: &mut Lbfgs, n: usize, o: &PlanOptions) {
+    let tn = st.grad.len();
+    let free = 3 * n..tn - 3 * n;
+    let m = o.history;
+    if st.pending {
+        let mut sy = 0.0;
+        for i in free.clone() {
+            sy += st.pending_step[i] * (st.grad[i] - st.prev_grad[i]);
+        }
+        if sy > 1e-10 {
+            let slot = if st.count == 0 { 0 } else { (st.newest + 1) % m };
+            for i in free.clone() {
+                st.steps[slot * tn + i] = st.pending_step[i];
+                st.changes[slot * tn + i] = st.grad[i] - st.prev_grad[i];
+            }
+            st.newest = slot;
+            st.count = (st.count + 1).min(m);
+        }
+        st.pending = false;
+    }
+    let mut largest = 0.0f32;
+    for i in free.clone() {
+        st.prev_grad[i] = st.grad[i];
+        st.dir[i] = -st.grad[i];
+        largest = largest.max(st.grad[i].abs());
+    }
+    let dot = |a: &[f32], b: &[f32]| free.clone().map(|i| a[i] * b[i]).sum::<f32>();
+    let mut alpha = [0.0f32; MAX_HISTORY];
+    for a in 0..st.count {
+        let slot = (st.newest + m - a) % m;
+        let (s, y) = (&st.steps[slot * tn..(slot + 1) * tn], &st.changes[slot * tn..(slot + 1) * tn]);
+        alpha[a] = dot(s, &st.dir) / dot(y, s);
+        for i in free.clone() {
+            st.dir[i] -= alpha[a] * y[i];
+        }
+    }
+    let gamma = if st.count > 0 {
+        let slot = st.newest;
+        let (s, y) = (&st.steps[slot * tn..(slot + 1) * tn], &st.changes[slot * tn..(slot + 1) * tn]);
+        dot(s, y) / dot(y, y)
+    } else if largest > 0.0 {
+        o.initial_step / largest
+    } else {
+        0.0
+    };
+    for i in free.clone() {
+        st.dir[i] *= gamma;
+    }
+    for a in (0..st.count).rev() {
+        let slot = (st.newest + m - a) % m;
+        let (s, y) = (&st.steps[slot * tn..(slot + 1) * tn], &st.changes[slot * tn..(slot + 1) * tn]);
+        let beta = dot(y, &st.dir) / dot(y, s);
+        for i in free.clone() {
+            st.dir[i] += (alpha[a] - beta) * s[i];
+        }
+    }
+    if largest > 0.0 && dot(&st.dir, &st.grad) >= 0.0 {
+        st.count = 0;
+        for i in free.clone() {
+            st.dir[i] = -st.grad[i] * (o.initial_step / largest);
+        }
+    }
+}
+
 impl Backend for CpuBackend {
     fn name(&self) -> String {
         format!("cpu ({} threads)", rayon::current_num_threads())
@@ -379,32 +569,113 @@ impl Backend for CpuBackend {
         let t_count = paths.points;
         let samples = (t_count - 3) * o.samples_per_span;
         let prepared: &CpuWorlds = worlds.prepared();
+        if o.iterations == 0 {
+            return Ok(());
+        }
         paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(|(tr, &s)| {
-            let world = &prepared[s as usize];
+            let (world, k) = (&prepared[s as usize], o.samples_per_span);
             let mut sample_grad = vec![0.0f32; samples * n];
-            let mut grad = vec![0.0f32; t_count * n];
-            let mut m = vec![0.0f32; t_count * n];
-            let mut v = vec![0.0f32; t_count * n];
-            for k in 0..o.iterations {
-                for (i, g) in sample_grad.chunks_mut(n).enumerate() {
-                    traj_sample_grad(&self.robot, world, tr, i / o.samples_per_span, i % o.samples_per_span, o, g);
-                }
-                for t in 3..t_count - 3 {
-                    traj_grad(tr, &sample_grad, n, t, o, &mut grad[t * n..(t + 1) * n]);
-                }
-                let [lr, bc1, bc2] = o.schedule(k);
-                for t in 3..t_count - 3 {
-                    for j in 0..n {
-                        let i = t * n + j;
-                        let g = grad[i];
-                        m[i] = o.beta1 * m[i] + (1.0 - o.beta1) * g;
-                        v[i] = o.beta2 * v[i] + (1.0 - o.beta2) * g * g;
-                        let step = lr * (m[i] / bc1) / ((v[i] / bc2).sqrt() + o.adam_epsilon);
-                        tr[i] = (tr[i] - step).clamp(self.robot.lower[j], self.robot.upper[j]);
+            let mut st = Lbfgs::new(t_count, n, samples, o);
+            // The first round only prices the seed: its direction is still zero.
+            for round in 0..=o.iterations {
+                for (c, &alpha) in LINE_SEARCH.iter().enumerate() {
+                    for i in 0..samples {
+                        st.costs[c * samples + i] = traj_cost(&self.robot, world, tr, &st.dir, alpha, i / k, i % k, o);
                     }
                 }
+                traj_search(&self.robot, tr, &mut st, o);
+                if round == o.iterations {
+                    break;
+                }
+                for (i, g) in sample_grad.chunks_mut(n).enumerate() {
+                    traj_sample_grad(&self.robot, world, tr, i / k, i % k, o, g);
+                }
+                for t in 3..t_count - 3 {
+                    traj_grad(tr, &sample_grad, n, t, o, &mut st.grad[t * n..(t + 1) * n]);
+                }
+                lbfgs_direction(&mut st, n, o);
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    #[test]
+    fn lbfgs_direction_applies_the_bfgs_inverse_hessian() {
+        // Three remembered steps in a ring of four, newest in slot 0 after wrapping around; the
+        // two-loop recursion must equal -H g with H built by explicit BFGS updates.
+        let (n, points) = (2, 10);
+        let o = PlanOptions { history: 4, ..Default::default() };
+        let mut st = Lbfgs::new(points, n, 1, &o);
+        let free: Vec<usize> = (3 * n..(points - 3) * n).collect();
+        let mut rng = Rng::new(1);
+        let tn = points * n;
+        let mut pairs = vec![];
+        for (age, slot) in [(0, 2), (1, 3), (2, 0)] {
+            let s: Vec<f32> = (0..tn).map(|i| if free.contains(&i) { rng.range(-1.0, 1.0) } else { 0.0 }).collect();
+            // y = A s for a fixed positive diagonal A, so s.y > 0.
+            let y: Vec<f32> = s.iter().enumerate().map(|(i, v)| v * (1.0 + i as f32 * 0.1)).collect();
+            st.steps[slot * tn..(slot + 1) * tn].copy_from_slice(&s);
+            st.changes[slot * tn..(slot + 1) * tn].copy_from_slice(&y);
+            pairs.push((age, s, y));
+        }
+        (st.count, st.newest) = (3, 0);
+        for &i in &free {
+            st.grad[i] = rng.range(-1.0, 1.0);
+        }
+        lbfgs_direction(&mut st, n, &o);
+        // H = gamma I, then each pair oldest first: H <- (I - r s y') H (I - r y s') + r s s'.
+        let k = free.len();
+        let (_, s_new, y_new) = &pairs[2];
+        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        let pick = |v: &[f32]| free.iter().map(|&i| v[i] as f64).collect::<Vec<f64>>();
+        let gamma = dot(&pick(s_new), &pick(y_new)) / dot(&pick(y_new), &pick(y_new));
+        let mut h: Vec<f64> = (0..k * k).map(|i| if i % (k + 1) == 0 { gamma } else { 0.0 }).collect();
+        for (_, s, y) in &pairs {
+            let (s, y) = (pick(s), pick(y));
+            let r = 1.0 / dot(&s, &y);
+            let left: Vec<f64> = (0..k * k).map(|i| f64::from(i / k == i % k) - r * s[i / k] * y[i % k]).collect();
+            let mul = |a: &[f64], b: &[f64]| -> Vec<f64> {
+                (0..k * k).map(|i| (0..k).map(|m| a[i / k * k + m] * b[m * k + i % k]).sum()).collect()
+            };
+            let right: Vec<f64> = (0..k * k).map(|i| left[i % k * k + i / k]).collect();
+            h = mul(&mul(&left, &h), &right);
+            for i in 0..k * k {
+                h[i] += r * s[i / k] * s[i % k];
+            }
+        }
+        let g = pick(&st.grad);
+        for (row, &i) in free.iter().enumerate() {
+            let expected = -(0..k).map(|c| h[row * k + c] * g[c]).sum::<f64>();
+            assert!(
+                (st.dir[i] as f64 - expected).abs() < 1e-4 * expected.abs().max(1.0),
+                "{} vs {expected}",
+                st.dir[i]
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_line_search_resets_the_history() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/franka");
+        let robot = Robot::load(format!("{dir}/franka_panda.urdf"), &Default::default()).unwrap();
+        let (n, points) = (robot.dof(), 10);
+        let o = PlanOptions { control_points: points, ..Default::default() };
+        let mut st = Lbfgs::new(points, n, 1, &o);
+        let mut x = vec![0.0; points * n];
+        (st.started, st.cost, st.count) = (true, 1.0, 3);
+        st.costs.fill(2.0);
+        traj_search(&robot, &mut x, &mut st, &o);
+        assert_eq!((st.count, st.pending), (0, false), "a step that raises the cost must not be taken");
+        assert!(x.iter().all(|&v| v == 0.0));
+        st.costs.fill(0.0);
+        st.count = 3;
+        traj_search(&robot, &mut x, &mut st, &o);
+        assert!(st.pending && st.count == 3 && st.cost < 1.0, "a cheaper step must be taken");
     }
 }

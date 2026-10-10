@@ -330,45 +330,6 @@ fn load_errors_name_the_problem() {
     assert!(message.contains("link 'gripper'"), "{message}");
 }
 
-/// A table under the robot and boxes within its reach; none of them touch the default pose.
-fn tabletop(robot: &Robot, cpu: &Device, rng: &mut Rng) -> World {
-    let mut reach = 0.0f32;
-    for _ in 0..500 {
-        reach = reach.max(robot.ee_pose(&random_q(robot, rng)).position.truncate().length());
-    }
-    let model = robot.collision_model();
-    let floor = model
-        .spheres
-        .iter()
-        .flat_map(|(link, spheres)| {
-            let pose = robot.link_pose(robot.default_q(), link).unwrap();
-            spheres.iter().map(move |s| (pose.position + pose.rotation * Vec3::new(s[0], s[1], s[2])).z - s[3])
-        })
-        .fold(f32::INFINITY, f32::min);
-    let table = Obstacle::Cuboid {
-        center: Vec3::new(0.0, 0.0, floor - 0.01 - reach * 0.05),
-        half_extents: Vec3::new(2.0 * reach, 2.0 * reach, reach * 0.05),
-        rotation: Quat::IDENTITY,
-    };
-    let mut world = World { obstacles: vec![table] };
-    while world.obstacles.len() < 4 {
-        let (angle, radius) = (rng.range(-3.1, 3.1), rng.range(0.4, 0.8) * reach);
-        let half = Vec3::new(0.06, 0.06, 0.3) * reach;
-        let candidate = Obstacle::Cuboid {
-            center: Vec3::new(radius * angle.cos(), radius * angle.sin(), floor - 0.01 + half.z),
-            half_extents: half,
-            rotation: Quat::from_rotation_z(rng.range(0.0, 3.1)),
-        };
-        let mut trial = world.clone();
-        trial.obstacles.push(candidate);
-        let uploaded = cpu.upload(std::slice::from_ref(&trial)).unwrap();
-        if cpu.evaluate(&uploaded, &[0], robot.default_q(), &CollisionWeights::NONE).unwrap().collision_free(0) {
-            world = trial;
-        }
-    }
-    world
-}
-
 #[test]
 fn every_test_arm_loads_spherizes_and_plans() {
     let panda = RobotOptions { collision_model: None, ..common::panda_options() };
@@ -382,7 +343,7 @@ fn every_test_arm_loads_spherizes_and_plans() {
         let robot = Robot::load(common::asset(path), &options).unwrap();
         let cpu = Device::cpu(&robot);
         let mut rng = Rng::new(12);
-        let scene: Vec<World> = (0..4).map(|_| tabletop(&robot, &cpu, &mut rng)).collect();
+        let scene: Vec<World> = (0..4).map(|_| common::tabletop_for(&robot, &cpu, &mut rng)).collect();
         let worlds = cpu.upload(&scene).unwrap();
         // Goals within 1.5 rad of the default pose per joint: tabletop motions. Goals across the
         // UR5e's full +-2 pi range swing the arm through the table, which trajectory optimization

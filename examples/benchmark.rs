@@ -119,6 +119,9 @@ fn args() -> Result<Args> {
             "--device" => a.device = it.next().context("--device gpu|cpu|all")?,
             "--points" => a.plan.control_points = it.next().context("--points N")?.parse()?,
             "--samples" => a.plan.samples_per_span = it.next().context("--samples K")?.parse()?,
+            "--iterations" => a.plan.iterations = it.next().context("--iterations N")?.parse()?,
+            "--history" => a.plan.history = it.next().context("--history M")?.parse()?,
+            "--no-fallback" => a.plan.fallback = None,
             s if s.starts_with("--") => bail!("unknown flag {s}"),
             s => a.data = PathBuf::from(s),
         }

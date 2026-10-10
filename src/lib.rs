@@ -7,9 +7,9 @@
 //!   the exporters ([`npy`], `lerobot`) are independent modules that take a `Device` and exchange
 //!   the [`types`]; there are no planner plugins or runtime configuration. Results keep the
 //!   problems they answer (`solved()`).
-//! - **Standalone.** No middleware. Robots load from URDF; collision spheres are fitted to their
-//!   geometry or loaded from a committed collision-model file. Datasets export to LeRobot v3.0
-//!   with the optional `lerobot` feature.
+//! - **Standalone.** No middleware. Robots load from URDF, MJCF or OpenUSD; collision spheres are
+//!   fitted to their geometry or loaded from a committed collision-model file. Datasets export to
+//!   LeRobot v3.0 with the optional `lerobot` feature.
 //!
 //! ```no_run
 //! use batchplan::*;
@@ -35,7 +35,9 @@ mod mjcf;
 pub mod npy;
 pub mod rng;
 pub mod robot;
+pub mod rrt;
 pub mod sdf;
+pub mod shortcut;
 pub mod spheres;
 mod spline;
 pub mod timing;
@@ -49,9 +51,11 @@ pub mod world;
 pub use device::{CollisionWeights, Device, Evaluation, Worlds};
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
 pub use robot::{CollisionModel, Robot, RobotOptions};
+pub use rrt::{RrtOptions, RrtProblem, RrtResult};
 pub use sdf::{Intrinsics, Occlusion, SdfGrid, SdfOptions};
+pub use shortcut::ShortcutOptions;
 pub use spheres::{SphereGeometry, SphereOptions};
 pub use timing::{JointState, Trajectory};
-pub use trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
+pub use trajopt::{Fallback, PlanOptions, PlanProblem, PlanResult, plan};
 pub use types::{JointPaths, JointTrajectory, Pose, Solved};
 pub use world::{Obstacle, World};

@@ -218,30 +218,36 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     assert!(worst > -2e-3, "trajectory penetrates by {worst}");
 }
 
-/// Trajectory-cost gradients recovered from one optimizer step. With a huge Adam epsilon a single
-/// step is plain gradient descent, moving each control point by `-(lr / epsilon) * gradient`, so
-/// `(seed - stepped) * epsilon / lr` is the gradient each device computed. Returns the gradients
-/// and a mask of values a joint limit clamped (those carry no gradient information).
-fn one_step_gradients(
+/// The direction of each path's `step`-th L-BFGS step, scaled to its largest entry (the line
+/// search only scales it). The first step has no history, so it is the negative gradient; later
+/// ones come from the two-loop recursion. Also returns a mask of values a joint limit clamped
+/// (those carry no direction information).
+fn step_directions(
     d: &Device,
     worlds: &[World],
     problems: &[PlanProblem],
     o: &PlanOptions,
+    step: u32,
 ) -> (Vec<f32>, Vec<bool>) {
-    let (lr, eps) = (1e3, 1e7);
     let worlds = d.upload(worlds).unwrap();
-    let seed = plan(d, &worlds, problems, &PlanOptions { iterations: 0, ..*o }).unwrap().paths.positions;
-    let step = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..*o };
-    let stepped = plan(d, &worlds, problems, &step).unwrap().paths.positions;
+    let seed = plan(d, &worlds, problems, &PlanOptions { iterations: step - 1, ..*o }).unwrap().paths.positions;
+    let stepped = plan(d, &worlds, problems, &PlanOptions { iterations: step, ..*o }).unwrap().paths.positions;
     let robot = d.robot();
     let n = robot.dof();
     let clamped =
         stepped.iter().enumerate().map(|(i, &q)| q <= robot.lower()[i % n] || q >= robot.upper()[i % n]).collect();
-    (seed.iter().zip(&stepped).map(|(a, b)| (a - b) * (eps / lr)).collect(), clamped)
+    let mut gradients: Vec<f32> = seed.iter().zip(&stepped).map(|(a, b)| a - b).collect();
+    for path in gradients.chunks_mut(o.control_points * n) {
+        let largest = path.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if largest > 0.0 {
+            path.iter_mut().for_each(|v| *v /= largest);
+        }
+    }
+    (gradients, clamped)
 }
 
 #[test]
-fn trajopt_gradients_match_cpu_element_wise() {
+fn trajopt_directions_match_cpu_element_wise() {
     let Some((robot, gpu, cpu)) = setup() else { return };
     let n = robot.dof();
     let worlds = worlds(32, 8);
@@ -250,22 +256,82 @@ fn trajopt_gradients_match_cpu_element_wise() {
         .solved()
         .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
         .collect();
-    let o = PlanOptions::default();
-    let (a, clamped_a) = one_step_gradients(&cpu, &worlds, &problems, &o);
-    let (b, clamped_b) = one_step_gradients(&gpu, &worlds, &problems, &o);
-    let (mut worst, mut compared, mut largest) = (0.0f32, 0, 0.0f32);
-    for (w, (ga, gb)) in a.chunks(n).zip(b.chunks(n)).enumerate() {
-        if (0..n).any(|j| clamped_a[w * n + j] || clamped_b[w * n + j]) {
-            continue;
+    let o = PlanOptions { fallback: None, ..Default::default() };
+    let per_path = o.control_points * n;
+    // Step 1 follows the gradient; step 4 the two-loop recursion over three remembered steps.
+    for step in [1, 4] {
+        let (a, clamped_a) = step_directions(&cpu, &worlds, &problems, &o, step);
+        let (b, clamped_b) = step_directions(&gpu, &worlds, &problems, &o, step);
+        let (mut worst, mut compared) = (0.0f32, 0);
+        for (p, (ga, gb)) in a.chunks(per_path).zip(b.chunks(per_path)).enumerate() {
+            let moved = |g: &[f32]| g.iter().any(|&v| v != 0.0);
+            if (0..per_path).any(|i| clamped_a[p * per_path + i] || clamped_b[p * per_path + i]) || !moved(ga) {
+                continue;
+            }
+            worst = ga.iter().zip(gb).fold(worst, |m, (x, y)| m.max((x - y).abs()));
+            compared += 1;
         }
-        let norm = ga.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let diff = ga.iter().zip(gb).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
-        worst = worst.max(diff / norm.max(1.0));
-        compared += 1;
-        largest = largest.max(norm);
+        let paths = a.len() / per_path;
+        eprintln!(
+            "step {step}: worst |cpu-gpu| of directions scaled to their largest entry, {compared} paths: {worst:.2e}"
+        );
+        assert!(compared > paths / 2, "step {step}: only {compared} of {paths} paths moved without clamping");
+        assert!(worst < 1e-2, "step {step}: directions differ by {worst} of their largest entry");
     }
-    eprintln!("worst per-point |cpu-gpu| / |grad| over {compared} control points: {worst:.2e}");
-    assert!(compared > a.len() / n / 2, "only {compared} waypoints escaped joint-limit clamping");
-    assert!(largest > 1.0, "gradients too small ({largest}) to exercise the comparison");
-    assert!(worst < 1e-2, "trajectory gradients differ by {worst} of their norm");
+}
+
+/// Weights of a uniform cubic B-spline span's control points at `u` (same as the planner's).
+fn basis(u: f32) -> [f32; 4] {
+    let v = 1.0 - u;
+    [
+        v * v * v / 6.0,
+        (3.0 * u * u * u - 6.0 * u * u + 4.0) / 6.0,
+        (-3.0 * u * u * u + 3.0 * u * u + 3.0 * u + 1.0) / 6.0,
+        u * u * u / 6.0,
+    ]
+}
+
+#[test]
+fn trajopt_lowers_the_cost_as_far_as_the_cpu() {
+    // The optimizers' line searches and directions, checked through what they achieve: the full
+    // trajectory cost after optimization, computed independently on the CPU.
+    let Some((robot, gpu, cpu)) = setup() else { return };
+    let n = robot.dof();
+    let scene = worlds(32, 12);
+    let on_cpu = cpu.upload(&scene).unwrap();
+    let ik = solve_ik(&cpu, &on_cpu, &ik_problems(&scene, 13), &IkOptions::default()).unwrap();
+    let problems: Vec<PlanProblem> = ik
+        .solved()
+        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .collect();
+    let o = PlanOptions { fallback: None, ..Default::default() };
+    let (points, k) = (o.control_points, o.samples_per_span);
+    let cost = |paths: &[f32]| -> f64 {
+        let (mut q, mut item_world, mut smooth) = (vec![], vec![], 0.0f64);
+        for (item, cp) in paths.chunks(points * n).enumerate() {
+            for span in 0..points - 3 {
+                for s in 0..k {
+                    let w = basis((s as f32 + 0.5) / k as f32);
+                    q.extend((0..n).map(|j| (0..4).map(|i| w[i] * cp[(span + i) * n + j]).sum::<f32>()));
+                    item_world.push(problems[item / o.seeds].world);
+                }
+            }
+            let p = |t: usize, j: usize| cp[t * n + j] as f64;
+            for j in 0..n {
+                smooth += (0..points - 1).map(|t| o.w_vel as f64 * (p(t + 1, j) - p(t, j)).powi(2)).sum::<f64>();
+                smooth += (1..points - 1)
+                    .map(|t| o.w_acc as f64 * (p(t + 1, j) - 2.0 * p(t, j) + p(t - 1, j)).powi(2))
+                    .sum::<f64>();
+            }
+        }
+        let e = cpu.evaluate(&on_cpu, &item_world, &q, &o.collision).unwrap();
+        e.cost.iter().map(|&c| c as f64).sum::<f64>() + smooth
+    };
+    let seeds = plan(&cpu, &on_cpu, &problems, &PlanOptions { iterations: 0, ..o }).unwrap().paths.positions;
+    let on_cpu_paths = plan(&cpu, &on_cpu, &problems, &o).unwrap().paths.positions;
+    let on_gpu_paths = plan(&gpu, &gpu.upload(&scene).unwrap(), &problems, &o).unwrap().paths.positions;
+    let (start, a, b) = (cost(&seeds), cost(&on_cpu_paths), cost(&on_gpu_paths));
+    eprintln!("trajectory cost of {} paths: seeds {start:.0}, CPU {a:.0}, GPU {b:.0}", seeds.len() / (points * n));
+    assert!(a < 0.2 * start && b < 0.2 * start, "optimization barely lowered the cost: {start} -> {a}, {b}");
+    assert!((a - b).abs() < 0.05 * a, "the devices end at different costs: {a} and {b}");
 }

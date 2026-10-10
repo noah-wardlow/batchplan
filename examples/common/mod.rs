@@ -6,7 +6,7 @@ use std::f32::consts::PI;
 use std::collections::HashMap;
 
 use batchplan::rng::Rng;
-use batchplan::{CollisionModel, Obstacle, Pose, Robot, RobotOptions, World};
+use batchplan::{CollisionModel, CollisionWeights, Device, Obstacle, Pose, Robot, RobotOptions, World};
 use glam::{Quat, Vec3};
 
 pub fn asset(path: &str) -> String {
@@ -58,4 +58,44 @@ pub fn grasp_target(world: &World, rng: &mut Rng) -> Pose {
             return Pose { position: p, rotation };
         }
     }
+}
+
+/// A table under any robot and three posts within its reach; none of them touch the default pose.
+pub fn tabletop_for(robot: &Robot, cpu: &Device, rng: &mut Rng) -> World {
+    let mut reach = 0.0f32;
+    for _ in 0..500 {
+        let q: Vec<f32> = (0..robot.dof()).map(|j| rng.range(robot.lower()[j], robot.upper()[j])).collect();
+        reach = reach.max(robot.ee_pose(&q).position.truncate().length());
+    }
+    let model = robot.collision_model();
+    let floor = model
+        .spheres
+        .iter()
+        .flat_map(|(link, spheres)| {
+            let pose = robot.link_pose(robot.default_q(), link).unwrap();
+            spheres.iter().map(move |s| (pose.position + pose.rotation * Vec3::new(s[0], s[1], s[2])).z - s[3])
+        })
+        .fold(f32::INFINITY, f32::min);
+    let table = Obstacle::Cuboid {
+        center: Vec3::new(0.0, 0.0, floor - 0.01 - reach * 0.05),
+        half_extents: Vec3::new(2.0 * reach, 2.0 * reach, reach * 0.05),
+        rotation: Quat::IDENTITY,
+    };
+    let mut world = World { obstacles: vec![table] };
+    while world.obstacles.len() < 4 {
+        let (angle, radius) = (rng.range(-3.1, 3.1), rng.range(0.4, 0.8) * reach);
+        let half = Vec3::new(0.06, 0.06, 0.3) * reach;
+        let candidate = Obstacle::Cuboid {
+            center: Vec3::new(radius * angle.cos(), radius * angle.sin(), floor - 0.01 + half.z),
+            half_extents: half,
+            rotation: Quat::from_rotation_z(rng.range(0.0, 3.1)),
+        };
+        let mut trial = world.clone();
+        trial.obstacles.push(candidate);
+        let uploaded = cpu.upload(std::slice::from_ref(&trial)).unwrap();
+        if cpu.evaluate(&uploaded, &[0], robot.default_q(), &CollisionWeights::NONE).unwrap().collision_free(0) {
+            world = trial;
+        }
+    }
+    world
 }

@@ -1,7 +1,8 @@
 // Batched kinematics, collision cost/gradient, IK and trajectory optimization.
 // Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (MAX_DOF, MAX_LINKS,
-// MAX_JOINTS, MAX_SPHERES, JAC_LEN, obstacle kinds) and the shared structs (Params, Link, Sphere,
-// Obstacle, Iter), generated from their Rust definitions so the two sides cannot drift apart.
+// MAX_JOINTS, MAX_SPHERES, JAC_LEN, obstacle kinds, MAX_HISTORY, LINE_STEPS and line_search) and
+// the shared structs (Params, Link, Sphere, Obstacle), generated from their Rust definitions so the
+// two sides cannot drift apart.
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> links: array<Link>;
@@ -16,10 +17,9 @@
 // Distance grid values, two half floats per word (see Obstacle.grid).
 @group(0) @binding(9) var<storage, read> grid_data: array<u32>;
 @group(0) @binding(10) var<storage, read_write> qbuf: array<f32>;
-// trajopt: [collision gradient per sample | gradient | Adam m | Adam v] (see sample_grad_len).
+// trajopt: the L-BFGS state of each path (see lbfgs_stride).
 @group(0) @binding(11) var<storage, read_write> aux: array<f32>;
 @group(0) @binding(12) var<storage, read_write> outbuf: array<f32>;
-@group(1) @binding(0) var<uniform> IT: Iter;
 
 const FAR: f32 = 1e30;
 
@@ -200,14 +200,17 @@ fn obstacle_distance(o: Obstacle, p: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(o.r0.xyz * gl.x + o.r1.xyz * gl.y + o.r2.xyz * gl.z, d);
 }
 
-// Collision cost of the configuration last passed to fk(); adds d(cost)/dq into `grad`.
-// Returns (cost, world clearance, self clearance).
-fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f32) -> vec3<f32> {
+// Collision cost of the configuration last passed to fk(); with `gradient`, adds d(cost)/dq into
+// `grad`. Returns (cost, world clearance, self clearance). Callers pass `gradient` as a constant,
+// so the compiler drops the per-sphere gradient work from cost-only kernels.
+fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f32, gradient: bool) -> vec3<f32> {
     let ns = P.n_spheres;
     for (var s = 0u; s < ns; s++) {
         let sp = spheres[s];
         sc[s] = lrot[sp.link] * sp.c.xyz + lpos[sp.link];
-        gc[s] = vec3<f32>(0.0);
+        if (gradient) {
+            gc[s] = vec3<f32>(0.0);
+        }
     }
     var cost = 0.0;
     var wmin = FAR;
@@ -222,7 +225,9 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
             let pen = margin - d;
             if (pen > 0.0) {
                 cost += w_world * pen * pen;
-                gc[s] -= 2.0 * w_world * pen * dg.xyz;
+                if (gradient) {
+                    gc[s] -= 2.0 * w_world * pen * dg.xyz;
+                }
             }
         }
     }
@@ -235,8 +240,7 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
         let d = dist - (a.c.w + a.self_buf) - (b.c.w + b.self_buf);
         smin = min(smin, d);
         let pen = self_margin - d;
-        if (pen > 0.0) {
-            cost += w_self * pen * pen;
+        if (pen > 0.0 && gradient) {
             var u = vec3<f32>(1.0, 0.0, 0.0);
             if (dist > 1e-9) {
                 u = diff / dist;
@@ -245,6 +249,12 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
             gc[pr.x] -= g;
             gc[pr.y] += g;
         }
+        if (pen > 0.0) {
+            cost += w_self * pen * pen;
+        }
+    }
+    if (!gradient) {
+        return vec3<f32>(cost, wmin, smin);
     }
     for (var s = 0u; s < ns; s++) {
         let g = gc[s];
@@ -388,7 +398,7 @@ fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
         for (var j = 0u; j < n; j++) {
             grad[j] = 0.0;
         }
-        collision(world, P.w_world, P.w_self, P.margin, P.self_margin);
+        collision(world, P.w_world, P.w_self, P.margin, P.self_margin, true);
         var jg: array<f32, 6>;
         for (var r = 0u; r < 6u; r++) {
             var s = 0.0;
@@ -433,7 +443,7 @@ fn evaluate_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
         grad[j] = 0.0;
     }
     fk();
-    let c = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin);
+    let c = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true);
     let base = item * (3u + n);
     outbuf[base] = c.y;
     outbuf[base + 1u] = c.z;
@@ -482,9 +492,242 @@ fn sample_u(s: u32) -> f32 {
     return (f32(s) + 0.5) / f32(P.samples);
 }
 
-// The trajopt part of aux: [collision gradient per sample | gradient | Adam m | Adam v].
-fn sample_grad_len() -> u32 {
-    return P.n_items * (P.points - 3u) * P.samples * P.n_dof;
+// Collision samples along one path.
+fn path_samples() -> u32 {
+    return (P.points - 3u) * P.samples;
+}
+
+// Each path's L-BFGS state in aux, in this order: the collision gradient per sample, the
+// collision cost per line-search step and sample, then per control point the gradient, the
+// previous gradient, the direction, the pending step, the step history and the gradient-change
+// history, then five scalars: cost, history count, newest slot, started, pending. Mirrors
+// lbfgs_stride in gpu.rs and the Lbfgs struct in cpu.rs.
+fn lbfgs_stride() -> u32 {
+    let tn = P.points * P.n_dof;
+    return path_samples() * P.n_dof + LINE_STEPS * path_samples() + (4u + 2u * P.history) * tn + 5u;
+}
+
+fn costs_at(item: u32) -> u32 {
+    return item * lbfgs_stride() + path_samples() * P.n_dof;
+}
+
+fn grad_at(item: u32) -> u32 {
+    return costs_at(item) + LINE_STEPS * path_samples();
+}
+
+fn prev_grad_at(item: u32) -> u32 {
+    return grad_at(item) + P.points * P.n_dof;
+}
+
+fn dir_at(item: u32) -> u32 {
+    return prev_grad_at(item) + P.points * P.n_dof;
+}
+
+fn pending_step_at(item: u32) -> u32 {
+    return dir_at(item) + P.points * P.n_dof;
+}
+
+fn steps_at(item: u32, slot: u32) -> u32 {
+    return pending_step_at(item) + (1u + slot) * P.points * P.n_dof;
+}
+
+fn changes_at(item: u32, slot: u32) -> u32 {
+    return steps_at(item, P.history + slot);
+}
+
+fn scalars_at(item: u32) -> u32 {
+    return steps_at(item, 2u * P.history);
+}
+
+// Control point t, joint j of the candidate path x + alpha d: free points move and are clamped
+// to the joint range, the three pinned at each end stay.
+fn candidate(item: u32, t: u32, j: u32, alpha: f32) -> f32 {
+    let i = t * P.n_dof + j;
+    let x = qbuf[item * P.points * P.n_dof + i];
+    if (t < 3u || t >= P.points - 3u) {
+        return x;
+    }
+    let lim = limits[j];
+    return clamp(x + alpha * aux[dir_at(item) + i], lim.x, lim.y);
+}
+
+// One invocation per line-search step and collision sample: the collision cost at that point of
+// the candidate path.
+@compute @workgroup_size(64)
+fn traj_costs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = item_index(gid, nwg);
+    let per_item = path_samples();
+    if (idx >= P.n_items * LINE_STEPS * per_item) {
+        return;
+    }
+    let item = idx / (LINE_STEPS * per_item);
+    let c = idx / per_item % LINE_STEPS;
+    let sample = idx % per_item;
+    let span = sample / P.samples;
+    let w = basis(sample_u(sample % P.samples));
+    let alpha = line_search(c);
+    for (var j = 0u; j < P.n_dof; j++) {
+        q[j] = w.x * candidate(item, span, j, alpha) + w.y * candidate(item, span + 1u, j, alpha)
+            + w.z * candidate(item, span + 2u, j, alpha) + w.w * candidate(item, span + 3u, j, alpha);
+    }
+    fk();
+    let c3 = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, false);
+    aux[costs_at(item) + c * per_item + sample] = c3.x;
+}
+
+// One invocation per path: the trajectory cost of each line-search step; the cheapest moves the
+// path if it lowers the cost, otherwise the history resets.
+@compute @workgroup_size(64)
+fn traj_search(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let item = item_index(gid, nwg);
+    if (item >= P.n_items) {
+        return;
+    }
+    let n = P.n_dof;
+    let tn = P.points;
+    let per_item = path_samples();
+    let sc = scalars_at(item);
+    let started = aux[sc + 3u] > 0.5;
+    var cost = aux[sc];
+    var best = -1;
+    for (var c = 0u; c < LINE_STEPS; c++) {
+        let alpha = line_search(c);
+        var total = 0.0;
+        for (var s = 0u; s < per_item; s++) {
+            total += aux[costs_at(item) + c * per_item + s];
+        }
+        for (var j = 0u; j < n; j++) {
+            // Each candidate point once, sliding along the path.
+            var before = 0.0;
+            var previous = candidate(item, 0u, j, alpha);
+            for (var t = 1u; t < tn; t++) {
+                let current = candidate(item, t, j, alpha);
+                let v = current - previous;
+                total += P.w_vel * v * v;
+                if (t >= 2u) {
+                    let a = current - 2.0 * previous + before;
+                    total += P.w_acc * a * a;
+                }
+                before = previous;
+                previous = current;
+            }
+        }
+        if ((best < 0 && !started) || total < cost) {
+            cost = total;
+            best = i32(c);
+        }
+    }
+    if (best < 0) {
+        aux[sc + 4u] = 0.0;
+        aux[sc + 1u] = 0.0;
+        return;
+    }
+    let alpha = line_search(u32(best));
+    for (var t = 3u; t < tn - 3u; t++) {
+        for (var j = 0u; j < n; j++) {
+            let i = t * n + j;
+            let moved = candidate(item, t, j, alpha);
+            let x = item * tn * n + i;
+            aux[pending_step_at(item) + i] = moved - qbuf[x];
+            qbuf[x] = moved;
+        }
+    }
+    aux[sc] = cost;
+    aux[sc + 3u] = 1.0;
+    aux[sc + 4u] = 1.0;
+}
+
+fn lbfgs_dot(a: u32, b: u32) -> f32 {
+    var sum = 0.0;
+    for (var i = 3u * P.n_dof; i < (P.points - 3u) * P.n_dof; i++) {
+        sum += aux[a + i] * aux[b + i];
+    }
+    return sum;
+}
+
+// One invocation per path: records the last step and the gradient change it caused, then the
+// L-BFGS two-loop recursion for the next direction; steepest descent scaled to initial_step
+// without history or when the recursion fails to descend.
+@compute @workgroup_size(64)
+fn lbfgs_direction(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let item = item_index(gid, nwg);
+    if (item >= P.n_items) {
+        return;
+    }
+    let first = 3u * P.n_dof;
+    let end = (P.points - 3u) * P.n_dof;
+    let m = P.history;
+    let sc = scalars_at(item);
+    let g = grad_at(item);
+    let gp = prev_grad_at(item);
+    let d = dir_at(item);
+    var count = u32(aux[sc + 1u]);
+    var newest = u32(aux[sc + 2u]);
+    if (aux[sc + 4u] > 0.5) {
+        let s = pending_step_at(item);
+        var sy = 0.0;
+        for (var i = first; i < end; i++) {
+            sy += aux[s + i] * (aux[g + i] - aux[gp + i]);
+        }
+        if (sy > 1e-10) {
+            var slot = 0u;
+            if (count > 0u) {
+                slot = (newest + 1u) % m;
+            }
+            for (var i = first; i < end; i++) {
+                aux[steps_at(item, slot) + i] = aux[s + i];
+                aux[changes_at(item, slot) + i] = aux[g + i] - aux[gp + i];
+            }
+            newest = slot;
+            count = min(count + 1u, m);
+        }
+        aux[sc + 4u] = 0.0;
+    }
+    var largest = 0.0;
+    for (var i = first; i < end; i++) {
+        aux[gp + i] = aux[g + i];
+        aux[d + i] = -aux[g + i];
+        largest = max(largest, abs(aux[g + i]));
+    }
+    var alpha: array<f32, MAX_HISTORY>;
+    for (var a = 0u; a < count; a++) {
+        let slot = (newest + m - a) % m;
+        let s = steps_at(item, slot);
+        let y = changes_at(item, slot);
+        alpha[a] = lbfgs_dot(s, d) / lbfgs_dot(y, s);
+        for (var i = first; i < end; i++) {
+            aux[d + i] -= alpha[a] * aux[y + i];
+        }
+    }
+    var gamma = 0.0;
+    if (count > 0u) {
+        let s = steps_at(item, newest);
+        let y = changes_at(item, newest);
+        gamma = lbfgs_dot(s, y) / lbfgs_dot(y, y);
+    } else if (largest > 0.0) {
+        gamma = P.initial_step / largest;
+    }
+    for (var i = first; i < end; i++) {
+        aux[d + i] *= gamma;
+    }
+    for (var k = 0u; k < count; k++) {
+        let a = count - 1u - k;
+        let slot = (newest + m - a) % m;
+        let s = steps_at(item, slot);
+        let y = changes_at(item, slot);
+        let beta = lbfgs_dot(y, d) / lbfgs_dot(y, s);
+        for (var i = first; i < end; i++) {
+            aux[d + i] += (alpha[a] - beta) * aux[s + i];
+        }
+    }
+    if (largest > 0.0 && lbfgs_dot(d, g) >= 0.0) {
+        count = 0u;
+        for (var i = first; i < end; i++) {
+            aux[d + i] = -aux[g + i] * (P.initial_step / largest);
+        }
+    }
+    aux[sc + 1u] = f32(count);
+    aux[sc + 2u] = f32(newest);
 }
 
 // One invocation per collision sample: writes d(collision cost)/dq at that point of the curve.
@@ -505,9 +748,10 @@ fn traj_samples(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
         grad[j] = 0.0;
     }
     fk();
-    collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin);
+    collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true);
+    let sample = idx % per_item;
     for (var j = 0u; j < n; j++) {
-        aux[idx * n + j] = grad[j];
+        aux[item * lbfgs_stride() + sample * n + j] = grad[j];
     }
 }
 
@@ -536,7 +780,7 @@ fn traj_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         }
         for (var s = 0u; s < P.samples; s++) {
             let w = basis(sample_u(s))[i];
-            let g = ((item * spans + t - i) * P.samples + s) * n;
+            let g = item * lbfgs_stride() + ((t - i) * P.samples + s) * n;
             for (var j = 0u; j < n; j++) {
                 grad[j] += w * aux[g + j];
             }
@@ -554,34 +798,6 @@ fn traj_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         if (t + 2u < tn) {
             g += 2.0 * P.w_acc * (qbuf[base + 2u * n + j] - 2.0 * qp + q0);
         }
-        aux[sample_grad_len() + base + j] = grad[j] + g;
-    }
-}
-
-// One invocation per free control point: Adam step from the gradient, clamped to joint limits.
-@compute @workgroup_size(64)
-fn traj_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let idx = item_index(gid, nwg);
-    let tn = P.points;
-    let free = tn - 6u;
-    if (idx >= P.n_items * free) {
-        return;
-    }
-    let item = idx / free;
-    let t = idx % free + 3u;
-    let n = P.n_dof;
-    let base = (item * tn + t) * n;
-    let total = P.n_items * tn * n;
-    let g0 = sample_grad_len();
-    for (var j = 0u; j < n; j++) {
-        let i = base + j;
-        let g = aux[g0 + i];
-        let m = P.beta1 * aux[g0 + total + i] + (1.0 - P.beta1) * g;
-        let v = P.beta2 * aux[g0 + 2u * total + i] + (1.0 - P.beta2) * g * g;
-        aux[g0 + total + i] = m;
-        aux[g0 + 2u * total + i] = v;
-        let step = IT.lr * (m / IT.bc1) / (sqrt(v / IT.bc2) + IT.eps);
-        let lim = limits[j];
-        qbuf[i] = clamp(qbuf[i] - step, lim.x, lim.y);
+        aux[grad_at(item) + t * n + j] = grad[j] + g;
     }
 }

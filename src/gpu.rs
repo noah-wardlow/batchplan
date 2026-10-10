@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -14,7 +13,7 @@ use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
 use crate::robot::{JointKind, MAX_DOF, MAX_JOINTS, MAX_LINKS, MAX_SPHERES, Robot};
 use crate::sdf::SdfGrid;
-use crate::trajopt::PlanOptions;
+use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
 use crate::types::{JointPaths, Pose};
 use crate::world::{Obstacle, World};
 
@@ -25,7 +24,7 @@ const READ_WRITE_STORAGE: u32 = 3;
 /// Upper bounds on work per queue submission, to stay clear of driver watchdogs.
 const EVAL_CHUNK: usize = 1 << 18;
 const IK_ITERS_PER_SUBMIT: u32 = 16;
-const TRAJ_ITERS_PER_SUBMIT: u32 = 25;
+const TRAJ_ITERS_PER_SUBMIT: u32 = 8;
 
 /// A `vec4<f32>` on the shader side.
 type Vec4 = [f32; 4];
@@ -55,7 +54,7 @@ shader_struct! {
         n_dof: u32, n_links: u32, n_spheres: u32, n_pairs: u32,
         ee_link: u32, n_items: u32, points: u32, iterations: u32,
         w_world: f32, w_self: f32, margin: f32, self_margin: f32,
-        w_acc: f32, w_vel: f32, beta1: f32, beta2: f32,
+        w_acc: f32, w_vel: f32, initial_step: f32, history: u32,
         damping: f32, rot_weight: f32, max_step: f32, collision_step: f32,
         samples: u32, pad0: u32, pad1: u32, pad2: u32,
     }
@@ -96,11 +95,6 @@ shader_struct! {
     }
 }
 
-shader_struct! {
-    /// Adam schedule for one trajopt iteration (`IT` in kernels.wgsl).
-    GpuIter => Iter { lr: f32, bc1: f32, bc2: f32, eps: f32 }
-}
-
 fn v4(v: glam::Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
 }
@@ -111,17 +105,17 @@ pub(crate) struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     layout0: wgpu::BindGroupLayout,
-    layout1: wgpu::BindGroupLayout,
     evaluate: wgpu::ComputePipeline,
     ik: wgpu::ComputePipeline,
+    traj_costs: wgpu::ComputePipeline,
+    traj_search: wgpu::ComputePipeline,
     traj_samples: wgpu::ComputePipeline,
     traj_grad: wgpu::ComputePipeline,
-    traj_update: wgpu::ComputePipeline,
+    lbfgs_direction: wgpu::ComputePipeline,
     links: wgpu::Buffer,
     spheres: wgpu::Buffer,
     pairs: wgpu::Buffer,
     limits: wgpu::Buffer,
-    uniform_align: u64,
 }
 
 /// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
@@ -205,11 +199,17 @@ impl GpuBackend {
             &format!(
                 "const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"
             ),
+            &format!(
+                "const MAX_HISTORY: u32 = {MAX_HISTORY}u;\nconst LINE_STEPS: u32 = {}u;\n\
+                 fn line_search(c: u32) -> f32 {{\n    var steps = array<f32, {}>({});\n    return steps[c];\n}}\n",
+                LINE_SEARCH.len(),
+                LINE_SEARCH.len(),
+                LINE_SEARCH.map(|a| format!("{a:?}")).join(", ")
+            ),
             GpuParams::WGSL,
             GpuLink::WGSL,
             GpuSphere::WGSL,
             GpuObstacle::WGSL,
-            GpuIter::WGSL,
             include_str!("kernels.wgsl"),
         ]
         .concat();
@@ -220,47 +220,40 @@ impl GpuBackend {
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
-        let buffer_entry = |binding: u32, ty: wgpu::BufferBindingType, dynamic: bool| wgpu::BindGroupLayoutEntry {
+        let buffer_entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: dynamic, min_binding_size: None },
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
-        let mut entries = vec![buffer_entry(0, wgpu::BufferBindingType::Uniform, false)];
+        let mut entries = vec![buffer_entry(0, wgpu::BufferBindingType::Uniform)];
         let (ro, rw) = (1..=READ_ONLY_STORAGE, READ_ONLY_STORAGE + 1..=READ_ONLY_STORAGE + READ_WRITE_STORAGE);
-        entries.extend(ro.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: true }, false)));
-        entries.extend(rw.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: false }, false)));
+        entries.extend(ro.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: true })));
+        entries.extend(rw.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: false })));
         let layout0 = device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("main"), entries: &entries });
-        let layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("iteration"),
-            entries: &[buffer_entry(0, wgpu::BufferBindingType::Uniform, true)],
-        });
         let pl_main = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&layout0)],
             immediate_size: 0,
         });
-        let pl_iter = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout0), Some(&layout1)],
-            immediate_size: 0,
-        });
-        let pipeline = |layout: &wgpu::PipelineLayout, entry: &str| {
+        let pipeline = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
-                layout: Some(layout),
+                layout: Some(&pl_main),
                 module: &module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
-        let evaluate = pipeline(&pl_main, "evaluate_main");
-        let ik = pipeline(&pl_main, "ik_main");
-        let traj_samples = pipeline(&pl_iter, "traj_samples");
-        let traj_grad = pipeline(&pl_iter, "traj_grad");
-        let traj_update = pipeline(&pl_iter, "traj_update");
+        let evaluate = pipeline("evaluate_main");
+        let ik = pipeline("ik_main");
+        let traj_costs = pipeline("traj_costs");
+        let traj_search = pipeline("traj_search");
+        let traj_samples = pipeline("traj_samples");
+        let traj_grad = pipeline("traj_grad");
+        let lbfgs_direction = pipeline("lbfgs_direction");
         if let Some(e) = pollster::block_on(scope.pop()) {
             bail!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend);
         }
@@ -311,16 +304,16 @@ impl GpuBackend {
             spheres: storage(&device, "spheres", &gpu_spheres),
             pairs: storage(&device, "pairs", &robot.self_pairs),
             limits: storage(&device, "limits", &gpu_limits),
-            uniform_align: u64::from(adapter_limits.min_uniform_buffer_offset_alignment).max(16),
             device,
             queue,
             layout0,
-            layout1,
             evaluate,
             ik,
+            traj_costs,
+            traj_search,
             traj_samples,
             traj_grad,
-            traj_update,
+            lbfgs_direction,
         })
     }
 
@@ -604,25 +597,49 @@ impl Backend for GpuBackend {
 
     fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
         let worlds: &GpuWorlds = worlds.prepared();
-        let traj = &mut paths.positions[..];
-        let items = item_world.len();
-        if items == 0 || o.iterations == 0 {
+        let (points, n) = (paths.points, paths.dof);
+        if item_world.is_empty() || o.iterations == 0 {
             return Ok(());
         }
+        // The L-BFGS state is large; paths are optimized in chunks whose state fits one binding.
+        let limits = self.device.limits();
+        let bytes = 4 * lbfgs_stride(points, n, o) as u64;
+        let chunk = (limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / bytes).max(1) as usize;
+        for (chunk_world, chunk_paths) in item_world.chunks(chunk).zip(paths.positions.chunks_mut(chunk * points * n)) {
+            self.trajopt_chunk(worlds, chunk_world, chunk_paths, points, o)?;
+        }
+        Ok(())
+    }
+}
+
+/// Floats of L-BFGS state per path; must match `lbfgs_stride` in kernels.wgsl.
+fn lbfgs_stride(points: usize, n: usize, o: &PlanOptions) -> usize {
+    let samples = (points - 3) * o.samples_per_span;
+    samples * n + LINE_SEARCH.len() * samples + (4 + 2 * o.history) * points * n + 5
+}
+
+impl GpuBackend {
+    fn trajopt_chunk(
+        &self,
+        worlds: &GpuWorlds,
+        item_world: &[u32],
+        traj: &mut [f32],
+        points: usize,
+        o: &PlanOptions,
+    ) -> Result<()> {
+        let items = item_world.len();
         let mut params = self.params(items, &o.collision);
-        params.points = paths.points as u32;
+        params.points = points as u32;
         params.samples = o.samples_per_span as u32;
         params.w_acc = o.w_acc;
         params.w_vel = o.w_vel;
-        params.beta1 = o.beta1;
-        params.beta2 = o.beta2;
+        params.initial_step = o.initial_step;
+        params.history = o.history as u32;
         let params_buf = self.uniform(&params);
         let world_buf = storage(&self.device, "item world", item_world);
         let dummy = storage::<f32>(&self.device, "unused", &[]);
         let q_buf = storage(&self.device, "trajectories", traj);
-        // [collision gradient per sample | gradient per control point | Adam m | Adam v]
-        let sample_threads = items * (paths.points - 3) * o.samples_per_span;
-        let aux = storage_zeroed(&self.device, "trajopt state", sample_threads * paths.dof + traj.len() * 3);
+        let aux = storage_zeroed(&self.device, "L-BFGS state", items * lbfgs_stride(points, self.robot.dof(), o));
         let out = storage::<f32>(&self.device, "unused out", &[]);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
@@ -633,45 +650,28 @@ impl Backend for GpuBackend {
             aux: &aux,
             out: &out,
         });
-        let align = self.uniform_align as usize;
-        let mut schedule = vec![0u8; align * o.iterations as usize];
-        for k in 0..o.iterations {
-            let [lr, bc1, bc2] = o.schedule(k);
-            let it = GpuIter { lr, bc1, bc2, eps: o.adam_epsilon };
-            schedule[k as usize * align..k as usize * align + 16].copy_from_slice(bytemuck::bytes_of(&it));
-        }
-        let iter_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("schedule"),
-            contents: &schedule,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bg_iter = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layout1,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &iter_buf,
-                    offset: 0,
-                    size: NonZeroU64::new(16),
-                }),
-            }],
-        });
-        let free_threads = items * (paths.points - 6);
+        let samples = items * (points - 3) * o.samples_per_span;
+        // The first round only prices the seeds: their directions are still zero.
+        let rounds = o.iterations + 1;
         let mut k = 0;
-        while k < o.iterations {
-            let end = (k + TRAJ_ITERS_PER_SUBMIT).min(o.iterations);
+        while k < rounds {
+            let end = (k + TRAJ_ITERS_PER_SUBMIT).min(rounds);
             self.submit_pass(|pass| {
                 pass.set_bind_group(0, &bg, &[]);
-                for it in k..end {
-                    let offset = it * self.uniform_align as u32;
-                    pass.set_bind_group(1, &bg_iter, &[offset]);
+                for round in k..end {
+                    pass.set_pipeline(&self.traj_costs);
+                    dispatch(pass, samples * LINE_SEARCH.len());
+                    pass.set_pipeline(&self.traj_search);
+                    dispatch(pass, items);
+                    if round + 1 == rounds {
+                        break;
+                    }
                     pass.set_pipeline(&self.traj_samples);
-                    dispatch(pass, sample_threads);
+                    dispatch(pass, samples);
                     pass.set_pipeline(&self.traj_grad);
-                    dispatch(pass, free_threads);
-                    pass.set_pipeline(&self.traj_update);
-                    dispatch(pass, free_threads);
+                    dispatch(pass, items * (points - 6));
+                    pass.set_pipeline(&self.lbfgs_direction);
+                    dispatch(pass, items);
                 }
             });
             k = end;
@@ -690,9 +690,6 @@ fn unmet_limits(l: &wgpu::Limits) -> Vec<String> {
             "{storage} storage buffers per shader stage (has {})",
             l.max_storage_buffers_per_shader_stage
         ));
-    }
-    if l.max_bind_groups < 2 {
-        unmet.push(format!("2 bind groups (has {})", l.max_bind_groups));
     }
     if l.max_compute_workgroup_size_x < WORKGROUP || l.max_compute_invocations_per_workgroup < WORKGROUP {
         unmet.push(format!("{WORKGROUP}-wide compute workgroups"));

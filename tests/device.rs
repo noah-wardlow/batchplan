@@ -117,7 +117,7 @@ fn results_keep_the_worlds_of_their_problems() {
 fn trajopt_smoothness_gradient_matches_its_cost() {
     // Collision off: the trajectory cost is pure smoothness,
     //   J = w_acc * sum |q[t+1] - 2 q[t] + q[t-1]|^2 + w_vel * sum |q[t+1] - q[t]|^2,
-    // whose gradient one linearized optimizer step must reproduce (see tests/gpu.rs).
+    // whose gradient sets the direction of the first L-BFGS step (see tests/gpu.rs).
     let robot = panda();
     let n = robot.dof();
     let mut goal = robot.default_q().to_vec();
@@ -125,7 +125,7 @@ fn trajopt_smoothness_gradient_matches_its_cost() {
     goal[2] -= 0.7;
     let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal }];
     let scene = vec![World::default()];
-    let o = PlanOptions { collision: CollisionWeights::NONE, ..Default::default() };
+    let o = PlanOptions { collision: CollisionWeights::NONE, fallback: None, ..Default::default() };
     let cost = |path: &[f64]| {
         let t_count = path.len() / n;
         let q = |t: usize, j: usize| path[t * n + j];
@@ -142,32 +142,32 @@ fn trajopt_smoothness_gradient_matches_its_cost() {
     };
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
-        let (lr, eps) = (1e3, 1e7);
         let seed = plan(&d, &worlds, &problems, &PlanOptions { iterations: 0, ..o }).unwrap().paths.positions;
-        let one = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..o };
-        let stepped = plan(&d, &worlds, &problems, &one).unwrap().paths.positions;
+        let stepped = plan(&d, &worlds, &problems, &PlanOptions { iterations: 1, ..o }).unwrap().paths.positions;
         // Seed 1's path (seed 0 is a straight line, where the smoothness gradient vanishes); the
         // result holds `o.seeds` paths back to back. Only control points 3..points - 3 move.
         let points = o.control_points;
         let offset = points * n;
         let path: Vec<f64> = seed[offset..2 * offset].iter().map(|&v| v as f64).collect();
-        let (mut worst, mut largest) = (0.0f64, 0.0f64);
-        for i in 3 * n..(points - 3) * n {
-            let h = 1e-5;
-            let (mut up, mut down) = (path.clone(), path.clone());
-            up[i] += h;
-            down[i] -= h;
-            let fd = (cost(&up) - cost(&down)) / (2.0 * h);
-            let from_step = (seed[offset + i] - stepped[offset + i]) as f64 * (eps / lr) as f64;
-            let err = (fd - from_step).abs() / fd.abs().max(1.0);
-            if err > 0.02 {
-                eprintln!("  coord {i} (point {}, joint {}): fd {fd:.3} step {from_step:.3}", i / n, i % n);
-            }
-            worst = worst.max(err);
-            largest = largest.max(fd.abs());
-        }
-        assert!(largest > 0.1, "{}: test path is too straight to exercise the gradient ({largest})", d.name());
-        assert!(worst < 1e-2, "{}: smoothness gradient off by {worst:.2e} relative", d.name());
+        let free = 3 * n..(points - 3) * n;
+        let fd: Vec<f64> = free
+            .clone()
+            .map(|i| {
+                let h = 1e-5;
+                let (mut up, mut down) = (path.clone(), path.clone());
+                up[i] += h;
+                down[i] -= h;
+                (cost(&up) - cost(&down)) / (2.0 * h)
+            })
+            .collect();
+        // Without history the step is steepest descent: -gradient times a positive scale.
+        let step: Vec<f64> = free.map(|i| (seed[offset + i] - stepped[offset + i]) as f64).collect();
+        let largest = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let (fd_max, step_max) = (largest(&fd), largest(&step));
+        assert!(fd_max > 0.1, "{}: test path is too straight to exercise the gradient ({fd_max})", d.name());
+        assert!(step_max > 0.0, "{}: the step did not move the path", d.name());
+        let worst = fd.iter().zip(&step).map(|(f, s)| (f / fd_max - s / step_max).abs()).fold(0.0, f64::max);
+        assert!(worst < 1e-2, "{}: the step's direction is off the smoothness gradient by {worst:.2e}", d.name());
     }
 }
 
@@ -197,7 +197,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
     let post = Obstacle::Cylinder { center, rotation: glam::Quat::IDENTITY, radius: 0.05, half_height: 0.3 };
     let scene = vec![World { obstacles: vec![post] }];
     let problems = vec![PlanProblem { world: 0, start, goal }];
-    let o = PlanOptions::default();
+    let o = PlanOptions { fallback: None, ..Default::default() };
     let (points, k) = (o.control_points, o.samples_per_span);
     let samples_of = |cp: &[f64]| -> Vec<f32> {
         let mut out = vec![];
@@ -226,10 +226,8 @@ fn trajopt_collision_gradient_matches_its_cost() {
     let on_cpu = cpu.upload(&scene).unwrap();
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
-        let (lr, eps) = (1e3, 1e7);
         let seed = plan(&d, &worlds, &problems, &PlanOptions { iterations: 0, ..o }).unwrap().paths.positions;
-        let one = PlanOptions { iterations: 1, learning_rate: lr, adam_epsilon: eps, ..o };
-        let stepped = plan(&d, &worlds, &problems, &one).unwrap().paths.positions;
+        let stepped = plan(&d, &worlds, &problems, &PlanOptions { iterations: 1, ..o }).unwrap().paths.positions;
         // Seed 0, the straight line through the post.
         let path: Vec<f64> = seed[..points * n].iter().map(|&v| v as f64).collect();
         let free: Vec<usize> = (3 * n..(points - 3) * n).collect();
@@ -259,15 +257,19 @@ fn trajopt_collision_gradient_matches_its_cost() {
                 .collect()
         };
         let (fine, coarse) = (fd_at(2e-4), fd_at(1e-3));
-        let largest = fine.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        // Without history the step is steepest descent: -gradient times a positive scale, so
+        // gradients are compared scaled to their largest entries.
+        let step: Vec<f64> = free.iter().map(|&i| (seed[i] - stepped[i]) as f64).collect();
+        let largest = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let (fine_max, coarse_max, step_max) = (largest(&fine), largest(&coarse), largest(&step));
+        assert!(step_max > 0.0, "{}: the step did not move the path", d.name());
         let mut worst = 0.0f64;
-        for (f, &i) in free.iter().enumerate() {
-            let from_step = (seed[i] - stepped[i]) as f64 * (eps / lr) as f64;
-            let scale = fine[f].abs().max(0.05 * largest);
-            let err = (fine[f] - from_step).abs().min((coarse[f] - from_step).abs()) / scale;
-            worst = worst.max(err);
+        for f in 0..free.len() {
+            let s = step[f] / step_max;
+            let err = (fine[f] / fine_max - s).abs().min((coarse[f] / coarse_max - s).abs());
+            worst = worst.max(err / (fine[f].abs() / fine_max).max(0.05));
         }
-        eprintln!("{}: largest gradient {largest:.1}, worst relative error {worst:.2e}", d.name());
+        eprintln!("{}: largest gradient {fine_max:.1}, worst relative error {worst:.2e}", d.name());
         let seed_samples = samples_of(&path);
         let items = seed_samples.len() / n;
         let touching = cpu.evaluate(&on_cpu, &vec![0; items], &seed_samples, &o.collision).unwrap().cost;
