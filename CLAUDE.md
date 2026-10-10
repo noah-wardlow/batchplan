@@ -69,21 +69,28 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 ## Architecture that spans files
 
 **CPU/GPU twin.**
-- `src/kernels.wgsl` and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_costs`/`traj_cost`, `traj_search`, `traj_samples`/`traj_sample_grad`, `traj_grad`, `lbfgs_direction`). `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
+- The GPU kernels (`src/kernels.wgsl` plus the per-robot code `robot_wgsl` writes in `gpu.rs`) and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_costs`/`traj_cost`, `traj_search`, `traj_samples`/`traj_sample_grad`, `traj_grad`, `lbfgs_direction`). `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
 - `cpu.rs` keeps index loops on purpose so the two read side by side.
 - Any change to the math lands in both files in the same change. The parity tests in `tests/gpu.rs` and `tests/device.rs` catch drift.
 
 **Host/shader structs.**
 - Each struct the GPU reads is declared once with `shader_struct!` in `gpu.rs`: `GpuParams`, `GpuLink`, `GpuSphere` and `GpuObstacle`. So are the constants (`MAX_HISTORY`, the line-search steps `LINE_SEARCH`, obstacle kinds).
-- Their WGSL declarations are generated from the same field list. `gpu.rs` builds the shader source as: generated prelude (`alias Vec4`, `MAX_DOF`, `MAX_LINKS`, `MAX_SPHERES`, `JAC_LEN`, the structs) + `kernels.wgsl`.
+- Their WGSL declarations are generated from the same field list. `gpu.rs` builds the shader source as: generated prelude (`alias Vec4`, the constants, the structs) + `robot_wgsl(robot)` + `kernels.wgsl`.
 - To add a kernel parameter:
   1. Add a field to the right `shader_struct!`.
   2. Fill it in `GpuBackend`.
   3. Read it in WGSL as `P.<field>`.
   4. Mirror it in `cpu.rs`.
-- The kernel limits (`MAX_DOF` = 16, `MAX_JOINTS` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) are defined in `robot.rs` and enforced when a robot loads.
-- Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with two entries per link pair, `(a, b)` and `(first, count)`, followed by the sphere pairs.
-- Per-joint kernel state (`jaxis`, `janchor`) is indexed by `Link.joint`, the moving-joint number, and sized `MAX_JOINTS`. Arrays that small stay in registers on AMD; indexing them per link (32 entries) cost 20% of GPU planning time.
+- The limits (`MAX_DOF` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) size the CPU kernels' arrays. They are defined in `robot.rs` and enforced when a robot loads.
+- Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with one `(first, count)` entry per link pair, followed by the sphere pairs.
+
+**Per-robot GPU kernels.**
+- `robot_wgsl` writes the robot-specific code: `MAX_DOF`, forward kinematics, the end effector's Jacobian and the collision cost.
+  - Each link's frame (`rot_i`, `pos_i`) and collision wrench (`force_i`, `moment_i`) is its own private variable, indexed only by constants.
+  - Sphere and pair ranges come from the buffers (`GpuLink.first_sphere`, the `pairs` header), so robots that differ only in their spheres share code.
+- Why: Mesa's RADV moves any private array indexed at run time and larger than 256 bytes into scratch memory. With per-link and per-sphere arrays, every collision kernel spilled 3–5 KB per invocation. Writing the code per robot removed that and made GPU planning 4.8× faster on the Radeon and 2.7× on the M4 Pro. Never add a run-time-indexed private array larger than that to a collision kernel. To check on RADV, `MESA_SHADER_CACHE_DISABLE=true RADV_DEBUG=shaderstats cargo run --release --example bench -- 8` prints each pipeline's VGPRs and scratch size.
+- Collision gradients accumulate a wrench per link (force, and moment about the world origin). One reverse pass, leaves first, adds each link's wrench into its parent and gives each joint `a·(M − o×F)` (revolute) or `a·F` (prismatic). `cpu.rs` does the same.
+- `GpuBackend` compiles kernels per robot shape and caches them by generated source, shared by every backend `with_robot` derives.
 
 **GPU details.**
 - Bind group 0 has 12 storage buffers. `unmet_limits` skips adapters that can't provide them, and the error names each rejected adapter and what it lacks.
@@ -124,7 +131,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 
 **Robot model.**
 - `Robot::load` → `description::load_robot` (by extension) → `kinematics` (breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a multiplier and offset, locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
-- Gradients and Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order.
+- IK Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order (`robot_wgsl` unrolls it).
 - `assets/franka/panda_collision.json` holds cuRobo's hand-tuned Panda spheres (Apache-2.0, credited in the README and `assets/README.md`); keep that credit when touching assets. `examples/common/mod.rs` has the Panda's options (locked fingers, `ee_link`, default pose).
 
 ## Working rules

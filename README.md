@@ -88,7 +88,7 @@ GPU time per phase on the Radeon: 0.064 s for IK (16,384 seeds) and 2.5 s for pl
 
 Performance claims come from alternating runs of two builds on one machine. Two things those runs caught:
 - Hot functions the CPU backend calls across modules are marked `#[inline]`. Without it, the CPU path lost 15–20% whenever unrelated code changed how the compiler split the crate.
-- Per-joint kernel state must stay in arrays of `MAX_JOINTS` entries. Indexing it per link (32 entries) pushed it out of registers and cost 20% of GPU planning time on the Radeon.
+- Collision kernels must not index private arrays at run time. Mesa's RADV moves such arrays into scratch memory once they exceed 256 bytes, and per-link and per-sphere arrays cost 3–5 KB of it per invocation. Writing the kernels out for each robot (frames and collision wrenches as separate variables) made GPU planning 4.8× faster on the Radeon and 2.7× faster on the M4 Pro.
 - The line search's cost passes must skip the collision gradient. Computing it there, unused, made GPU planning 28% slower on both GPUs.
 - RRT-Connect must extend toward several configurations per round. One per round meant thousands of tiny GPU calls for problems it cannot solve, which halved benchmark throughput.
 
@@ -108,7 +108,7 @@ Performance claims come from alternating runs of two builds on one machine. Two 
   - **Variants:** `RobotOptions::variants` selects variants where the file authors no selection.
 - **Scenes.** `World::load` reads the static geometry of an MJCF or USD scene as obstacles; planes become slabs and ellipsoids their bounding boxes. Meshes become [distance grids](#distance-grids) of their convex hulls where the format collides them that way: MJCF always (as MuJoCo does), USD when `physics:approximation` is `convexHull`. Other USD approximations use the exact mesh.
 
-- **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Up to 16 actuated joints, 16 moving joints (actuated plus mimic), 32 links and 128 spheres.
+- **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Up to 16 actuated joints, 32 links and 128 spheres.
 - **Collision spheres.** Without a collision model, spheres are fitted to each link's collision geometry (or its visual geometry) with cuRobo's voxel method:
   1. Interior grid points become candidate spheres that touch the surface.
   2. A greedy cover picks the candidates that reach the most surface samples.
@@ -319,7 +319,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 ## Limits of the MVP
 
 - **Geometry.** The robot is modeled as spheres only. Distance grids are built on the CPU, from one depth image at a time (no fusion over frames), and depth images must have the robot masked out by the caller.
-- **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating, planar and ball joints aren't supported; closed loops (MJCF `connect`, USD loop joints) are dropped from the tree.
+- **Kinematics.** The tree is limited to 16 actuated joints, 32 links and 128 spheres. Floating, planar and ball joints aren't supported; closed loops (MJCF `connect`, USD loop joints) are dropped from the tree.
 - **Long motions.** Joint ranges are intervals, not circles: continuous joints are planned within ±π and nothing wraps. On the UR5e, a goal whose shoulder has turned past the table below is unreachable even for RRT-Connect.
 - **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.
 - **Kernel performance.** Kernels run one invocation per configuration (or per collision sample, or per control point), with no shared memory or subgroup work. Worlds stay on the device, but per-call buffers (configurations, paths) are allocated per call. This leaves performance on the table.

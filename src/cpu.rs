@@ -14,7 +14,7 @@ use rayon::prelude::*;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
-use crate::robot::{Fk, MAX_DOF, MAX_SPHERES, Robot};
+use crate::robot::{Fk, JointKind, MAX_DOF, MAX_LINKS, MAX_SPHERES, Robot};
 use crate::sdf::SdfGrid;
 use crate::spline;
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
@@ -96,13 +96,16 @@ fn collision<const GRADIENT: bool>(
 ) -> CollisionOut {
     let ns = robot.spheres.len();
     let mut sc = [Vec3::ZERO; MAX_SPHERES];
-    let mut gc = [Vec3::ZERO; MAX_SPHERES];
+    // Each link's collision wrench: force, and moment about the world origin.
+    let mut force = [Vec3::ZERO; MAX_LINKS];
+    let mut moment = [Vec3::ZERO; MAX_LINKS];
+    let mut touched = false;
     for (s, sp) in robot.spheres.iter().enumerate() {
         sc[s] = fk.rot[sp.link] * sp.center + fk.pos[sp.link];
     }
     let (mut cost, mut wmin, mut smin) = (0.0f32, FAR, FAR);
     for s in 0..ns {
-        let r = robot.spheres[s].radius;
+        let (r, link) = (robot.spheres[s].radius, robot.spheres[s].link);
         for o in world {
             let (dist, g) = match *o {
                 Prepared::Cuboid { rot, center, half } => box_distance(rot, center, half, sc[s]),
@@ -121,7 +124,10 @@ fn collision<const GRADIENT: bool>(
             if pen > 0.0 {
                 cost += w.world * pen * pen;
                 if GRADIENT {
-                    gc[s] -= 2.0 * w.world * pen * g;
+                    let f = -2.0 * w.world * pen * g;
+                    force[link] += f;
+                    moment[link] += sc[s].cross(f);
+                    touched = true;
                 }
             }
         }
@@ -148,23 +154,34 @@ fn collision<const GRADIENT: bool>(
             if pen > 0.0 && GRADIENT {
                 let u = if dist > 1e-9 { diff / dist } else { Vec3::X };
                 let g = 2.0 * w.self_collision * pen * u;
-                gc[a] -= g;
-                gc[b] += g;
+                let (la, lb) = (lp.a as usize, lp.b as usize);
+                force[la] -= g;
+                moment[la] -= sc[a].cross(g);
+                force[lb] += g;
+                moment[lb] += sc[b].cross(g);
+                touched = true;
             }
             if pen > 0.0 {
                 cost += w.self_collision * pen * pen;
             }
         }
     }
-    if !GRADIENT {
+    if !GRADIENT || !touched {
         return CollisionOut { cost, world_clearance: wmin, self_clearance: smin };
     }
-    for s in 0..ns {
-        if gc[s] == Vec3::ZERO {
-            continue;
+    // Each link's wrench reaches the joints at and above it, leaves first.
+    for i in (0..robot.links.len()).rev() {
+        let link = &robot.links[i];
+        match link.joint {
+            JointKind::Revolute { dof, multiplier, .. } => {
+                grad[dof] += multiplier * fk.axis[i].dot(moment[i] - fk.pos[i].cross(force[i]));
+            }
+            JointKind::Prismatic { dof, multiplier, .. } => grad[dof] += multiplier * fk.axis[i].dot(force[i]),
+            JointKind::Fixed => {}
         }
-        for (i, dof, m) in robot.chain(robot.spheres[s].link) {
-            grad[dof] += m * gc[s].dot(fk.dpoint(i, sc[s]));
+        if let Some(p) = link.parent {
+            force[p] += force[i];
+            moment[p] += moment[i];
         }
     }
     CollisionOut { cost, world_clearance: wmin, self_clearance: smin }

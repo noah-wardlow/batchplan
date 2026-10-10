@@ -2,17 +2,17 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::error::{Error, Result, input};
+use crate::error::{Error, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat3;
 use wgpu::util::DeviceExt;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
-use crate::robot::{JointKind, MAX_DOF, MAX_JOINTS, MAX_LINKS, MAX_SPHERES, Robot};
+use crate::robot::{JointKind, Robot};
 use crate::sdf::SdfGrid;
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
 use crate::types::{JointPaths, Pose};
@@ -54,8 +54,7 @@ macro_rules! shader_struct {
 shader_struct! {
     /// Per-call constants (`P` in kernels.wgsl).
     GpuParams => Params {
-        n_dof: u32, n_links: u32, n_spheres: u32, n_link_pairs: u32,
-        ee_link: u32, n_items: u32, points: u32, iterations: u32,
+        n_dof: u32, n_items: u32, points: u32, iterations: u32,
         w_world: f32, w_self: f32, margin: f32, self_margin: f32,
         w_acc: f32, w_vel: f32, initial_step: f32, history: u32,
         damping: f32, rot_weight: f32, max_step: f32, collision_step: f32,
@@ -64,21 +63,20 @@ shader_struct! {
 }
 
 shader_struct! {
-    /// One kinematic link: joint origin rotation columns and translation, joint axis, and
-    /// `kind` 0 fixed / 1 revolute / 2 prismatic. A moving joint's value is
-    /// `axis.w * q[dof] + trans.w` (multiplier and offset, for mimic joints), and `joint` numbers
-    /// it among the moving joints. Bit `i` of `chain` marks link `i` as this link or an ancestor
-    /// with a moving joint. `bound` is the sphere (center in link frame, radius) enclosing the
-    /// link's collision spheres and their self-collision buffers.
+    /// One kinematic link: joint origin rotation columns and translation, and joint axis. A moving
+    /// joint's value is `axis.w * q[dof] + trans.w` (multiplier and offset, for mimic joints).
+    /// `bound` is the sphere (center in the link frame, radius) around the link's collision spheres
+    /// and their self-collision buffers, which are spheres `first_sphere..first_sphere + n_spheres`.
+    /// The tree itself is written into the generated kernels (`robot_wgsl`).
     GpuLink => Link {
         c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, bound: Vec4,
-        parent: i32, kind: u32, dof: u32, chain: u32, joint: u32, pad0: u32, pad1: u32, pad2: u32,
+        first_sphere: u32, n_spheres: u32, pad0: u32, pad1: u32,
     }
 }
 
 shader_struct! {
     /// Collision sphere: center xyz and radius in `c`.
-    GpuSphere => Sphere { c: Vec4, link: u32, self_buf: f32, pad0: u32, pad1: u32 }
+    GpuSphere => Sphere { c: Vec4, self_buf: f32, pad0: u32, pad1: u32, pad2: u32 }
 }
 
 /// Obstacle kinds as stored in `GpuObstacle::center.w`.
@@ -99,6 +97,176 @@ shader_struct! {
     }
 }
 
+/// The robot-specific part of the kernels: forward kinematics, the end effector's Jacobian and
+/// the collision cost, written out link by link. Each link's frame (`rot_i`, `pos_i`) and collision
+/// wrench (`force_i`, `moment_i`, about the world origin) is its own private variable indexed only
+/// by constants, so it stays in registers; private arrays indexed at run time end up in scratch
+/// memory on some drivers. Sphere and sphere-pair ranges are read from the buffers, so robots that
+/// differ only in their spheres share kernels.
+fn robot_wgsl(robot: &Robot) -> String {
+    use std::fmt::Write;
+    let links = &robot.links;
+    let (dof, ee) = (robot.dof(), robot.ee_link);
+    let mut w = format!("const MAX_DOF: u32 = {dof}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * dof);
+    for i in 0..links.len() {
+        let _ = writeln!(w, "var<private> rot_{i}: mat3x3<f32>;\nvar<private> pos_{i}: vec3<f32>;");
+        let _ = writeln!(w, "var<private> force_{i}: vec3<f32>;\nvar<private> moment_{i}: vec3<f32>;");
+    }
+
+    w += "\n// Every link's frame, root first.\nfn fk() {\n";
+    for (i, l) in links.iter().enumerate() {
+        let (prot, ppos) =
+            l.parent.map_or((String::new(), String::new()), |p| (format!("rot_{p} * "), format!(" + pos_{p}")));
+        let _ = writeln!(w, "    {{\n        let l = links[{i}u];");
+        let _ = writeln!(w, "        let jrot = {prot}mat3x3<f32>(l.c0.xyz, l.c1.xyz, l.c2.xyz);");
+        let _ = writeln!(w, "        let jpos = {prot}l.trans.xyz{ppos};");
+        let _ = match l.joint {
+            JointKind::Revolute { dof, .. } => writeln!(
+                w,
+                "        rot_{i} = jrot * rodrigues(l.axis.xyz, l.axis.w * q[{dof}u] + l.trans.w);\n        pos_{i} = jpos;"
+            ),
+            JointKind::Prismatic { dof, .. } => writeln!(
+                w,
+                "        rot_{i} = jrot;\n        pos_{i} = jpos + jrot * l.axis.xyz * (l.axis.w * q[{dof}u] + l.trans.w);"
+            ),
+            JointKind::Fixed => writeln!(w, "        rot_{i} = jrot;\n        pos_{i} = jpos;"),
+        };
+        w += "    }\n";
+    }
+    w += "}\n";
+
+    let _ = writeln!(w, "\nfn ee_pos() -> vec3<f32> {{\n    return pos_{ee};\n}}");
+    let _ = writeln!(w, "\nfn ee_rot() -> mat3x3<f32> {{\n    return rot_{ee};\n}}");
+    w += "\n// The end effector's Jacobian into `jac` (6 x MAX_DOF, row-major; rotation rows scaled by\n";
+    w += "// P.rot_weight), its moving joints root first, mimic joints adding into their leader.\n";
+    w += "fn ee_jacobian() {\n    for (var k = 0u; k < JAC_LEN; k++) {\n        jac[k] = 0.0;\n    }\n";
+    for (i, d, _) in robot.chain(ee) {
+        let _ =
+            writeln!(w, "    {{\n        let m = links[{i}u].axis.w;\n        let a = rot_{i} * links[{i}u].axis.xyz;");
+        if matches!(links[i].joint, JointKind::Prismatic { .. }) {
+            w += "        let jp = m * a;\n        let jo = vec3<f32>(0.0);\n";
+        } else {
+            let _ = writeln!(
+                w,
+                "        let jp = m * cross(a, pos_{ee} - pos_{i});\n        let jo = m * a * P.rot_weight;"
+            );
+        }
+        for (r, c) in ["jp.x", "jp.y", "jp.z", "jo.x", "jo.y", "jo.z"].iter().enumerate() {
+            let _ = writeln!(w, "        jac[{r}u * MAX_DOF + {d}u] += {c};");
+        }
+        w += "    }\n";
+    }
+    w += "}\n";
+
+    w += r"
+// Collision cost of the configuration last passed to fk(); with `gradient`, adds d(cost)/dq into
+// `grad`. Returns (cost, world clearance, self clearance). Callers pass `gradient` as a constant,
+// so the compiler drops the gradient work from cost-only kernels.
+fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f32, gradient: bool) -> vec3<f32> {
+    var cost = 0.0;
+    var wmin = FAR;
+    var smin = FAR;
+    var touched = false;
+    let range = world_ranges[world];
+    if (gradient) {
+";
+    for i in 0..links.len() {
+        let _ = writeln!(w, "        force_{i} = vec3<f32>(0.0);\n        moment_{i} = vec3<f32>(0.0);");
+    }
+    w += "    }\n";
+    for i in (0..links.len()).filter(|&i| robot.spheres.iter().any(|s| s.link == i)) {
+        let _ = write!(
+            w,
+            r"    for (var s = links[{i}u].first_sphere; s < links[{i}u].first_sphere + links[{i}u].n_spheres; s++) {{
+        let sp = spheres[s];
+        let c = rot_{i} * sp.c.xyz + pos_{i};
+        for (var k = 0u; k < range.y; k++) {{
+            let dg = obstacle_distance(obstacles[range.x + k], c);
+            let d = dg.w - sp.c.w;
+            wmin = min(wmin, d);
+            let pen = margin - d;
+            if (pen > 0.0) {{
+                cost += w_world * pen * pen;
+                if (gradient) {{
+                    let f = -2.0 * w_world * pen * dg.xyz;
+                    force_{i} += f;
+                    moment_{i} += cross(c, f);
+                    touched = true;
+                }}
+            }}
+        }}
+    }}
+"
+        );
+    }
+    w += "    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their\n";
+    w += "    // gap bounds their clearance from below.\n    let gate = max(self_margin, 0.0);\n";
+    for (l, lp) in robot.self_link_pairs.iter().enumerate() {
+        let (a, b) = (lp.a, lp.b);
+        let _ = write!(
+            w,
+            r"    {{
+        let ba = links[{a}u].bound;
+        let bb = links[{b}u].bound;
+        let gap = length(rot_{a} * ba.xyz + pos_{a} - rot_{b} * bb.xyz - pos_{b}) - ba.w - bb.w;
+        if (gap > gate) {{
+            smin = min(smin, gap);
+        }} else {{
+            let span = pairs[{l}u];
+            for (var k = span.x; k < span.x + span.y; k++) {{
+                let pr = pairs[k];
+                let sa = spheres[pr.x];
+                let sb = spheres[pr.y];
+                let ca = rot_{a} * sa.c.xyz + pos_{a};
+                let cb = rot_{b} * sb.c.xyz + pos_{b};
+                let diff = ca - cb;
+                let dist = length(diff);
+                let d = dist - (sa.c.w + sa.self_buf) - (sb.c.w + sb.self_buf);
+                smin = min(smin, d);
+                let pen = self_margin - d;
+                if (pen > 0.0) {{
+                    cost += w_self * pen * pen;
+                    if (gradient) {{
+                        var u = vec3<f32>(1.0, 0.0, 0.0);
+                        if (dist > 1e-9) {{
+                            u = diff / dist;
+                        }}
+                        let g = 2.0 * w_self * pen * u;
+                        force_{a} -= g;
+                        moment_{a} -= cross(ca, g);
+                        force_{b} += g;
+                        moment_{b} += cross(cb, g);
+                        touched = true;
+                    }}
+                }}
+            }}
+        }}
+    }}
+"
+        );
+    }
+    w += "    // Each link's wrench reaches the joints at and above it, leaves first.\n";
+    w += "    if (gradient && touched) {\n";
+    for (i, l) in links.iter().enumerate().rev() {
+        let _ = match l.joint {
+            JointKind::Revolute { dof, .. } => writeln!(
+                w,
+                "        grad[{dof}u] += links[{i}u].axis.w * dot(rot_{i} * links[{i}u].axis.xyz, moment_{i} - cross(pos_{i}, force_{i}));"
+            ),
+            JointKind::Prismatic { dof, .. } => writeln!(
+                w,
+                "        grad[{dof}u] += links[{i}u].axis.w * dot(rot_{i} * links[{i}u].axis.xyz, force_{i});"
+            ),
+            JointKind::Fixed => Ok(()),
+        };
+        if let Some(p) = l.parent {
+            let _ = writeln!(w, "        force_{p} += force_{i};\n        moment_{p} += moment_{i};");
+        }
+    }
+    w += "    }\n    return vec3<f32>(cost, wmin, smin);\n}\n";
+    w
+}
+
 fn v4(v: glam::Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
 }
@@ -109,6 +277,15 @@ pub(crate) struct GpuBackend {
     info: wgpu::AdapterInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    kernels: Arc<Kernels>,
+    /// Kernels built on this device, by their robot-specific source. Every backend derived with
+    /// `with_robot` shares it, so attaching and detaching objects compiles each robot shape once.
+    built: Arc<Mutex<HashMap<String, Arc<Kernels>>>>,
+    buffers: RobotBuffers,
+}
+
+/// The compiled kernels for one robot shape.
+struct Kernels {
     layout0: wgpu::BindGroupLayout,
     evaluate: wgpu::ComputePipeline,
     ik: wgpu::ComputePipeline,
@@ -117,7 +294,6 @@ pub(crate) struct GpuBackend {
     traj_samples: wgpu::ComputePipeline,
     traj_grad: wgpu::ComputePipeline,
     lbfgs_direction: wgpu::ComputePipeline,
-    buffers: RobotBuffers,
 }
 
 /// The robot as the kernels read it.
@@ -129,27 +305,17 @@ struct RobotBuffers {
     limits: wgpu::Buffer,
 }
 
-fn check_kernel_limits(robot: &Robot) -> Result<()> {
-    if robot.dof() > MAX_DOF || robot.spheres.len() > MAX_SPHERES || robot.links.len() > MAX_LINKS {
-        return Err(input!("robot exceeds kernel limits ({MAX_DOF} joints, {MAX_SPHERES} spheres, {MAX_LINKS} links)"));
-    }
-    Ok(())
-}
-
 impl RobotBuffers {
     fn new(device: &wgpu::Device, robot: &Robot) -> Self {
-        let mut moving = 0;
         let gpu_links: Vec<GpuLink> = robot
             .links
             .iter()
             .enumerate()
             .map(|(i, l)| {
-                let joint = moving;
-                moving += u32::from(l.joint.actuation().is_some());
-                let (kind, dof, axis, multiplier, offset) = match l.joint {
-                    JointKind::Fixed => (0, 0, glam::Vec3::ZERO, 0.0, 0.0),
-                    JointKind::Revolute { dof, axis, multiplier, offset } => (1, dof as u32, axis, multiplier, offset),
-                    JointKind::Prismatic { dof, axis, multiplier, offset } => (2, dof as u32, axis, multiplier, offset),
+                let (axis, multiplier, offset) = match l.joint {
+                    JointKind::Fixed => (glam::Vec3::ZERO, 0.0, 0.0),
+                    JointKind::Revolute { axis, multiplier, offset, .. }
+                    | JointKind::Prismatic { axis, multiplier, offset, .. } => (axis, multiplier, offset),
                 };
                 GpuLink {
                     c0: v4(l.origin.rot.x_axis, 0.0),
@@ -158,11 +324,8 @@ impl RobotBuffers {
                     trans: v4(l.origin.trans, offset),
                     axis: v4(axis, multiplier),
                     bound: robot.link_bounds[i],
-                    parent: l.parent.map_or(-1, |p| p as i32),
-                    kind,
-                    dof,
-                    chain: l.chain,
-                    joint,
+                    first_sphere: robot.spheres.iter().position(|s| s.link == i).unwrap_or(0) as u32,
+                    n_spheres: robot.spheres.iter().filter(|s| s.link == i).count() as u32,
                     ..Default::default()
                 }
             })
@@ -170,19 +333,14 @@ impl RobotBuffers {
         let gpu_spheres: Vec<GpuSphere> = robot
             .spheres
             .iter()
-            .map(|s| GpuSphere {
-                c: v4(s.center, s.radius),
-                link: s.link as u32,
-                self_buf: s.self_buffer,
-                ..Default::default()
-            })
+            .map(|s| GpuSphere { c: v4(s.center, s.radius), self_buf: s.self_buffer, ..Default::default() })
             .collect();
-        // Each link pair as (a, b), (first, count), then the sphere pairs they index.
-        let skip = 2 * robot.self_link_pairs.len() as u32;
+        // Each link pair's (first, count) of the sphere pairs that follow.
+        let skip = robot.self_link_pairs.len() as u32;
         let gpu_pairs: Vec<[u32; 2]> = robot
             .self_link_pairs
             .iter()
-            .flat_map(|lp| [[lp.a, lp.b], [skip + lp.first, lp.count]])
+            .map(|lp| [skip + lp.first, lp.count])
             .chain(robot.self_pairs.iter().copied())
             .collect();
         let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
@@ -194,6 +352,92 @@ impl RobotBuffers {
             limits: storage(device, "limits", &gpu_limits),
         }
     }
+}
+
+/// The kernels for `robot`'s shape, built on `device` unless `built` already holds them.
+fn kernels_for(
+    device: &wgpu::Device,
+    info: &wgpu::AdapterInfo,
+    built: &Mutex<HashMap<String, Arc<Kernels>>>,
+    robot: &Robot,
+) -> Result<Arc<Kernels>> {
+    let robot_source = robot_wgsl(robot);
+    let mut built = built.lock().expect("no thread panics while holding the kernel cache");
+    if let Some(kernels) = built.get(&robot_source) {
+        return Ok(kernels.clone());
+    }
+    let kernels = Arc::new(build_kernels(device, info, &robot_source)?);
+    built.insert(robot_source, kernels.clone());
+    Ok(kernels)
+}
+
+fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: &str) -> Result<Kernels> {
+    // Constants and shared structs are generated from their Rust definitions.
+    let source = [
+        "alias Vec4 = vec4<f32>;\n",
+        &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
+        &format!("const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"),
+        &format!(
+            "const MAX_HISTORY: u32 = {MAX_HISTORY}u;\nconst LINE_STEPS: u32 = {}u;\n\
+             fn line_search(c: u32) -> f32 {{\n    var steps = array<f32, {}>({});\n    return steps[c];\n}}\n",
+            LINE_SEARCH.len(),
+            LINE_SEARCH.len(),
+            LINE_SEARCH.map(|a| format!("{a:?}")).join(", ")
+        ),
+        GpuParams::WGSL,
+        GpuLink::WGSL,
+        GpuSphere::WGSL,
+        GpuObstacle::WGSL,
+        robot_source,
+        include_str!("kernels.wgsl"),
+    ]
+    .concat();
+    // Turn shader and pipeline validation failures into errors instead of panics.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("batchplan kernels"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+
+    let buffer_entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let mut entries = vec![buffer_entry(0, wgpu::BufferBindingType::Uniform)];
+    let (ro, rw) = (1..=READ_ONLY_STORAGE, READ_ONLY_STORAGE + 1..=READ_ONLY_STORAGE + READ_WRITE_STORAGE);
+    entries.extend(ro.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: true })));
+    entries.extend(rw.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: false })));
+    let layout0 =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("main"), entries: &entries });
+    let pl_main = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout0)],
+        immediate_size: 0,
+    });
+    let pipeline = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pl_main),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let evaluate = pipeline("evaluate_main");
+    let ik = pipeline("ik_main");
+    let traj_costs = pipeline("traj_costs");
+    let traj_search = pipeline("traj_search");
+    let traj_samples = pipeline("traj_samples");
+    let traj_grad = pipeline("traj_grad");
+    let lbfgs_direction = pipeline("lbfgs_direction");
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        return Err(Error::Gpu(format!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend)));
+    }
+
+    Ok(Kernels { layout0, evaluate, ik, traj_costs, traj_search, traj_samples, traj_grad, lbfgs_direction })
 }
 
 /// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
@@ -219,7 +463,6 @@ impl GpuBackend {
     /// Uses the first adapter whose name contains `name` (any adapter if `None`), preferring
     /// discrete, then integrated GPUs. OpenGL adapters are skipped.
     pub(crate) fn new(robot: &Robot, name: Option<&str>) -> Result<Self> {
-        check_kernel_limits(robot)?;
         let wanted = name.map(str::to_lowercase);
         let accept = |info: &wgpu::AdapterInfo| {
             info.backend != wgpu::Backend::Gl && wanted.as_ref().is_none_or(|w| info.name.to_lowercase().contains(w))
@@ -265,100 +508,15 @@ impl GpuBackend {
         }))
         .map_err(|e| Error::Gpu(format!("requesting GPU device: {e}")))?;
 
-        // Constants and shared structs are generated from their Rust definitions.
-        let source = [
-            "alias Vec4 = vec4<f32>;\n",
-            &format!("const MAX_DOF: u32 = {MAX_DOF}u;\nconst MAX_LINKS: u32 = {MAX_LINKS}u;\n"),
-            &format!("const MAX_JOINTS: u32 = {MAX_JOINTS}u;\n"),
-            &format!("const MAX_SPHERES: u32 = {MAX_SPHERES}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * MAX_DOF),
-            &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
-            &format!(
-                "const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"
-            ),
-            &format!(
-                "const MAX_HISTORY: u32 = {MAX_HISTORY}u;\nconst LINE_STEPS: u32 = {}u;\n\
-                 fn line_search(c: u32) -> f32 {{\n    var steps = array<f32, {}>({});\n    return steps[c];\n}}\n",
-                LINE_SEARCH.len(),
-                LINE_SEARCH.len(),
-                LINE_SEARCH.map(|a| format!("{a:?}")).join(", ")
-            ),
-            GpuParams::WGSL,
-            GpuLink::WGSL,
-            GpuSphere::WGSL,
-            GpuObstacle::WGSL,
-            include_str!("kernels.wgsl"),
-        ]
-        .concat();
-        // Turn shader and pipeline validation failures into errors instead of panics.
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("batchplan kernels"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-
-        let buffer_entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
-            count: None,
-        };
-        let mut entries = vec![buffer_entry(0, wgpu::BufferBindingType::Uniform)];
-        let (ro, rw) = (1..=READ_ONLY_STORAGE, READ_ONLY_STORAGE + 1..=READ_ONLY_STORAGE + READ_WRITE_STORAGE);
-        entries.extend(ro.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: true })));
-        entries.extend(rw.map(|b| buffer_entry(b, wgpu::BufferBindingType::Storage { read_only: false })));
-        let layout0 = device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("main"), entries: &entries });
-        let pl_main = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout0)],
-            immediate_size: 0,
-        });
-        let pipeline = |entry: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pl_main),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let evaluate = pipeline("evaluate_main");
-        let ik = pipeline("ik_main");
-        let traj_costs = pipeline("traj_costs");
-        let traj_search = pipeline("traj_search");
-        let traj_samples = pipeline("traj_samples");
-        let traj_grad = pipeline("traj_grad");
-        let lbfgs_direction = pipeline("lbfgs_direction");
-        if let Some(e) = pollster::block_on(scope.pop()) {
-            return Err(Error::Gpu(format!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend)));
-        }
-
+        let built = Arc::new(Mutex::new(HashMap::new()));
+        let kernels = kernels_for(&device, &info, &built, robot)?;
         let buffers = RobotBuffers::new(&device, robot);
-        Ok(Self {
-            robot: robot.clone(),
-            info,
-            buffers,
-            device,
-            queue,
-            layout0,
-            evaluate,
-            ik,
-            traj_costs,
-            traj_search,
-            traj_samples,
-            traj_grad,
-            lbfgs_direction,
-        })
+        Ok(Self { robot: robot.clone(), info, device, queue, kernels, built, buffers })
     }
 
     fn params(&self, n_items: usize, w: &CollisionWeights) -> GpuParams {
         GpuParams {
             n_dof: self.robot.dof() as u32,
-            n_links: self.robot.links.len() as u32,
-            n_spheres: self.robot.spheres.len() as u32,
-            n_link_pairs: self.robot.self_link_pairs.len() as u32,
-            ee_link: self.robot.ee_link as u32,
             n_items: n_items as u32,
             w_world: w.world,
             w_self: w.self_collision,
@@ -468,7 +626,7 @@ impl GpuBackend {
             .collect();
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.layout0,
+            layout: &self.kernels.layout0,
             entries: &entries,
         })
     }
@@ -536,7 +694,7 @@ impl GpuBackend {
             out: &out,
         });
         self.submit_pass(|pass| {
-            pass.set_pipeline(&self.evaluate);
+            pass.set_pipeline(&self.kernels.evaluate);
             pass.set_bind_group(0, &bg, &[]);
             dispatch(pass, items);
         });
@@ -558,9 +716,9 @@ impl Backend for GpuBackend {
     }
 
     fn with_robot(&self, robot: &Robot) -> Result<Box<dyn Backend>> {
-        check_kernel_limits(robot)?;
+        let kernels = kernels_for(&self.device, &self.info, &self.built, robot)?;
         let buffers = RobotBuffers::new(&self.device, robot);
-        Ok(Box::new(Self { robot: robot.clone(), buffers, ..self.clone() }))
+        Ok(Box::new(Self { robot: robot.clone(), kernels, buffers, ..self.clone() }))
     }
 
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
@@ -679,7 +837,7 @@ impl GpuBackend {
             params.iterations = IK_ITERS_PER_SUBMIT.min(o.iterations - done);
             self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
             self.submit_pass(|pass| {
-                pass.set_pipeline(&self.ik);
+                pass.set_pipeline(&self.kernels.ik);
                 pass.set_bind_group(0, &bg, &[]);
                 dispatch(pass, items);
             });
@@ -689,7 +847,7 @@ impl GpuBackend {
             params.iterations = 0;
             self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
             self.submit_pass(|pass| {
-                pass.set_pipeline(&self.ik);
+                pass.set_pipeline(&self.kernels.ik);
                 pass.set_bind_group(0, &bg, &[]);
                 dispatch(pass, items);
             });
@@ -739,18 +897,18 @@ impl GpuBackend {
             self.submit_pass(|pass| {
                 pass.set_bind_group(0, &bg, &[]);
                 for round in k..end {
-                    pass.set_pipeline(&self.traj_costs);
+                    pass.set_pipeline(&self.kernels.traj_costs);
                     dispatch(pass, samples * LINE_SEARCH.len());
-                    pass.set_pipeline(&self.traj_search);
+                    pass.set_pipeline(&self.kernels.traj_search);
                     dispatch(pass, items);
                     if round + 1 == rounds {
                         break;
                     }
-                    pass.set_pipeline(&self.traj_samples);
+                    pass.set_pipeline(&self.kernels.traj_samples);
                     dispatch(pass, samples);
-                    pass.set_pipeline(&self.traj_grad);
+                    pass.set_pipeline(&self.kernels.traj_grad);
                     dispatch(pass, items * (points - 6));
-                    pass.set_pipeline(&self.lbfgs_direction);
+                    pass.set_pipeline(&self.kernels.lbfgs_direction);
                     dispatch(pass, items);
                 }
             });

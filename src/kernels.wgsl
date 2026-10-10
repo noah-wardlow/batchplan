@@ -1,8 +1,9 @@
 // Batched kinematics, collision cost/gradient, IK and trajectory optimization.
-// Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (MAX_DOF, MAX_LINKS,
-// MAX_JOINTS, MAX_SPHERES, JAC_LEN, obstacle kinds, MAX_HISTORY, LINE_STEPS and line_search) and
-// the shared structs (Params, Link, Sphere, Obstacle), generated from their Rust definitions so the
-// two sides cannot drift apart.
+// Mirrors src/cpu.rs function for function. gpu.rs prepends the constants (obstacle kinds,
+// MAX_HISTORY, LINE_STEPS and line_search) and the shared structs (Params, Link, Sphere, Obstacle),
+// generated from their Rust definitions so the two sides cannot drift apart, and the code written
+// for the robot (`robot_wgsl`): MAX_DOF, JAC_LEN, fk(), ee_pos(), ee_rot(), ee_jacobian() and
+// collision().
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> links: array<Link>;
@@ -23,17 +24,8 @@
 
 const FAR: f32 = 1e30;
 
-var<private> lrot: array<mat3x3<f32>, MAX_LINKS>;
-var<private> lpos: array<vec3<f32>, MAX_LINKS>;
-// World axis and anchor of each moving joint (numbered by `Link.joint`); bit j of `prismatic` is
-// set when joint j slides. Kept to MAX_JOINTS entries so they stay in registers.
-var<private> jaxis: array<vec3<f32>, MAX_JOINTS>;
-var<private> janchor: array<vec3<f32>, MAX_JOINTS>;
-var<private> prismatic: u32;
 var<private> q: array<f32, MAX_DOF>;
 var<private> grad: array<f32, MAX_DOF>;
-var<private> sc: array<vec3<f32>, MAX_SPHERES>;
-var<private> gc: array<vec3<f32>, MAX_SPHERES>;
 var<private> jac: array<f32, JAC_LEN>;  // 6 x MAX_DOF, row-major
 var<private> chol: array<f32, 36>;
 
@@ -49,45 +41,6 @@ fn rodrigues(a: vec3<f32>, angle: f32) -> mat3x3<f32> {
         vec3<f32>(t * a.x * a.x + c, t * a.x * a.y + s * a.z, t * a.x * a.z - s * a.y),
         vec3<f32>(t * a.x * a.y - s * a.z, t * a.y * a.y + c, t * a.y * a.z + s * a.x),
         vec3<f32>(t * a.x * a.z + s * a.y, t * a.y * a.z - s * a.x, t * a.z * a.z + c));
-}
-
-fn fk() {
-    prismatic = 0u;
-    for (var i = 0u; i < P.n_links; i++) {
-        let l = links[i];
-        var prot = mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
-        var ppos = vec3<f32>(0.0);
-        if (l.parent >= 0) {
-            prot = lrot[l.parent];
-            ppos = lpos[l.parent];
-        }
-        let jrot = prot * mat3x3<f32>(l.c0.xyz, l.c1.xyz, l.c2.xyz);
-        let jpos = prot * l.trans.xyz + ppos;
-        if (l.kind == 1u) {
-            lrot[i] = jrot * rodrigues(l.axis.xyz, l.axis.w * q[l.dof] + l.trans.w);
-            lpos[i] = jpos;
-            jaxis[l.joint] = jrot * l.axis.xyz;
-            janchor[l.joint] = jpos;
-        } else if (l.kind == 2u) {
-            let a = jrot * l.axis.xyz;
-            lrot[i] = jrot;
-            lpos[i] = jpos + a * (l.axis.w * q[l.dof] + l.trans.w);
-            jaxis[l.joint] = a;
-            janchor[l.joint] = jpos;
-            prismatic |= 1u << l.joint;
-        } else {
-            lrot[i] = jrot;
-            lpos[i] = jpos;
-        }
-    }
-}
-
-// Derivative of a point rigidly attached downstream of moving joint j, per unit of joint motion.
-fn dpoint(j: u32, p: vec3<f32>) -> vec3<f32> {
-    if (((prismatic >> j) & 1u) == 1u) {
-        return jaxis[j];
-    }
-    return cross(jaxis[j], p - janchor[j]);
 }
 
 fn grid_value(o: Obstacle, n: u32) -> f32 {
@@ -200,92 +153,6 @@ fn obstacle_distance(o: Obstacle, p: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(o.r0.xyz * gl.x + o.r1.xyz * gl.y + o.r2.xyz * gl.z, d);
 }
 
-// Collision cost of the configuration last passed to fk(); with `gradient`, adds d(cost)/dq into
-// `grad`. Returns (cost, world clearance, self clearance). Callers pass `gradient` as a constant,
-// so the compiler drops the per-sphere gradient work from cost-only kernels.
-fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f32, gradient: bool) -> vec3<f32> {
-    let ns = P.n_spheres;
-    for (var s = 0u; s < ns; s++) {
-        let sp = spheres[s];
-        sc[s] = lrot[sp.link] * sp.c.xyz + lpos[sp.link];
-        if (gradient) {
-            gc[s] = vec3<f32>(0.0);
-        }
-    }
-    var cost = 0.0;
-    var wmin = FAR;
-    var smin = FAR;
-    let range = world_ranges[world];
-    for (var s = 0u; s < ns; s++) {
-        let r = spheres[s].c.w;
-        for (var k = 0u; k < range.y; k++) {
-            let dg = obstacle_distance(obstacles[range.x + k], sc[s]);
-            let d = dg.w - r;
-            wmin = min(wmin, d);
-            let pen = margin - d;
-            if (pen > 0.0) {
-                cost += w_world * pen * pen;
-                if (gradient) {
-                    gc[s] -= 2.0 * w_world * pen * dg.xyz;
-                }
-            }
-        }
-    }
-    // Link pairs whose bounding spheres are farther apart than the margin cannot add cost; their
-    // gap bounds their clearance from below.
-    let gate = max(self_margin, 0.0);
-    for (var l = 0u; l < P.n_link_pairs; l++) {
-        let lp = pairs[2u * l];
-        let span = pairs[2u * l + 1u];
-        let ba = links[lp.x].bound;
-        let bb = links[lp.y].bound;
-        let gap = length(lrot[lp.x] * ba.xyz + lpos[lp.x] - lrot[lp.y] * bb.xyz - lpos[lp.y]) - ba.w - bb.w;
-        if (gap > gate) {
-            smin = min(smin, gap);
-            continue;
-        }
-        for (var k = span.x; k < span.x + span.y; k++) {
-            let pr = pairs[k];
-            let a = spheres[pr.x];
-            let b = spheres[pr.y];
-            let diff = sc[pr.x] - sc[pr.y];
-            let dist = length(diff);
-            let d = dist - (a.c.w + a.self_buf) - (b.c.w + b.self_buf);
-            smin = min(smin, d);
-            let pen = self_margin - d;
-            if (pen > 0.0 && gradient) {
-                var u = vec3<f32>(1.0, 0.0, 0.0);
-                if (dist > 1e-9) {
-                    u = diff / dist;
-                }
-                let g = 2.0 * w_self * pen * u;
-                gc[pr.x] -= g;
-                gc[pr.y] += g;
-            }
-            if (pen > 0.0) {
-                cost += w_self * pen * pen;
-            }
-        }
-    }
-    if (!gradient) {
-        return vec3<f32>(cost, wmin, smin);
-    }
-    for (var s = 0u; s < ns; s++) {
-        let g = gc[s];
-        if (all(g == vec3<f32>(0.0))) {
-            continue;
-        }
-        // Every moving joint at or above the sphere's link, mimic joints adding into their leader.
-        var chain = links[spheres[s].link].chain;
-        while (chain != 0u) {
-            let i = firstTrailingBit(chain);
-            chain &= chain - 1u;
-            grad[links[i].dof] += links[i].axis.w * dot(g, dpoint(links[i].joint, sc[s]));
-        }
-    }
-    return vec3<f32>(cost, wmin, smin);
-}
-
 // Rotation vector and angle of r (column-major: r[col][row]).
 fn rot_log(r: mat3x3<f32>) -> vec4<f32> {
     let cos_t = clamp((r[0][0] + r[1][1] + r[2][2] - 1.0) * 0.5, -1.0, 1.0);
@@ -357,34 +224,10 @@ fn target_rot(item: u32) -> mat3x3<f32> {
 fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
     let n = P.n_dof;
     fk();
-    let ee = P.ee_link;
-    let ep = tp - lpos[ee];
-    let eo = rot_log(tr * transpose(lrot[ee])).xyz * P.rot_weight;
+    let ep = tp - ee_pos();
+    let eo = rot_log(tr * transpose(ee_rot())).xyz * P.rot_weight;
     let e = array<f32, 6>(ep.x, ep.y, ep.z, eo.x, eo.y, eo.z);
-    for (var k = 0u; k < JAC_LEN; k++) {
-        jac[k] = 0.0;
-    }
-    var chain = links[ee].chain;
-    while (chain != 0u) {
-        let i = firstTrailingBit(chain);
-        chain &= chain - 1u;
-        {
-            let j = links[i].dof;
-            let k = links[i].joint;
-            let m = links[i].axis.w;
-            let jp = m * dpoint(k, lpos[ee]);
-            var jo = vec3<f32>(0.0);
-            if (((prismatic >> k) & 1u) == 0u) {
-                jo = m * jaxis[k] * P.rot_weight;
-            }
-            jac[0u * MAX_DOF + j] += jp.x;
-            jac[1u * MAX_DOF + j] += jp.y;
-            jac[2u * MAX_DOF + j] += jp.z;
-            jac[3u * MAX_DOF + j] += jo.x;
-            jac[4u * MAX_DOF + j] += jo.y;
-            jac[5u * MAX_DOF + j] += jo.z;
-        }
-    }
+    ee_jacobian();
     for (var r = 0u; r < 6u; r++) {
         for (var c = 0u; c <= r; c++) {
             var s = 0.0;
@@ -488,9 +331,8 @@ fn ik_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
         qbuf[item * n + j] = q[j];
     }
     fk();
-    let ee = P.ee_link;
-    outbuf[item * 2u] = length(tp - lpos[ee]);
-    outbuf[item * 2u + 1u] = rot_log(tr * transpose(lrot[ee])).w;
+    outbuf[item * 2u] = length(tp - ee_pos());
+    outbuf[item * 2u + 1u] = rot_log(tr * transpose(ee_rot())).w;
 }
 
 // Uniform cubic B-spline weights of a span's four control points at u in [0, 1]. Mirrors spline.rs.

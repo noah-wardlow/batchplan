@@ -12,14 +12,12 @@ use crate::error::{self, Error, ensure_input, input};
 use crate::spheres::{self, SphereGeometry, SphereOptions};
 use crate::types::Pose;
 
-/// Limits shared with the GPU kernels (private per-invocation arrays are sized from these).
+/// Limits of the CPU kernels, whose per-configuration arrays are sized from these. The GPU kernels
+/// are written for each robot (`gpu::robot_wgsl`).
 pub(crate) const MAX_DOF: usize = 16;
 pub(crate) const MAX_LINKS: usize = 32;
 pub(crate) const MAX_SPHERES: usize = 128;
-/// Moving joints, actuated or mimic. The kernels keep per-joint state in arrays this small so
-/// they stay in registers.
-pub(crate) const MAX_JOINTS: usize = 16;
-// `Fk::prismatic` is a bitmask over links.
+// `Fk::prismatic` and `Link::chain` are bitmasks over links.
 const _: () = assert!(MAX_LINKS <= 32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -660,11 +658,6 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         link_index.insert(joint.child.clone(), links.len());
         links.push(Link { name: joint.child.clone(), parent: Some(parent), origin, joint: kind, chain });
     }
-    let moving_joints = links.iter().filter(|l| l.joint.actuation().is_some()).count();
-    ensure!(
-        moving_joints <= MAX_JOINTS,
-        "{moving_joints} moving joints (actuated and mimic) exceeds MAX_JOINTS={MAX_JOINTS}"
-    );
     if let Some(dof) =
         (0..dof_names.len()).find(|&d| lower[d] > upper[d] || !(lower[d].is_finite() && upper[d].is_finite()))
     {
