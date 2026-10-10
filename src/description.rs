@@ -45,8 +45,10 @@ pub(crate) struct JointDesc {
     pub(crate) axis: Vec3,
     pub(crate) lower: f32,
     pub(crate) upper: f32,
-    /// Infinite when the description gives none.
+    /// Velocity, acceleration and jerk limits; infinite when the description gives none.
     pub(crate) max_velocity: f32,
+    pub(crate) max_acceleration: f32,
+    pub(crate) max_jerk: f32,
     pub(crate) mimic: Option<Mimic>,
 }
 

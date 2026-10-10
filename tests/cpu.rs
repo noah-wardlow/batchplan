@@ -1,4 +1,4 @@
-//! CPU device checks: kinematics against published parameters, analytic gradients, IK, retiming.
+//! CPU device checks: kinematics against published parameters, obstacle distances, analytic gradients, IK.
 
 #[path = "../examples/common/mod.rs"]
 mod common;
@@ -6,7 +6,6 @@ mod common;
 use std::f64::consts::FRAC_PI_2;
 
 use batchplan::rng::Rng;
-use batchplan::timing::{RetimeOptions, retime};
 use batchplan::*;
 use glam::{DMat3, DVec3, Quat, Vec3};
 
@@ -193,19 +192,5 @@ fn ik_reaches_targets_from_collision_free_configurations() {
         if let Some(q) = result.best(p) {
             assert!((robot.ee_pose(q).position - problem.target.position).length() < o.position_tolerance);
         }
-    }
-}
-
-#[test]
-fn retime_keeps_endpoints_and_velocity_limits() {
-    let robot = panda();
-    let path: Vec<f32> = (0..10).flat_map(|t| robot.default_q().iter().map(move |q| q + 0.1 * t as f32)).collect();
-    let tt = retime(&robot, &path, &RetimeOptions { max_acceleration: 10.0, speed_scale: 1.0, dt: 0.01 });
-    assert!(tt.duration > 0.0);
-    let (first, last) = (&tt.positions[..7], &tt.positions[tt.positions.len() - 7..]);
-    assert!(first.iter().zip(&path[..7]).all(|(a, b)| (a - b).abs() < 1e-6));
-    assert!(last.iter().zip(&path[63..]).all(|(a, b)| (a - b).abs() < 1e-5));
-    for row in tt.velocities.chunks(7) {
-        assert!(row.iter().zip(robot.max_velocity()).all(|(v, max)| v.abs() <= max * 1.001));
     }
 }

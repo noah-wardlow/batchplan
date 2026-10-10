@@ -118,8 +118,8 @@ impl Device {
             paths.dof,
             self.robot().dof()
         );
-        ensure!(paths.waypoints >= 3, "paths need at least 3 waypoints");
-        check_batch(worlds, item_world, paths.positions.len(), paths.waypoints * paths.dof)?;
+        ensure!(paths.points >= 7, "paths need at least 7 control points");
+        check_batch(worlds, item_world, paths.positions.len(), paths.points * paths.dof)?;
         self.backend.trajopt(worlds, item_world, paths, o)
     }
 }
@@ -153,6 +153,6 @@ pub(crate) trait Backend: Send + Sync {
         q: &mut [f32],
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>>;
-    /// Optimizes each path in place, holding its first and last waypoints fixed.
+    /// Optimizes each path's control points in place, holding the three at each end fixed.
     fn trajopt(&self, worlds: &[World], item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()>;
 }

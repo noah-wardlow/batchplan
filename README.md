@@ -14,7 +14,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 |---|---|
 | AMD Radeon 8060S, Mesa RADV (Vulkan), Ubuntu 26.04 | Verified: all tests pass |
 | Apple M4 Pro (Metal), macOS | Verified: all tests pass |
-| NVIDIA Tesla T4, driver 595.91 (Vulkan), Ubuntu 24.04 (AWS g4dn.xlarge) | Verified: all tests pass |
+| NVIDIA Tesla T4, driver 595.91 (Vulkan), Ubuntu 24.04 (AWS g4dn.xlarge) | Verified at commit `950e06c` (the MVP's 14 tests); not re-run since |
 | Mesa llvmpipe (Vulkan on the CPU) | Verified: benchmark solves the same problems |
 | Other NVIDIA cards and Jetson, Intel, DX12 on Windows | Untested |
 
@@ -24,8 +24,8 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 |---|---|---|
 | `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.evaluate(..)` | Robot uploaded once. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices), so malformed input is an `Err` on both devices. |
 | `ik` | `solve_ik(&device, &worlds, &problems, &IkOptions)` | Many seeds per target. Damped least squares, with the collision gradient projected into the Jacobian null space. Success = pose tolerance + collision-free. The result keeps its problems; `ik.solved()` yields each one with its best configuration. |
-| `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal. Adam on collision + smoothness cost, then validation by dense interpolation. `result.solved()` yields each problem with its shortest valid path. |
-| `timing` | `retime(&robot, path, &RetimeOptions)` | Minimum-jerk (bell-shaped velocity) timing within the robot's velocity limits and an acceleration limit. |
+| `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal, each a uniform cubic B-spline that starts and ends at rest. Adam on smoothness plus collision cost sampled along the curve, then validation by sampling the curve densely. `result.solved()` yields each problem with its shortest valid path's control points. |
+| `timing` | `Trajectory::new(&robot, path, speed_scale)`, `trajectory.at(t, &mut state)`, `.sample(hz)`, `.check(&robot)` | Executable trajectories: timing that keeps position, velocity, acceleration and jerk within the robot's limits everywhere; allocation-free sampling for control loops; a check a safety layer can run. See [Executable trajectories](#executable-trajectories). |
 | `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
@@ -61,35 +61,33 @@ let problems: Vec<PlanProblem> = ik
     .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
     .collect();
 let result = plan(&device, &worlds, &problems, &PlanOptions::default())?;
-for s in result.solved() { /* s.problem, s.solution: [waypoints, dof] path */ }
+for s in result.solved() {
+    let trajectory = Trajectory::new(&robot, s.solution, 1.0); // as fast as the robot's limits allow
+    let mut state = JointState::new(robot.dof());
+    trajectory.at(0.5 * trajectory.duration(), &mut state); // position, velocity, acceleration
+}
 ```
 
 ## Results
 
 `bench -- 512` uses 512 random worlds, each a table plus 2–6 boxes, with one top-down grasp target per world:
 - **IK:** 32 seeds × 60 iterations per target.
-- **Planning:** 8 seeds × 32 waypoints × 200 Adam iterations from the default pose.
+- **Planning:** 8 seeds × 24 control points × 200 Adam iterations from the default pose, with collision checked at 3 points per span (63 per seed and iteration).
 
-Every device solves the same 484 of 512 IK targets and plans all 484, except the Framework's and the T4 machine's CPU runs, which each missed one plan.
+Every device solves the same 484 of 512 IK targets and plans all 484.
 
 | Machine | GPU | GPU end-to-end | CPU end-to-end | GPU speedup |
 |---|---|---|---|---|
-| Framework Desktop (Ryzen AI Max+ 395) | AMD Radeon 8060S, Mesa RADV (Vulkan) | **406 problems/s** | 84 problems/s (32 threads) | 4.8× |
-| MacBook (Apple M4 Pro) | Apple M4 Pro, 20 cores (Metal) | **233 problems/s** | 86 problems/s (14 threads) | 2.7× |
-| AWS g4dn.xlarge | NVIDIA Tesla T4, driver 595.91 (Vulkan) | **209 problems/s** | 4 problems/s (4 vCPUs) | 52× |
+| Framework Desktop (Ryzen AI Max+ 395) | AMD Radeon 8060S, Mesa RADV (Vulkan) | **214 problems/s** | 37 problems/s (32 threads) | 5.8× |
+| MacBook (Apple M4 Pro) | Apple M4 Pro, 20 cores (Metal) | **112 problems/s** | 32 problems/s (14 threads) | 3.5× |
 
-GPU time per phase:
+GPU time per phase on the Radeon: 0.065 s for IK (16,384 seeds) and 2.2 s for planning (3,872 seeds). The M4 Pro was measured while the machine ran other work. Checking collision along the curve instead of at 30 waypoints roughly doubled planning time compared with the MVP, which reached 406 problems/s on the Radeon and 209 on an NVIDIA T4 (commit `950e06c`). The benchmark below shows what that buys.
 
-| GPU | IK (16,384 seeds) | Planning (3,872 seeds) |
-|---|---|---|
-| Radeon 8060S | 0.062 s | 1.13 s |
-| M4 Pro | 0.080 s | 2.00 s |
-| Tesla T4 | 0.115 s | 2.20 s |
-| Mesa llvmpipe: the same WGSL on the Framework's CPU, 128 worlds | 0.134 s | 2.79 s (42 problems/s end-to-end) |
+Performance claims come from alternating runs of two builds on one machine. Two things those runs caught:
+- Hot functions the CPU backend calls across modules are marked `#[inline]`. Without it, the CPU path lost 15–20% whenever unrelated code changed how the compiler split the crate.
+- Per-joint kernel state must stay in arrays of `MAX_JOINTS` entries. Indexing it per link (32 entries) pushed it out of registers and cost 20% of GPU planning time on the Radeon.
 
-All three machines were measured at commit `950e06c` on otherwise idle machines. Alternating runs on the M4 Pro show the current code within noise of that commit on both GPU and CPU. One thing those runs caught: hot functions the CPU backend calls across modules are marked `#[inline]`. Without it, the CPU path lost 15–20% whenever unrelated code changed how the compiler split the crate.
-
-`datagen -- data/demo 512 20` produced 481 nominal and 932 recovery episodes from 512 worlds on the Framework, in about 3.3 s of planning. Peak joint speed reaches 0.99 of the limit, and recovery starts sit a median 0.35 rad off the nominal path.
+`datagen -- --lerobot data/lerobot_512 512 20` produced 481 nominal and 928 recovery episodes from 512 worlds on the M4 Pro, in about 12 s of planning.
 
 ## Robots
 
@@ -113,6 +111,19 @@ All three machines were measured at commit `950e06c` on otherwise idle machines.
 
 Test robots live in `assets/` with their licences ([assets/README.md](assets/README.md)): the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints).
 
+## Executable trajectories
+
+A planned path is a uniform cubic B-spline over its control points. The first three and last three equal the start and goal, so the path starts and ends at rest.
+- **Optimization and validation see the same curve.** Trajectory optimization samples collision cost along the spline (`samples_per_span` points per span), and validation samples it densely (`validate_substeps` per span).
+- **Timing bounds the whole curve, not samples of it.** On a B-spline with knot interval `h`:
+  - velocity is a quadratic B-spline over the control-point differences divided by `h`;
+  - acceleration is a linear one over the second differences divided by `h²`;
+  - jerk is constant per span: third differences divided by `h³`.
+
+  Each stays within its largest control value. `Trajectory::new` picks the smallest `h` that keeps every joint within its velocity, acceleration and jerk limits, then divides by the speed scale. Limits come from the robot description when it has them (URDF 1.2 `acceleration` and `jerk`), otherwise from `RobotOptions` (5 rad/s² and 50 rad/s³ by default).
+- **For control loops.** `trajectory.at(t, &mut state)` writes position, velocity and acceleration without allocating. A test with a counting allocator holds it to that. `sample(hz)` returns fixed-rate samples for datasets.
+- **For safety layers.** A `Trajectory` is plain serializable data, so a planner process can hand it to a controller process. `trajectory.check(&robot)` refuses one that is non-finite, not at rest at both ends, out of a joint range, or over any velocity, acceleration or jerk limit anywhere along its length.
+
 ## Benchmark
 
 `scripts/fetch_benchmark.sh` downloads the standard Panda problem sets that [robometrics](https://github.com/fishbotics/robometrics) packages as plain YAML (MIT): MotionBenchMaker's 800 problems in 8 sets and MπNets' 1,800 in 12, at a pinned commit with checksums. No ROS is involved. `cargo run --release --example benchmark` runs every set on the GPU and the CPU in two modes:
@@ -121,20 +132,30 @@ Test robots live in `assets/` with their licences ([assets/README.md](assets/REA
 
 A problem succeeds when the final `panda_hand` position is within 1 cm of the goal, every joint is within its limits, and an independent CPU check at 4× the planner's validation density finds no collision. That check uses the same sphere model the planner uses. "Free ends" counts the problems whose start and given IK goal are collision-free under that model, which caps the achievable success. Throughput runs each set as one batch; batch-1 latency runs IK and planning for one problem at a time (first 20 problems of each set).
 
-Baseline before the improvements below, all 2,600 problems:
+All 2,600 problems on the Framework Desktop, before (M0: straight-line paths, retimed) and after B-spline trajectories:
 
 | Device | Free ends | Plan | IK + plan | Batched | Batch-1 latency (mean / p75 / p98) |
 |---|---|---|---|---|---|
-| Radeon 8060S (Vulkan) | 98.1% | 81.2% | 74.2% | 196 problems/s | 162 / 197 / 503 ms |
-| M4 Pro (Metal) | 98.1% | 81.3% | 73.7% | 178 problems/s | 129 / 137 / 238 ms |
-| Ryzen AI Max+ 395 CPU (32 threads) | 98.1% | 81.3% | 74.2% | 31 problems/s | 88 / 104 / 251 ms |
-| M4 Pro CPU (14 threads) | 98.1% | 81.3% | 73.9% | 29 problems/s | 38 / 43 / 86 ms |
+| Radeon 8060S (Vulkan), M0 | 98.1% | 81.2% | 74.2% | 196 problems/s | 162 / 197 / 503 ms |
+| Radeon 8060S (Vulkan), now | 98.1% | **92.2%** | **87.5%** | 150 problems/s | 108 / 115 / 204 ms |
+| Ryzen AI Max+ 395 CPU (32 threads), M0 | 98.1% | 81.3% | 74.2% | 31 problems/s | 88 / 104 / 251 ms |
+| Ryzen AI Max+ 395 CPU (32 threads), now | 98.1% | **92.2%** | **87.5%** | 17 problems/s | 117 / 140 / 275 ms |
 
-`table_under_pick` (24%) and `cubby_task_oriented` (37–40%) are the weakest sets. GPU latency is dominated by per-call setup and readback, which is why the CPU wins at batch size 1. Retimed paths keep unbounded accelerations at waypoint corners: the median peak jerk, by finite differences at 100 Hz, is about 2,000 rad/s³.
+The M4 Pro's GPU and CPU solve the same problems.
+- **The hardest sets gain most:**
+  - `table_under_pick`: 23% → 62%;
+  - `cubby_task_oriented`: 43% → 87% planning only;
+  - `dresser_task_oriented`: 63% → 86% planning only.
+- **Motion quality:**
+  - Median peak acceleration (finite differences at 100 Hz, median over sets) falls from 20 rad/s² to 4.9 rad/s², within the 5 rad/s² limit.
+  - Median peak jerk falls from about 2,000 rad/s³ to 41 rad/s³, within the 50 rad/s³ limit.
+  - Median motion time is unchanged at 2.55 s.
+
+GPU latency at batch size 1 is dominated by per-call setup and readback, which is why the CPU is competitive there.
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 32 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 37 tests; `--features lerobot` adds 2 export tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory gradients:** with a huge Adam epsilon, one optimizer step is plain gradient descent, so the step recovers each device's trajectory gradient. The smoothness part matches finite differences of the cost on every device. GPU and CPU gradients agree element-wise to 2e-3 of their size. Planting a swapped weight in the GPU parameter packing makes both tests fail.
@@ -148,6 +169,11 @@ Baseline before the improvements below, all 2,600 problems:
 - **CPU IK and retiming:** IK solves targets taken from collision-free configurations; retiming respects velocity limits and keeps the endpoints.
 - **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
 - **Obstacle distances:** every obstacle kind returns unit gradients that match finite differences, stepping back along the gradient lands on the surface, and cylinder and capsule distances match closed forms. The GPU agrees with the CPU for each kind.
+- **Trajectories:**
+  - Planned trajectories stay within velocity, acceleration and jerk limits along their whole length, reach the binding limit, and start and end exactly at rest.
+  - The analytic velocity and acceleration match finite differences.
+  - `at` makes no allocations. `check` refuses a NaN, running too fast, a jerk spike, a moving start, leaving a joint range and the wrong joint count.
+  - The trajectory gradient (smoothness plus collision sampled along the spline) matches finite differences of the full cost on every device. Planting a wrong basis weight in either device's gather, a wrong jerk exponent in the timing, or an allocation in `at` fails a test.
 - **Robots from URDF:**
   - The 2F-85's link poses match an independent composition of its URDF with mimic joints applied. Its collision gradient matches finite differences, and the GPU agrees with the CPU. Planting a dropped multiplier in the CPU kinematics, the CPU gradient or the GPU gradient fails a test.
   - Mimic limits intersect into the leader's range and velocity.
@@ -162,7 +188,7 @@ Baseline before the improvements below, all 2,600 problems:
 1. **IK:** solve each goal pose with many seeds; keep the collision-free solution with the most clearance.
 2. **Plan nominal reaches:** start from the default pose plus joint noise (a collision-free sample), and plan to the IK goal.
 3. **Plan recoveries:** perturb each solved path partway along it (20–80% by default), keep the collision-free perturbed states, and replan from them to the same goal. These are the recovery examples that raw planner data lacks.
-4. **Retime:** apply a minimum-jerk (bell-shaped velocity) profile with a randomized speed scale, sampled at a fixed `dt`.
+4. **Time:** each trajectory runs at a random fraction (60–100% by default) of the fastest timing within the robot's limits, sampled at a fixed `dt`.
 
 Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, goal pose and timed trajectory. Two exporters write them, `npy::export` and `lerobot::export`. `examples/datagen.rs` uses one or the other. Generated from the same worlds, the two formats hold identical trajectories, labels, worlds and goals.
 
@@ -176,7 +202,7 @@ Each `Demonstration` holds its origin (nominal, or recovery with its parent and 
 | `parent.npy` | `[episodes]` int32: for recoveries, the row of the nominal episode they branch from; -1 otherwise |
 | `world.npy`, `worlds.json` | world index per episode and the obstacles of every world |
 | `goal_pose.npy` | `[episodes, 7]` target of the `ee_link` frame: xyz + quaternion xyzw |
-| `meta.json` | `dt`, joint names, velocity and acceleration limits, nominal/recovery counts, device |
+| `meta.json` | `dt`, joint names, velocity, acceleration and jerk limits, nominal/recovery counts, device |
 
 ### LeRobot v3.0 (optional bridge)
 
@@ -192,21 +218,22 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 `meta/batchplan.json` adds the worlds, the environment-state layout and each episode's origin. There are no camera features: the data is state-only until rendering is added.
 
-`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). On the 512-world export (1,413 episodes, 57,650 frames), every check passed:
+`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). On the 512-world export (1,409 episodes, 69,740 frames), every check passed:
 - **Loading:** episodes, frames and the task string load as written.
 - **Episodes:** boundaries are correct, and `action` is the next frame's state.
 - **Labels and stats:** recovery labels match `meta/batchplan.json`, and the normalization stats match the data.
 - **Action chunks:** chunks are padded correctly at episode ends.
 
-`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. On the same export, a 50-step CPU run cut the loss from 46.7 to 5.8.
+`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. On the same export, a 50-step CPU run cut the loss from 45.6 (step 10) to 5.7.
 
 ## Limits of the MVP
 
 - **Geometry.** The robot is modeled as spheres only, and obstacles as boxes, spheres, cylinders and capsules. There are no meshes, point clouds or depth-derived distance fields yet.
 - **Kinematics.** The tree is limited to 16 actuated joints, 16 moving joints, 32 links and 128 spheres. Floating and planar joints aren't supported.
 - **Long motions.** Trajectory optimization alone does not escape seeds that sweep through obstacles. Goals across the UR5e's full ±2π joint ranges in a tabletop world fail this way.
-- **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search. Validation follows the linear interpolation between waypoints. Retiming does not bound accelerations at waypoint corners.
-- **Kernel performance.** Kernels run one invocation per configuration (or per waypoint), with no shared memory or subgroup work. Buffers are allocated per call. This leaves performance on the table.
+- **Optimizer.** Trajectory optimization uses fixed-step Adam with no line search.
+- **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.
+- **Kernel performance.** Kernels run one invocation per configuration (or per collision sample, or per control point), with no shared memory or subgroup work. Buffers are allocated per call. This leaves performance on the table.
 - **Training data.** Demonstrations are state-only reaches with the gripper held open, and every episode shares one task string. The LeRobot export writes all episode metadata to a single file, which caps it at roughly 100k episodes.
 
 ## License

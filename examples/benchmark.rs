@@ -2,6 +2,7 @@
 //! Fetch them first with `scripts/fetch_benchmark.sh`.
 //!
 //! cargo run --release --example benchmark -- [data_dir=data/robometrics] [--latency N=20] [--device gpu|cpu|all]
+//!     [--points N] [--samples K]   (B-spline control points, collision samples per span)
 //!
 //! For every set and device it reports two modes:
 //! - **plan**: plan from the start to the set's first IK solution (planning only);
@@ -20,7 +21,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use batchplan::timing::{RetimeOptions, retime};
 use batchplan::*;
 use glam::{Quat, Vec3};
 use serde::Deserialize;
@@ -102,15 +102,23 @@ struct Args {
     data: PathBuf,
     latency: usize,
     device: String,
+    plan: PlanOptions,
 }
 
 fn args() -> Result<Args> {
-    let mut a = Args { data: PathBuf::from("data/robometrics"), latency: 20, device: "all".into() };
+    let mut a = Args {
+        data: PathBuf::from("data/robometrics"),
+        latency: 20,
+        device: "all".into(),
+        plan: PlanOptions::default(),
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--latency" => a.latency = it.next().context("--latency N")?.parse()?,
             "--device" => a.device = it.next().context("--device gpu|cpu|all")?,
+            "--points" => a.plan.control_points = it.next().context("--points N")?.parse()?,
+            "--samples" => a.plan.samples_per_span = it.next().context("--samples K")?.parse()?,
             s if s.starts_with("--") => bail!("unknown flag {s}"),
             s => a.data = PathBuf::from(s),
         }
@@ -129,40 +137,39 @@ struct Outcome {
 }
 
 /// Successful problems under the independent check, plus path metrics of the successful paths.
-fn score(robot: &Robot, cpu: &Device, worlds: &[World], problems: &[Problem], result: &PlanResult) -> Result<Outcome> {
+fn score(
+    robot: &Robot,
+    cpu: &Device,
+    worlds: &[World],
+    problems: &[Problem],
+    result: &PlanResult,
+    o: &PlanOptions,
+) -> Result<Outcome> {
     let n = robot.dof();
-    let substeps = PlanOptions::default().validate_substeps * 4;
+    let per_span = (o.validate_substeps * 4) as f32;
     let mut out = Outcome::default();
     for s in result.solved() {
-        let path = s.solution;
-        let waypoints = path.len() / n;
-        let mut dense = vec![];
-        for t in 0..waypoints - 1 {
-            for k in 0..substeps {
-                let a = k as f32 / substeps as f32;
-                dense.extend((0..n).map(|j| path[t * n + j] + a * (path[(t + 1) * n + j] - path[t * n + j])));
-            }
-        }
-        dense.extend_from_slice(&path[(waypoints - 1) * n..]);
+        // Check the timed trajectory a controller would run, sampled 4x denser per span than the
+        // planner validates.
+        let trajectory = Trajectory::new(robot, s.solution, 1.0);
+        let dense = trajectory.sample(per_span / trajectory.knot_interval).positions;
         let items = dense.len() / n;
         let eval = cpu.evaluate(worlds, &vec![s.problem.world; items], &dense, &CollisionWeights::NONE)?;
         let collision_free = (0..items).all(|i| eval.collision_free(i));
-        let within_limits =
-            path.iter().enumerate().all(|(i, &q)| q >= robot.lower()[i % n] && q <= robot.upper()[i % n]);
+        let within_limits = trajectory.check(robot).is_ok();
         let goal = problems[s.problem.world as usize].hand_goal();
-        let hand = robot.link_pose(&path[(waypoints - 1) * n..], "panda_hand").expect("panda_hand");
+        let hand = robot.link_pose(&dense[(items - 1) * n..], "panda_hand").expect("panda_hand");
         let reached = (hand.position - goal.position).length() < 0.01;
         if !(collision_free && within_limits && reached) {
             continue;
         }
         out.success += 1;
+        let q = |i: usize| &dense[i * n..(i + 1) * n];
         out.path_length.push(
-            (0..waypoints - 1)
-                .map(|t| (0..n).map(|j| (path[(t + 1) * n + j] - path[t * n + j]).powi(2)).sum::<f32>().sqrt())
-                .sum(),
+            (0..items - 1).map(|i| q(i).iter().zip(q(i + 1)).map(|(a, b)| (b - a).powi(2)).sum::<f32>().sqrt()).sum(),
         );
         let dt = 0.01;
-        let traj = retime(robot, path, &RetimeOptions { dt, ..Default::default() });
+        let traj = trajectory.sample(1.0 / dt);
         out.motion_time.push(traj.duration);
         let v = &traj.velocities;
         let acc: Vec<f32> = (0..v.len().saturating_sub(n)).map(|i| (v[i + n] - v[i]) / dt).collect();
@@ -192,7 +199,7 @@ fn ik_problems(problems: &[Problem]) -> Vec<IkProblem> {
 }
 
 /// IK for every goal, then a plan from each start to its best IK solution.
-fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem]) -> Result<PlanResult> {
+fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem], o: &PlanOptions) -> Result<PlanResult> {
     let ik = solve_ik(device, worlds, &ik_problems(problems), &IkOptions::default())?;
     let plans: Vec<PlanProblem> = ik
         .solved()
@@ -202,7 +209,7 @@ fn ik_and_plan(device: &Device, worlds: &[World], problems: &[Problem]) -> Resul
             goal: s.solution.to_vec(),
         })
         .collect();
-    plan(device, worlds, &plans, &PlanOptions::default())
+    plan(device, worlds, &plans, o)
 }
 
 fn main() -> Result<()> {
@@ -262,14 +269,18 @@ fn main() -> Result<()> {
                 .map(|(i, p)| PlanProblem { world: i as u32, start: p.start.clone(), goal: p.goal_ik[0].clone() })
                 .collect();
             let t = Instant::now();
-            let planned = plan(device, &worlds, &to_ik, &PlanOptions::default())?;
-            let plan_only =
-                Outcome { seconds: t.elapsed().as_secs_f64(), ..score(&robot, &cpu, &worlds, problems, &planned)? };
+            let planned = plan(device, &worlds, &to_ik, &args.plan)?;
+            let plan_only = Outcome {
+                seconds: t.elapsed().as_secs_f64(),
+                ..score(&robot, &cpu, &worlds, problems, &planned, &args.plan)?
+            };
 
             let t = Instant::now();
-            let full_result = ik_and_plan(device, &worlds, problems)?;
-            let full =
-                Outcome { seconds: t.elapsed().as_secs_f64(), ..score(&robot, &cpu, &worlds, problems, &full_result)? };
+            let full_result = ik_and_plan(device, &worlds, problems, &args.plan)?;
+            let full = Outcome {
+                seconds: t.elapsed().as_secs_f64(),
+                ..score(&robot, &cpu, &worlds, problems, &full_result, &args.plan)?
+            };
 
             // Problems whose start and given IK goal are collision-free under this robot model.
             let ends: Vec<f32> = problems.iter().flat_map(|p| p.start.iter().chain(&p.goal_ik[0]).copied()).collect();
@@ -282,7 +293,7 @@ fn main() -> Result<()> {
             let mut latency = vec![];
             for i in 0..args.latency.min(problems.len()) {
                 let t = Instant::now();
-                ik_and_plan(device, &worlds[i..i + 1], &problems[i..i + 1])?;
+                ik_and_plan(device, &worlds[i..i + 1], &problems[i..i + 1], &args.plan)?;
                 latency.push(t.elapsed().as_secs_f64() * 1e3);
             }
             all_latency.extend(&latency);

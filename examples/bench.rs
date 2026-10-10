@@ -36,8 +36,8 @@ fn main() -> Result<()> {
     let ik_opts = IkOptions::default();
     let plan_opts = PlanOptions::default();
     println!(
-        "{count} worlds (table + 2-6 boxes), IK {} seeds x {} iters, trajopt {} seeds x {} waypoints x {} iters\n",
-        ik_opts.seeds, ik_opts.iterations, plan_opts.seeds, plan_opts.waypoints, plan_opts.iterations
+        "{count} worlds (table + 2-6 boxes), IK {} seeds x {} iters, trajopt {} seeds x {} control points x {} iters\n",
+        ik_opts.seeds, ik_opts.iterations, plan_opts.seeds, plan_opts.control_points, plan_opts.iterations
     );
     for device in &devices {
         // Warm up (pipeline compilation, thread pool).

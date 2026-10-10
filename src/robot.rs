@@ -118,7 +118,7 @@ impl CollisionModel {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RobotOptions {
     /// Root of the planned tree; defaults to the description's root link.
     pub base_link: Option<String>,
@@ -137,6 +137,27 @@ pub struct RobotOptions {
     pub spheres: SphereOptions,
     /// A MoveIt SRDF whose disabled collision pairs are added to the collision model's.
     pub srdf: Option<PathBuf>,
+    /// Acceleration limit (rad/s² or m/s²) for joints whose description gives none.
+    pub max_acceleration: f32,
+    /// Jerk limit (rad/s³ or m/s³) for joints whose description gives none.
+    pub max_jerk: f32,
+}
+
+impl Default for RobotOptions {
+    fn default() -> Self {
+        Self {
+            base_link: None,
+            ee_link: None,
+            default_q: None,
+            lock_joints: HashMap::new(),
+            package_dirs: vec![],
+            collision_model: None,
+            spheres: SphereOptions::default(),
+            srdf: None,
+            max_acceleration: 5.0,
+            max_jerk: 50.0,
+        }
+    }
 }
 
 /// A robot's kinematic tree and collision-sphere model. Immutable once loaded.
@@ -148,6 +169,8 @@ pub struct Robot {
     pub(crate) lower: Vec<f32>,
     pub(crate) upper: Vec<f32>,
     pub(crate) max_velocity: Vec<f32>,
+    pub(crate) max_acceleration: Vec<f32>,
+    pub(crate) max_jerk: Vec<f32>,
     pub(crate) spheres: Vec<CollisionSphere>,
     /// Sphere index pairs checked for self-collision.
     pub(crate) self_pairs: Vec<[u32; 2]>,
@@ -295,6 +318,14 @@ impl Robot {
         &self.max_velocity
     }
 
+    pub fn max_acceleration(&self) -> &[f32] {
+        &self.max_acceleration
+    }
+
+    pub fn max_jerk(&self) -> &[f32] {
+        &self.max_jerk
+    }
+
     pub fn default_q(&self) -> &[f32] {
         &self.default_q
     }
@@ -423,7 +454,9 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
     }
     let moving = |j: usize| desc.joints[j].kind != JointType::Fixed;
     let mut dof_of: HashMap<usize, usize> = HashMap::new();
-    let (mut dof_names, mut lower, mut upper, mut max_velocity) = (vec![], vec![], vec![], vec![]);
+    let (mut dof_names, mut lower, mut upper) = (vec![], vec![], vec![]);
+    let (mut max_velocity, mut max_acceleration, mut max_jerk) = (vec![], vec![], vec![]);
+    let or_default = |v: f32, default: f32| if v.is_finite() { v } else { default };
     for &j in order.iter().filter(|&&j| moving(j) && desc.joints[j].mimic.is_none()) {
         let joint = &desc.joints[j];
         if o.lock_joints.contains_key(&joint.name) {
@@ -438,6 +471,8 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         lower.push(lo);
         upper.push(hi);
         max_velocity.push(joint.max_velocity);
+        max_acceleration.push(or_default(joint.max_acceleration, o.max_acceleration));
+        max_jerk.push(or_default(joint.max_jerk, o.max_jerk));
     }
     ensure!(dof_names.len() <= MAX_DOF, "{} actuated joints exceeds MAX_DOF={MAX_DOF}", dof_names.len());
 
@@ -475,7 +510,10 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
                         lower[dof] = lower[dof].max(a.min(b));
                         upper[dof] = upper[dof].min(a.max(b));
                     }
+                    // Its derivatives scale by the multiplier too.
                     max_velocity[dof] = max_velocity[dof].min(joint.max_velocity / multiplier.abs());
+                    max_acceleration[dof] = max_acceleration[dof].min(joint.max_acceleration / multiplier.abs());
+                    max_jerk[dof] = max_jerk[dof].min(joint.max_jerk / multiplier.abs());
                 }
                 let axis = joint.axis;
                 if prismatic {
@@ -541,6 +579,8 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         lower,
         upper,
         max_velocity,
+        max_acceleration,
+        max_jerk,
         spheres: vec![],
         self_pairs: vec![],
         ee_link,

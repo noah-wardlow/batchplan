@@ -1,18 +1,24 @@
-//! Batched trajectory optimization: many seeds per start/goal pair, each a fixed-length waypoint
-//! path optimized with Adam on collision + smoothness cost, then validated by dense interpolation.
+//! Batched trajectory optimization: many seeds per start/goal pair, each a uniform cubic B-spline
+//! whose control points Adam optimizes on smoothness plus collision cost sampled along the curve,
+//! then validated by sampling the curve densely. The first three and last three control points
+//! are pinned to the start and goal, so every path starts and ends at rest.
 
 use anyhow::{Result, ensure};
 
 use crate::device::{CollisionWeights, Device};
 use crate::rng::Rng;
 use crate::robot::Robot;
+use crate::spline;
 use crate::types::{JointPaths, Solved};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanOptions {
     pub seeds: usize,
-    pub waypoints: usize,
+    /// B-spline control points per path, including the three pinned at each end (at least 7).
+    pub control_points: usize,
+    /// Collision samples per span during optimization.
+    pub samples_per_span: usize,
     pub iterations: u32,
     pub learning_rate: f32,
     pub lr_decay: f32,
@@ -20,12 +26,12 @@ pub struct PlanOptions {
     pub beta2: f32,
     /// Adam's denominator offset; gradients far below it take proportionally small steps.
     pub adam_epsilon: f32,
-    /// Weight of squared waypoint accelerations.
+    /// Weight of squared second differences of control points.
     pub w_acc: f32,
-    /// Weight of squared waypoint velocities (path length).
+    /// Weight of squared differences of control points (path length).
     pub w_vel: f32,
     pub collision: CollisionWeights,
-    /// Linear interpolation samples per segment used to validate the result.
+    /// Samples per span used to validate the result.
     pub validate_substeps: usize,
     pub rng_seed: u64,
 }
@@ -34,7 +40,8 @@ impl Default for PlanOptions {
     fn default() -> Self {
         Self {
             seeds: 8,
-            waypoints: 32,
+            control_points: 24,
+            samples_per_span: 3,
             iterations: 200,
             learning_rate: 0.03,
             lr_decay: 0.99,
@@ -70,9 +77,10 @@ pub struct PlanProblem {
 pub struct PlanResult {
     pub problems: Vec<PlanProblem>,
     pub seeds: usize,
+    /// B-spline control points of every seed's path.
     pub paths: JointPaths,
     pub valid: Vec<bool>,
-    /// Minimum of world and self clearance along the densely interpolated path.
+    /// Minimum of world and self clearance along the densely sampled path.
     pub min_clearance: Vec<f32>,
     /// Joint-space path length.
     pub length: Vec<f32>,
@@ -87,7 +95,8 @@ impl PlanResult {
             .map(|i| self.paths.path(i))
     }
 
-    /// Every problem with a valid seed, with its best path (`[waypoints, dof]`).
+    /// Every problem with a valid seed, with its best path's control points (`[points, dof]`);
+    /// [`crate::timing::Trajectory::new`] times one for execution.
     pub fn solved(&self) -> impl Iterator<Item = Solved<'_, PlanProblem>> {
         self.problems
             .iter()
@@ -99,11 +108,12 @@ impl PlanResult {
 pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &PlanOptions) -> Result<PlanResult> {
     let robot = device.robot();
     let n = robot.dof();
-    let t_count = o.waypoints;
-    ensure!(t_count >= 3 && o.seeds > 0, "need at least 3 waypoints and one seed");
+    let points = o.control_points;
+    ensure!(points >= 7 && o.seeds > 0, "need at least 7 control points and one seed");
+    ensure!(o.samples_per_span > 0, "need at least one collision sample per span");
     let items = problems.len() * o.seeds;
     let mut rng = Rng::new(o.rng_seed);
-    let mut paths = JointPaths::zeros(items, t_count, n);
+    let mut paths = JointPaths::zeros(items, points, n);
     let mut item_world = Vec::with_capacity(items);
     for (pi, p) in problems.iter().enumerate() {
         ensure!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
@@ -114,22 +124,14 @@ pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &Pla
     }
     device.trajopt(worlds, &item_world, &mut paths, o)?;
 
-    // Validate along the joint-space polyline (the path the retimer follows).
+    // Validate along the curve itself.
     let k = o.validate_substeps.max(1);
-    let samples = (t_count - 1) * k + 1;
+    let samples = (points - 3) * k + 1;
     let mut dense = Vec::with_capacity(items * samples * n);
-    let mut dense_world = Vec::with_capacity(items * samples);
-    for (item, &world) in item_world.iter().enumerate() {
-        let tr = paths.path(item);
-        for t in 0..t_count - 1 {
-            for s in 0..k {
-                let a = s as f32 / k as f32;
-                dense.extend((0..n).map(|j| tr[t * n + j] + a * (tr[(t + 1) * n + j] - tr[t * n + j])));
-            }
-        }
-        dense.extend_from_slice(&tr[(t_count - 1) * n..]);
-        dense_world.extend(std::iter::repeat_n(world, samples));
+    for item in 0..items {
+        dense.extend(spline::dense(paths.path(item), n, k));
     }
+    let dense_world: Vec<u32> = item_world.iter().flat_map(|&w| std::iter::repeat_n(w, samples)).collect();
     let eval = device.evaluate(worlds, &dense_world, &dense, &CollisionWeights::NONE)?;
     let min_clearance: Vec<f32> = (0..items)
         .map(|item| {
@@ -140,9 +142,10 @@ pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &Pla
         .collect();
     let length = (0..items)
         .map(|item| {
-            let tr = paths.path(item);
-            (0..t_count - 1)
-                .map(|t| (0..n).map(|j| (tr[(t + 1) * n + j] - tr[t * n + j]).powi(2)).sum::<f32>().sqrt())
+            let q = &dense[item * samples * n..(item + 1) * samples * n];
+            q.chunks(n)
+                .zip(q.chunks(n).skip(1))
+                .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (y - x).powi(2)).sum::<f32>().sqrt())
                 .sum()
         })
         .collect();
@@ -156,7 +159,8 @@ pub fn plan(device: &Device, worlds: &[World], problems: &[PlanProblem], o: &Pla
     })
 }
 
-/// Seed 0 is the straight line; other seeds bend through a random via point.
+/// Control points of seed 0 lie on the straight line; other seeds bend through a random via point.
+/// The first three and last three are the start and goal.
 fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], seed: usize, rng: &mut Rng, out: &mut [f32]) {
     let n = start.len();
     let t_count = out.len() / n;
@@ -173,8 +177,9 @@ fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], seed: usize, rng: &mut 
             .collect();
         (u, via)
     };
-    for t in 1..t_count - 1 {
-        let u = t as f32 / (t_count - 1) as f32;
+    // Free control points 3..t_count - 3 spread evenly along the seed between the pinned ends.
+    for t in 3..t_count - 3 {
+        let u = (t - 2) as f32 / (t_count - 5) as f32;
         for j in 0..n {
             out[t * n + j] = if u <= via_u {
                 start[j] + (via[j] - start[j]) * (u / via_u)
@@ -183,7 +188,9 @@ fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], seed: usize, rng: &mut 
             };
         }
     }
-    // Endpoints are copied, not interpolated, so they stay bit-exact.
-    out[..n].copy_from_slice(start);
-    out[(t_count - 1) * n..].copy_from_slice(goal);
+    // Copied, not interpolated, so they stay bit-exact.
+    for t in 0..3 {
+        out[t * n..(t + 1) * n].copy_from_slice(start);
+        out[(t_count - 1 - t) * n..(t_count - t) * n].copy_from_slice(goal);
+    }
 }

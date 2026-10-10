@@ -17,9 +17,9 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 32 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 37 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 2 export tests
-cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot)
+cargo test --release --test gpu trajopt_gradients_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot]       # keep at zero warnings, both configurations
 cargo doc --no-deps --features lerobot                          # keep at zero warnings
@@ -58,7 +58,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 ## Architecture that spans files
 
 **CPU/GPU twin.**
-- `src/kernels.wgsl` and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, `traj_grad`, and the Adam update.
+- `src/kernels.wgsl` and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_samples`/`traj_sample_grad`, `traj_grad`) and the Adam update. `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors.
 - `cpu.rs` keeps index loops on purpose so the two read side by side.
 - Any change to the math lands in both files in the same change. The parity tests in `tests/gpu.rs` and `tests/device.rs` catch drift.
 
@@ -77,13 +77,20 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - Bind group 0 has 11 storage buffers. `unmet_limits` skips adapters that can't provide them, and the error names each rejected adapter and what it lacks.
 - Storage buffers are created by `storage::<T>()`, padded to at least one shader element. Empty obstacle lists previously crashed this way.
 - Work is split per queue submission (`EVAL_CHUNK`, `IK_ITERS_PER_SUBMIT`, `TRAJ_ITERS_PER_SUBMIT`) to stay under driver watchdogs.
-- Trajopt alternates `traj_grad` and `traj_update` dispatches. Each iteration's Adam schedule comes from a dynamic-offset uniform (`GpuIter`).
+- Each trajopt iteration dispatches three passes:
+  1. `traj_samples`: the collision gradient at every sample along every spline;
+  2. `traj_grad`: per free control point, basis-weighted sample gradients plus smoothness;
+  3. `traj_update`: Adam.
+
+  `aux` holds [sample gradients | gradient | Adam m | Adam v]. Each iteration's Adam schedule comes from a dynamic-offset uniform (`GpuIter`).
 
 **Planning flow.** In `trajopt::plan`:
-1. Seed the paths: seed 0 is a straight line, the others bend through random via points.
-2. Run the backend's trajopt.
-3. Validate densely: interpolate each path (`validate_substeps`) and run `device.evaluate`.
+1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Seed 0's free points lie on the straight line; the others bend through random via points.
+2. Run the backend's trajopt on the free control points.
+3. Validate by sampling each spline densely (`validate_substeps` per span) and running `device.evaluate`.
 4. `best()` picks the shortest valid seed.
+
+`timing::Trajectory` times a path from bounds on its control-point differences (velocity, acceleration, jerk), so limits hold along the whole curve; `check` re-verifies them.
 
 **Data pipeline.**
 - `datagen::demonstrations` runs:
@@ -91,7 +98,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   2. Nominal plans from noisy, collision-free starts.
   3. `recovery_problems`: perturb solved paths and keep collision-free starts.
   4. Replanning from those starts.
-  5. `timing::retime`: minimum-jerk timing with randomized speed.
+  5. `Trajectory::new(..).sample(1 / dt)`: timing within the robot's limits at a random speed scale.
 - `Origin::parent()` encodes recovery links for both exporters.
 - `lerobot.rs` writes the v3.0 layout natively:
   - data, episode and task parquet; `tasks.parquet` carries pandas index metadata;

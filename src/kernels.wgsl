@@ -14,7 +14,7 @@
 // IK targets: 4 vec4 per item (position, rotation columns).
 @group(0) @binding(8) var<storage, read> targets: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> qbuf: array<f32>;
-// trajopt: [grad | adam m | adam v], each the size of qbuf.
+// trajopt: [collision gradient per sample | gradient | Adam m | Adam v] (see sample_grad_len).
 @group(0) @binding(10) var<storage, read_write> aux: array<f32>;
 @group(0) @binding(11) var<storage, read_write> outbuf: array<f32>;
 @group(1) @binding(0) var<uniform> IT: Iter;
@@ -421,28 +421,82 @@ fn ik_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
     outbuf[item * 2u + 1u] = rot_log(tr * transpose(lrot[ee])).w;
 }
 
-// One invocation per interior waypoint: writes the trajectory-cost gradient into aux[0..N).
+// Uniform cubic B-spline weights of a span's four control points at u in [0, 1]. Mirrors spline.rs.
+fn basis(u: f32) -> vec4<f32> {
+    let v = 1.0 - u;
+    let u2 = u * u;
+    let u3 = u2 * u;
+    return vec4<f32>(v * v * v, 3.0 * u3 - 6.0 * u2 + 4.0, -3.0 * u3 + 3.0 * u2 + 3.0 * u + 1.0, u3) / 6.0;
+}
+
+// Collision sample s of a span sits at u = (s + 0.5) / P.samples.
+fn sample_u(s: u32) -> f32 {
+    return (f32(s) + 0.5) / f32(P.samples);
+}
+
+// The trajopt part of aux: [collision gradient per sample | gradient | Adam m | Adam v].
+fn sample_grad_len() -> u32 {
+    return P.n_items * (P.points - 3u) * P.samples * P.n_dof;
+}
+
+// One invocation per collision sample: writes d(collision cost)/dq at that point of the curve.
 @compute @workgroup_size(64)
-fn traj_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+fn traj_samples(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let idx = item_index(gid, nwg);
-    let tn = P.waypoints;
-    let inner = tn - 2u;
-    if (idx >= P.n_items * inner) {
+    let per_item = (P.points - 3u) * P.samples;
+    if (idx >= P.n_items * per_item) {
         return;
     }
-    let item = idx / inner;
-    let t = idx % inner + 1u;
+    let item = idx / per_item;
+    let span = (idx % per_item) / P.samples;
+    let w = basis(sample_u(idx % P.samples));
     let n = P.n_dof;
-    let base = (item * tn + t) * n;
+    let base = (item * P.points + span) * n;
     for (var j = 0u; j < n; j++) {
-        q[j] = qbuf[base + j];
+        q[j] = w.x * qbuf[base + j] + w.y * qbuf[base + n + j] + w.z * qbuf[base + 2u * n + j] + w.w * qbuf[base + 3u * n + j];
         grad[j] = 0.0;
     }
     fk();
     collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin);
     for (var j = 0u; j < n; j++) {
+        aux[idx * n + j] = grad[j];
+    }
+}
+
+// One invocation per free control point: the collision gradients of the samples it shapes, each
+// weighted by its basis value there, plus smoothness on the control points.
+@compute @workgroup_size(64)
+fn traj_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = item_index(gid, nwg);
+    let tn = P.points;
+    let free = tn - 6u;
+    if (idx >= P.n_items * free) {
+        return;
+    }
+    let item = idx / free;
+    let t = idx % free + 3u;
+    let n = P.n_dof;
+    let spans = tn - 3u;
+    let base = (item * tn + t) * n;
+    for (var j = 0u; j < n; j++) {
+        grad[j] = 0.0;
+    }
+    // Control point t is point i of span t - i.
+    for (var i = 0u; i < 4u; i++) {
+        if (t < i || t - i >= spans) {
+            continue;
+        }
+        for (var s = 0u; s < P.samples; s++) {
+            let w = basis(sample_u(s))[i];
+            let g = ((item * spans + t - i) * P.samples + s) * n;
+            for (var j = 0u; j < n; j++) {
+                grad[j] += w * aux[g + j];
+            }
+        }
+    }
+    for (var j = 0u; j < n; j++) {
         let qm = qbuf[base - n + j];
-        let q0 = q[j];
+        let q0 = qbuf[base + j];
         let qp = qbuf[base + n + j];
         var g = 2.0 * P.w_vel * (2.0 * q0 - qm - qp);
         g += 2.0 * P.w_acc * -2.0 * (qp - 2.0 * q0 + qm);
@@ -452,31 +506,32 @@ fn traj_grad(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         if (t + 2u < tn) {
             g += 2.0 * P.w_acc * (qbuf[base + 2u * n + j] - 2.0 * qp + q0);
         }
-        aux[base + j] = grad[j] + g;
+        aux[sample_grad_len() + base + j] = grad[j] + g;
     }
 }
 
-// One invocation per interior waypoint: Adam step from aux gradient, clamped to joint limits.
+// One invocation per free control point: Adam step from the gradient, clamped to joint limits.
 @compute @workgroup_size(64)
 fn traj_update(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let idx = item_index(gid, nwg);
-    let tn = P.waypoints;
-    let inner = tn - 2u;
-    if (idx >= P.n_items * inner) {
+    let tn = P.points;
+    let free = tn - 6u;
+    if (idx >= P.n_items * free) {
         return;
     }
-    let item = idx / inner;
-    let t = idx % inner + 1u;
+    let item = idx / free;
+    let t = idx % free + 3u;
     let n = P.n_dof;
     let base = (item * tn + t) * n;
     let total = P.n_items * tn * n;
+    let g0 = sample_grad_len();
     for (var j = 0u; j < n; j++) {
         let i = base + j;
-        let g = aux[i];
-        let m = P.beta1 * aux[total + i] + (1.0 - P.beta1) * g;
-        let v = P.beta2 * aux[2u * total + i] + (1.0 - P.beta2) * g * g;
-        aux[total + i] = m;
-        aux[2u * total + i] = v;
+        let g = aux[g0 + i];
+        let m = P.beta1 * aux[g0 + total + i] + (1.0 - P.beta1) * g;
+        let v = P.beta2 * aux[g0 + 2u * total + i] + (1.0 - P.beta2) * g * g;
+        aux[g0 + total + i] = m;
+        aux[g0 + 2u * total + i] = v;
         let step = IT.lr * (m / IT.bc1) / (sqrt(v / IT.bc2) + IT.eps);
         let lim = limits[j];
         qbuf[i] = clamp(qbuf[i] - step, lim.x, lim.y);

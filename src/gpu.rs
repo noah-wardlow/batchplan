@@ -49,10 +49,11 @@ shader_struct! {
     /// Per-call constants (`P` in kernels.wgsl).
     GpuParams => Params {
         n_dof: u32, n_links: u32, n_spheres: u32, n_pairs: u32,
-        ee_link: u32, n_items: u32, waypoints: u32, iterations: u32,
+        ee_link: u32, n_items: u32, points: u32, iterations: u32,
         w_world: f32, w_self: f32, margin: f32, self_margin: f32,
         w_acc: f32, w_vel: f32, beta1: f32, beta2: f32,
         damping: f32, rot_weight: f32, max_step: f32, collision_step: f32,
+        samples: u32, pad0: u32, pad1: u32, pad2: u32,
     }
 }
 
@@ -104,6 +105,7 @@ pub(crate) struct GpuBackend {
     layout1: wgpu::BindGroupLayout,
     evaluate: wgpu::ComputePipeline,
     ik: wgpu::ComputePipeline,
+    traj_samples: wgpu::ComputePipeline,
     traj_grad: wgpu::ComputePipeline,
     traj_update: wgpu::ComputePipeline,
     links: wgpu::Buffer,
@@ -238,6 +240,7 @@ impl GpuBackend {
         };
         let evaluate = pipeline(&pl_main, "evaluate_main");
         let ik = pipeline(&pl_main, "ik_main");
+        let traj_samples = pipeline(&pl_iter, "traj_samples");
         let traj_grad = pipeline(&pl_iter, "traj_grad");
         let traj_update = pipeline(&pl_iter, "traj_update");
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -297,6 +300,7 @@ impl GpuBackend {
             layout1,
             evaluate,
             ik,
+            traj_samples,
             traj_grad,
             traj_update,
         })
@@ -551,7 +555,8 @@ impl Backend for GpuBackend {
             return Ok(());
         }
         let mut params = self.params(items, &o.collision);
-        params.waypoints = paths.waypoints as u32;
+        params.points = paths.points as u32;
+        params.samples = o.samples_per_span as u32;
         params.w_acc = o.w_acc;
         params.w_vel = o.w_vel;
         params.beta1 = o.beta1;
@@ -561,7 +566,9 @@ impl Backend for GpuBackend {
         let world_buf = storage(&self.device, "item world", item_world);
         let dummy = storage::<f32>(&self.device, "unused", &[]);
         let q_buf = storage(&self.device, "trajectories", traj);
-        let aux = storage_zeroed(&self.device, "adam state", traj.len() * 3);
+        // [collision gradient per sample | gradient per control point | Adam m | Adam v]
+        let sample_threads = items * (paths.points - 3) * o.samples_per_span;
+        let aux = storage_zeroed(&self.device, "trajopt state", sample_threads * paths.dof + traj.len() * 3);
         let out = storage::<f32>(&self.device, "unused out", &[]);
         let bg = self.bind_main(&CallBuffers {
             params: &params_buf,
@@ -597,7 +604,7 @@ impl Backend for GpuBackend {
                 }),
             }],
         });
-        let threads = items * (paths.waypoints - 2);
+        let free_threads = items * (paths.points - 6);
         let mut k = 0;
         while k < o.iterations {
             let end = (k + TRAJ_ITERS_PER_SUBMIT).min(o.iterations);
@@ -606,10 +613,12 @@ impl Backend for GpuBackend {
                 for it in k..end {
                     let offset = it * self.uniform_align as u32;
                     pass.set_bind_group(1, &bg_iter, &[offset]);
+                    pass.set_pipeline(&self.traj_samples);
+                    dispatch(pass, sample_threads);
                     pass.set_pipeline(&self.traj_grad);
-                    dispatch(pass, threads);
+                    dispatch(pass, free_threads);
                     pass.set_pipeline(&self.traj_update);
-                    dispatch(pass, threads);
+                    dispatch(pass, free_threads);
                 }
             });
             k = end;

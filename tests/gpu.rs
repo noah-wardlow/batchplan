@@ -172,19 +172,18 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     );
     assert!(solved as f32 >= 0.8 * plan_problems.len() as f32);
 
-    // Independent check: CPU model, 4x denser interpolation than the planner's validation.
-    let substeps = o.validate_substeps * 4;
+    // Independent check: the CPU model on the timed trajectory, sampled 4x denser per span than
+    // the planner's validation.
+    let per_span = (o.validate_substeps * 4) as f32;
     let (mut dense, mut dense_world) = (vec![], vec![]);
-    for Solved { problem: prob, solution: tr, .. } in result.solved() {
-        assert!(tr[..n].iter().zip(&prob.start).all(|(a, b)| a == b), "start moved");
-        assert!(tr[tr.len() - n..].iter().zip(&prob.goal).all(|(a, b)| a == b), "goal moved");
-        for t in 0..o.waypoints - 1 {
-            for s in 0..=substeps {
-                let a = s as f32 / substeps as f32;
-                dense.extend((0..n).map(|j| tr[t * n + j] + a * (tr[(t + 1) * n + j] - tr[t * n + j])));
-                dense_world.push(prob.world);
-            }
-        }
+    for Solved { problem: prob, solution: cp, .. } in result.solved() {
+        let trajectory = Trajectory::new(&robot, cp, 1.0);
+        trajectory.check(&robot).unwrap();
+        let samples = trajectory.sample(per_span / trajectory.knot_interval);
+        let (first, last) = (&samples.positions[..n], &samples.positions[samples.positions.len() - n..]);
+        assert!(first == &prob.start[..] && last == &prob.goal[..], "the trajectory does not run start to goal");
+        dense.extend(&samples.positions);
+        dense_world.extend(std::iter::repeat_n(prob.world, samples.len()));
     }
     let eval = cpu.evaluate(&worlds, &dense_world, &dense, &CollisionWeights::NONE).unwrap();
     let worst = eval.world_clearance.iter().chain(&eval.self_clearance).fold(f32::INFINITY, |m, &v| m.min(v));
@@ -193,7 +192,7 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
 }
 
 /// Trajectory-cost gradients recovered from one optimizer step. With a huge Adam epsilon a single
-/// step is plain gradient descent, moving each waypoint by `-(lr / epsilon) * gradient`, so
+/// step is plain gradient descent, moving each control point by `-(lr / epsilon) * gradient`, so
 /// `(seed - stepped) * epsilon / lr` is the gradient each device computed. Returns the gradients
 /// and a mask of values a joint limit clamped (those carry no gradient information).
 fn one_step_gradients(
@@ -237,7 +236,7 @@ fn trajopt_gradients_match_cpu_element_wise() {
         compared += 1;
         largest = largest.max(norm);
     }
-    eprintln!("worst per-waypoint |cpu-gpu| / |grad| over {compared} waypoints: {worst:.2e}");
+    eprintln!("worst per-point |cpu-gpu| / |grad| over {compared} control points: {worst:.2e}");
     assert!(compared > a.len() / n / 2, "only {compared} waypoints escaped joint-limit clamping");
     assert!(largest > 1.0, "gradients too small ({largest}) to exercise the comparison");
     assert!(worst < 1e-2, "trajectory gradients differ by {worst} of their norm");

@@ -1,12 +1,13 @@
 //! Planner output as policy-training demonstrations: nominal reaches plus recoveries from
-//! perturbed states, retimed with human-like speed profiles.
+//! perturbed states, timed within the robot's limits at randomized speeds.
 
 use anyhow::Result;
 
 use crate::device::{CollisionWeights, Device};
 use crate::ik::{IkOptions, IkProblem, solve_ik};
 use crate::rng::Rng;
-use crate::timing::{RetimeOptions, retime};
+use crate::spline;
+use crate::timing::Trajectory;
 use crate::trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
 use crate::types::{JointTrajectory, Pose, Solved};
 use crate::world::World;
@@ -48,21 +49,15 @@ pub fn recovery_problems(
 ) -> Result<Vec<Recovery>> {
     let robot = device.robot();
     let n = robot.dof();
-    let last = result.paths.waypoints - 1;
     let mut rng = Rng::new(o.rng_seed);
     let mut candidates = vec![];
+    let mut on_path = vec![0.0; n];
     for Solved { index: parent, problem, solution: path } in result.solved() {
         for _ in 0..o.per_trajectory {
             let phase = rng.range(o.phase.0, o.phase.1);
-            let x = phase * last as f32;
-            let k = (x as usize).min(last - 1);
-            let a = x - k as f32;
-            let start: Vec<f32> = (0..n)
-                .map(|j| {
-                    let on_path = path[k * n + j] + a * (path[(k + 1) * n + j] - path[k * n + j]);
-                    (on_path + o.sigma * rng.normal()).clamp(robot.lower[j], robot.upper[j])
-                })
-                .collect();
+            spline::at_phase(path, n, phase, &mut on_path);
+            let start: Vec<f32> =
+                (0..n).map(|j| (on_path[j] + o.sigma * rng.normal()).clamp(robot.lower[j], robot.upper[j])).collect();
             let next = PlanProblem { world: problem.world, start, goal: problem.goal.clone() };
             candidates.push(Recovery { parent, phase, problem: next });
         }
@@ -111,9 +106,9 @@ pub struct DemoOptions {
     /// Standard deviation of the joint noise added to the default pose for start states (radians).
     /// Starts that collide fall back to the default pose.
     pub start_noise: f32,
-    /// Each demonstration's speed scale is drawn uniformly from this range.
+    /// Each demonstration's speed scale (a fraction of the fastest timing within the robot's
+    /// limits) is drawn uniformly from this range.
     pub speed_scale: (f32, f32),
-    pub max_acceleration: f32,
     /// Sample period of the trajectories (seconds).
     pub dt: f32,
     pub rng_seed: u64,
@@ -127,8 +122,7 @@ impl Default for DemoOptions {
             recovery: RecoveryOptions::default(),
             start_noise: 0.3,
             speed_scale: (0.6, 1.0),
-            max_acceleration: RetimeOptions::default().max_acceleration,
-            dt: RetimeOptions::default().dt,
+            dt: 0.05,
             rng_seed: 7,
         }
     }
@@ -172,9 +166,9 @@ pub fn demonstrations(
     let recovery_plans: Vec<PlanProblem> = recoveries.iter().map(|r| r.problem.clone()).collect();
     let recovered = plan(device, worlds, &recovery_plans, &o.plan)?;
 
-    let mut retimed = |path: &[f32]| {
+    let mut timed = |path: &[f32]| {
         let speed_scale = rng.range(o.speed_scale.0, o.speed_scale.1);
-        retime(robot, path, &RetimeOptions { max_acceleration: o.max_acceleration, speed_scale, dt: o.dt })
+        Trajectory::new(robot, path, speed_scale).sample(1.0 / o.dt)
     };
     let mut demos = vec![];
     // Demonstration index of each solved nominal problem, for recovery parents.
@@ -186,7 +180,7 @@ pub fn demonstrations(
             origin: Origin::Nominal,
             world: s.problem.world,
             goal,
-            trajectory: retimed(s.solution),
+            trajectory: timed(s.solution),
         });
     }
     for s in recovered.solved() {
@@ -196,7 +190,7 @@ pub fn demonstrations(
             origin: Origin::Recovery { parent, phase: rec.phase },
             world: s.problem.world,
             goal: demos[parent].goal,
-            trajectory: retimed(s.solution),
+            trajectory: timed(s.solution),
         });
     }
     Ok(demos)

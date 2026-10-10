@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use crate::device::{Backend, CollisionWeights, Evaluation};
 use crate::ik::IkOptions;
 use crate::robot::{Fk, MAX_DOF, MAX_SPHERES, Robot};
+use crate::spline;
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
 use crate::world::{FAR, Obstacle, World, box_distance, capsule_distance, cylinder_distance, sphere_distance};
@@ -248,14 +249,45 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     }
 }
 
-/// Gradient of the trajectory cost w.r.t. interior waypoint `t`. Must match `traj_grad` in kernels.wgsl.
-fn traj_grad(robot: &Robot, world: &[Prepared], tr: &[f32], t: usize, o: &PlanOptions, out: &mut [f32]) {
+/// Collision gradient of the trajectory cost at sample `s` of span `span`, with respect to the
+/// configuration there. Must match `traj_samples` in kernels.wgsl.
+fn traj_sample_grad(
+    robot: &Robot,
+    world: &[Prepared],
+    cp: &[f32],
+    span: usize,
+    s: usize,
+    o: &PlanOptions,
+    out: &mut [f32],
+) {
     let n = robot.dof();
-    let t_count = tr.len() / n;
-    let q = |k: usize, j: usize| tr[k * n + j];
+    let mut q = [0.0f32; MAX_DOF];
+    spline::blend(cp, n, span, spline::basis(spline::sample_u(s, o.samples_per_span)), &mut q[..n]);
     out.fill(0.0);
-    let fk = robot.fk(&tr[t * n..(t + 1) * n]);
-    collision(robot, world, &fk, &o.collision, out);
+    collision(robot, world, &robot.fk(&q[..n]), &o.collision, out);
+}
+
+/// Gradient of the trajectory cost w.r.t. free control point `t`: the collision gradients of the
+/// samples it shapes, each weighted by its basis value there, plus smoothness on the control
+/// points. Must match `traj_grad` in kernels.wgsl.
+fn traj_grad(cp: &[f32], sample_grad: &[f32], n: usize, t: usize, o: &PlanOptions, out: &mut [f32]) {
+    let t_count = cp.len() / n;
+    let (spans, k) = (t_count - 3, o.samples_per_span);
+    let q = |i: usize, j: usize| cp[i * n + j];
+    out.fill(0.0);
+    // Control point t is point i of span t - i.
+    for i in 0..4 {
+        if t < i || t - i >= spans {
+            continue;
+        }
+        for s in 0..k {
+            let w = spline::basis(spline::sample_u(s, k))[i];
+            let g = &sample_grad[((t - i) * k + s) * n..((t - i) * k + s + 1) * n];
+            for j in 0..n {
+                out[j] += w * g[j];
+            }
+        }
+    }
     for j in 0..n {
         let (qm, q0, qp) = (q(t - 1, j), q(t, j), q(t + 1, j));
         let mut g = 2.0 * o.w_vel * (2.0 * q0 - qm - qp);
@@ -327,19 +359,24 @@ impl Backend for CpuBackend {
 
     fn trajopt(&self, worlds: &[World], item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
         let n = self.robot.dof();
-        let t_count = paths.waypoints;
+        let t_count = paths.points;
+        let samples = (t_count - 3) * o.samples_per_span;
         let prepared = prepare(worlds);
         paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(|(tr, &s)| {
             let world = &prepared[s as usize];
+            let mut sample_grad = vec![0.0f32; samples * n];
             let mut grad = vec![0.0f32; t_count * n];
             let mut m = vec![0.0f32; t_count * n];
             let mut v = vec![0.0f32; t_count * n];
             for k in 0..o.iterations {
-                for t in 1..t_count - 1 {
-                    traj_grad(&self.robot, world, tr, t, o, &mut grad[t * n..(t + 1) * n]);
+                for (i, g) in sample_grad.chunks_mut(n).enumerate() {
+                    traj_sample_grad(&self.robot, world, tr, i / o.samples_per_span, i % o.samples_per_span, o, g);
+                }
+                for t in 3..t_count - 3 {
+                    traj_grad(tr, &sample_grad, n, t, o, &mut grad[t * n..(t + 1) * n]);
                 }
                 let [lr, bc1, bc2] = o.schedule(k);
-                for t in 1..t_count - 1 {
+                for t in 3..t_count - 3 {
                     for j in 0..n {
                         let i = t * n + j;
                         let g = grad[i];

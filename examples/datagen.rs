@@ -1,5 +1,5 @@
 //! Generates policy-training demonstrations: reach-to-grasp trajectories in random cluttered
-//! worlds plus recoveries from perturbed mid-path states, retimed with a minimum-jerk profile and
+//! worlds plus recoveries from perturbed mid-path states, timed within the robot's limits at
 //! randomized speed.
 //!
 //! cargo run --release --example datagen -- <out_dir> [episodes=256] [fps=20]
@@ -56,7 +56,11 @@ fn main() -> Result<()> {
     if lerobot {
         export_lerobot(&out, &robot, &worlds, &demos)?;
     } else {
-        let metadata = serde_json::json!({"max_acceleration": options.max_acceleration, "device": device.name()});
+        let metadata = serde_json::json!({
+            "max_acceleration": robot.max_acceleration(),
+            "max_jerk": robot.max_jerk(),
+            "device": device.name(),
+        });
         let metadata = metadata.as_object().expect("an object").clone();
         batchplan::npy::export(&out, &robot, &worlds, &demos, &batchplan::npy::ExportOptions { metadata })?;
     }

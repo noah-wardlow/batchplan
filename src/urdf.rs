@@ -46,7 +46,7 @@ pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescrip
             if matches!(kind, JointType::Revolute | JointType::Prismatic) && !(lower.is_finite() && upper.is_finite()) {
                 bail!("joint '{}' needs finite position limits", j.name);
             }
-            let velocity = j.limit.velocity as f32;
+            let limit = |v: f64| if v.is_finite() && v > 0.0 { v as f32 } else { f32::INFINITY };
             Ok(JointDesc {
                 name: j.name.clone(),
                 kind,
@@ -56,7 +56,9 @@ pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescrip
                 axis: Vec3::from_array(j.axis.xyz.0.map(|v| v as f32)).normalize_or_zero(),
                 lower,
                 upper,
-                max_velocity: if velocity.is_finite() && velocity > 0.0 { velocity } else { f32::INFINITY },
+                max_velocity: limit(j.limit.velocity),
+                max_acceleration: limit(j.limit.acceleration),
+                max_jerk: limit(j.limit.jerk),
                 mimic: j.mimic.as_ref().map(|m| Mimic {
                     joint: m.joint.clone(),
                     multiplier: m.multiplier.unwrap_or(1.0) as f32,
