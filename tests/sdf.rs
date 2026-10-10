@@ -89,7 +89,7 @@ fn grid_gradients_match_finite_differences() {
 #[test]
 fn grid_collision_gradients_match_finite_differences() {
     let robot = common::panda().unwrap();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let n = robot.dof();
     let mut mesh = (vec![], vec![]);
     add_box(&mut mesh, Vec3::new(-0.06, -0.06, 0.0), Vec3::new(0.06, 0.06, 0.4));

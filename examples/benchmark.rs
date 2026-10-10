@@ -212,7 +212,7 @@ fn ik_and_plan(device: &Device, worlds: &Worlds, problems: &[Problem], o: &PlanO
             goal: s.solution.to_vec(),
         })
         .collect();
-    plan(device, worlds, &plans, o)
+    Ok(plan(device, worlds, &plans, o)?)
 }
 
 fn main() -> Result<()> {
@@ -220,13 +220,13 @@ fn main() -> Result<()> {
     // Goals are poses of the hand frame.
     let options = RobotOptions { ee_link: Some("panda_hand".into()), ..common::panda_options() };
     let robot = Robot::load(common::asset("franka/franka_panda.urdf"), &options)?;
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot)?;
     let mut devices = vec![];
     if args.device != "cpu" {
         devices.push(Device::gpu(&robot)?);
     }
     if args.device != "gpu" {
-        devices.push(Device::cpu(&robot));
+        devices.push(Device::cpu(&robot)?);
     }
     let files = ["mb_set.yaml", "mpinets_set.yaml"];
     let mut sets = vec![];

@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+
+use crate::error::{Error, Result};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +69,12 @@ impl World {
     /// collides them that way (MJCF always, USD with `physics:approximation = "convexHull"`).
     /// Robots in the same file are left out.
     pub fn load(path: impl AsRef<Path>, grids: &SdfOptions) -> Result<World> {
-        let scene = crate::description::load_scene(path.as_ref())?;
+        let path = path.as_ref();
+        Self::read(path, grids).map_err(|e| Error::Load { path: path.to_path_buf(), message: format!("{e:#}") })
+    }
+
+    fn read(path: &Path, grids: &SdfOptions) -> anyhow::Result<World> {
+        let scene = crate::description::load_scene(path)?;
         let obstacles = scene
             .iter()
             .map(|s| {
@@ -95,7 +102,7 @@ impl World {
                     }
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<anyhow::Result<_>>()?;
         Ok(World { obstacles })
     }
 }

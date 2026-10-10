@@ -9,10 +9,12 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
-use anyhow::{Result, bail, ensure};
+use crate::error::{Result, ensure_input, input};
 
 use crate::cpu::CpuBackend;
+#[cfg(feature = "gpu")]
 use crate::gpu::GpuBackend;
 use crate::ik::IkOptions;
 use crate::robot::Robot;
@@ -87,24 +89,48 @@ impl Worlds {
 }
 
 impl Device {
-    /// All CPU cores (rayon).
-    pub fn cpu(robot: &Robot) -> Self {
-        Self::new(Box::new(CpuBackend::new(robot)))
+    /// One thread per CPU core.
+    pub fn cpu(robot: &Robot) -> Result<Self> {
+        Self::cpu_threads(robot, 0)
+    }
+
+    /// `threads` worker threads (0: one per core), started now and owned by the device: batched
+    /// work never runs on rayon's global pool or on threads the device did not start.
+    pub fn cpu_threads(robot: &Robot, threads: usize) -> Result<Self> {
+        Ok(Self::new(Box::new(CpuBackend::new(robot, threads)?)))
     }
 
     /// The fastest GPU wgpu finds: Vulkan on Linux and Windows, Metal on macOS, DX12 as fallback.
+    /// An error when built without the `gpu` feature.
     pub fn gpu(robot: &Robot) -> Result<Self> {
-        Ok(Self::new(Box::new(GpuBackend::new(robot, None)?)))
+        Self::gpu_adapter(robot, None)
     }
 
     /// The first adapter whose name contains `name` (case-insensitive), e.g. `"radv"` or `"llvmpipe"`.
     pub fn gpu_named(robot: &Robot, name: &str) -> Result<Self> {
-        Ok(Self::new(Box::new(GpuBackend::new(robot, Some(name))?)))
+        Self::gpu_adapter(robot, Some(name))
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_adapter(robot: &Robot, name: Option<&str>) -> Result<Self> {
+        Ok(Self::new(Box::new(GpuBackend::new(robot, name)?)))
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn gpu_adapter(_: &Robot, _: Option<&str>) -> Result<Self> {
+        Err(crate::error::Error::Gpu("batchplan was built without the `gpu` feature".into()))
     }
 
     fn new(backend: Box<dyn Backend>) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), backend }
+    }
+
+    /// A device for `robot` on the same hardware: it shares this device's GPU or threads, and
+    /// worlds uploaded to either work on both. Use it when the robot changes, as when it picks up
+    /// an object ([`Robot::attach`]), without starting a device or uploading worlds again.
+    pub fn with_robot(&self, robot: &Robot) -> Result<Self> {
+        Ok(Self { id: self.id, backend: self.backend.with_robot(robot)? })
     }
 
     /// Prepares `worlds` for this device. Calls on other devices refuse the result.
@@ -137,39 +163,41 @@ impl Device {
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>> {
         self.check_batch(worlds, item_world, q.len(), self.robot().dof())?;
-        ensure!(targets.len() == item_world.len(), "{} IK targets for {} items", targets.len(), item_world.len());
+        ensure_input!(targets.len() == item_world.len(), "{} IK targets for {} items", targets.len(), item_world.len());
         self.backend.ik(worlds, item_world, targets, q, o)
     }
 
+    /// Optimizes `paths` in place; stops early once `deadline` passes.
     pub(crate) fn trajopt(
         &self,
         worlds: &Worlds,
         item_world: &[u32],
         paths: &mut JointPaths,
         o: &PlanOptions,
+        deadline: Option<Instant>,
     ) -> Result<()> {
-        ensure!(
+        ensure_input!(
             paths.dof == self.robot().dof(),
             "paths have {} joints, the robot has {}",
             paths.dof,
             self.robot().dof()
         );
-        ensure!(paths.points >= 7, "paths need at least 7 control points");
+        ensure_input!(paths.points >= 7, "paths need at least 7 control points");
         self.check_batch(worlds, item_world, paths.positions.len(), paths.points * paths.dof)?;
-        self.backend.trajopt(worlds, item_world, paths, o)
+        self.backend.trajopt(worlds, item_world, paths, o, deadline)
     }
 
     /// The device, shape and index invariants every batch must satisfy before it reaches a backend.
     fn check_batch(&self, worlds: &Worlds, item_world: &[u32], values: usize, per_item: usize) -> Result<()> {
-        ensure!(worlds.device == self.id, "these worlds were uploaded to a different device");
+        ensure_input!(worlds.device == self.id, "these worlds were uploaded to a different device");
         let items = item_world.len();
-        ensure!(
+        ensure_input!(
             values == items * per_item,
             "{items} items need {} values ({per_item} each), got {values}",
             items * per_item
         );
         if let Some((item, &world)) = item_world.iter().enumerate().find(|&(_, &w)| w as usize >= worlds.len()) {
-            bail!("item {item} references world {world}, but only {} worlds were given", worlds.len());
+            return Err(input!("item {item} references world {world}, but only {} worlds were given", worlds.len()));
         }
         Ok(())
     }
@@ -182,6 +210,8 @@ pub(crate) trait Backend: Send + Sync {
     fn robot(&self) -> &Robot;
     /// The backend's own form of `worlds`, which [`Worlds::prepared`] hands back to it.
     fn upload(&self, worlds: &[World]) -> Result<Box<dyn Any + Send + Sync>>;
+    /// The same backend for another robot, sharing the hardware and the form of worlds.
+    fn with_robot(&self, robot: &Robot) -> Result<Box<dyn Backend>>;
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation>;
     /// Runs IK in place on `q` (`[items, dof]`) toward `targets[item]`; returns `[position error, rotation error]` per item.
     fn ik(
@@ -192,6 +222,14 @@ pub(crate) trait Backend: Send + Sync {
         q: &mut [f32],
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>>;
-    /// Optimizes each path's control points in place, holding the three at each end fixed.
-    fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()>;
+    /// Optimizes each path's control points in place, holding the three at each end fixed, and
+    /// stops between rounds once `deadline` passes.
+    fn trajopt(
+        &self,
+        worlds: &Worlds,
+        item_world: &[u32],
+        paths: &mut JointPaths,
+        o: &PlanOptions,
+        deadline: Option<Instant>,
+    ) -> Result<()>;
 }

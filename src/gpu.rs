@@ -3,8 +3,9 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use crate::error::{Error, Result, input};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat3;
 use wgpu::util::DeviceExt;
@@ -99,6 +100,7 @@ fn v4(v: glam::Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
 }
 
+#[derive(Clone)]
 pub(crate) struct GpuBackend {
     robot: Robot,
     info: wgpu::AdapterInfo,
@@ -112,10 +114,73 @@ pub(crate) struct GpuBackend {
     traj_samples: wgpu::ComputePipeline,
     traj_grad: wgpu::ComputePipeline,
     lbfgs_direction: wgpu::ComputePipeline,
+    buffers: RobotBuffers,
+}
+
+/// The robot as the kernels read it.
+#[derive(Clone)]
+struct RobotBuffers {
     links: wgpu::Buffer,
     spheres: wgpu::Buffer,
     pairs: wgpu::Buffer,
     limits: wgpu::Buffer,
+}
+
+fn check_kernel_limits(robot: &Robot) -> Result<()> {
+    if robot.dof() > MAX_DOF || robot.spheres.len() > MAX_SPHERES || robot.links.len() > MAX_LINKS {
+        return Err(input!("robot exceeds kernel limits ({MAX_DOF} joints, {MAX_SPHERES} spheres, {MAX_LINKS} links)"));
+    }
+    Ok(())
+}
+
+impl RobotBuffers {
+    fn new(device: &wgpu::Device, robot: &Robot) -> Self {
+        let mut moving = 0;
+        let gpu_links: Vec<GpuLink> = robot
+            .links
+            .iter()
+            .map(|l| {
+                let joint = moving;
+                moving += u32::from(l.joint.actuation().is_some());
+                let (kind, dof, axis, multiplier, offset) = match l.joint {
+                    JointKind::Fixed => (0, 0, glam::Vec3::ZERO, 0.0, 0.0),
+                    JointKind::Revolute { dof, axis, multiplier, offset } => (1, dof as u32, axis, multiplier, offset),
+                    JointKind::Prismatic { dof, axis, multiplier, offset } => (2, dof as u32, axis, multiplier, offset),
+                };
+                GpuLink {
+                    c0: v4(l.origin.rot.x_axis, 0.0),
+                    c1: v4(l.origin.rot.y_axis, 0.0),
+                    c2: v4(l.origin.rot.z_axis, 0.0),
+                    trans: v4(l.origin.trans, offset),
+                    axis: v4(axis, multiplier),
+                    parent: l.parent.map_or(-1, |p| p as i32),
+                    kind,
+                    dof,
+                    chain: l.chain,
+                    joint,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let gpu_spheres: Vec<GpuSphere> = robot
+            .spheres
+            .iter()
+            .map(|s| GpuSphere {
+                c: v4(s.center, s.radius),
+                link: s.link as u32,
+                self_buf: s.self_buffer,
+                ..Default::default()
+            })
+            .collect();
+        let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
+
+        Self {
+            links: storage(device, "links", &gpu_links),
+            spheres: storage(device, "spheres", &gpu_spheres),
+            pairs: storage(device, "pairs", &robot.self_pairs),
+            limits: storage(device, "limits", &gpu_limits),
+        }
+    }
 }
 
 /// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
@@ -141,9 +206,7 @@ impl GpuBackend {
     /// Uses the first adapter whose name contains `name` (any adapter if `None`), preferring
     /// discrete, then integrated GPUs. OpenGL adapters are skipped.
     pub(crate) fn new(robot: &Robot, name: Option<&str>) -> Result<Self> {
-        if robot.dof() > MAX_DOF || robot.spheres.len() > MAX_SPHERES || robot.links.len() > MAX_LINKS {
-            bail!("robot exceeds kernel limits ({MAX_DOF} joints, {MAX_SPHERES} spheres, {MAX_LINKS} links)");
-        }
+        check_kernel_limits(robot)?;
         let wanted = name.map(str::to_lowercase);
         let accept = |info: &wgpu::AdapterInfo| {
             info.backend != wgpu::Backend::Gl && wanted.as_ref().is_none_or(|w| info.name.to_lowercase().contains(w))
@@ -173,9 +236,9 @@ impl GpuBackend {
                 unmet.is_empty()
             })
             .ok_or_else(|| match (&rejected[..], name) {
-                ([], Some(name)) => anyhow!("no Vulkan, Metal or DX12 adapter named like '{name}'"),
-                ([], None) => anyhow!("no Vulkan, Metal or DX12 adapter found"),
-                _ => anyhow!("no GPU adapter can run the kernels:\n  {}", rejected.join("\n  ")),
+                ([], Some(name)) => Error::Gpu(format!("no Vulkan, Metal or DX12 adapter named like '{name}'")),
+                ([], None) => Error::Gpu("no Vulkan, Metal or DX12 adapter found".into()),
+                _ => Error::Gpu(format!("no GPU adapter can run the kernels:\n  {}", rejected.join("\n  "))),
             })?;
         let info = adapter.get_info();
         let adapter_limits = adapter.limits();
@@ -187,7 +250,7 @@ impl GpuBackend {
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
-        .context("requesting GPU device")?;
+        .map_err(|e| Error::Gpu(format!("requesting GPU device: {e}")))?;
 
         // Constants and shared structs are generated from their Rust definitions.
         let source = [
@@ -255,55 +318,14 @@ impl GpuBackend {
         let traj_grad = pipeline("traj_grad");
         let lbfgs_direction = pipeline("lbfgs_direction");
         if let Some(e) = pollster::block_on(scope.pop()) {
-            bail!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend);
+            return Err(Error::Gpu(format!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend)));
         }
 
-        let mut moving = 0;
-        let gpu_links: Vec<GpuLink> = robot
-            .links
-            .iter()
-            .map(|l| {
-                let joint = moving;
-                moving += u32::from(l.joint.actuation().is_some());
-                let (kind, dof, axis, multiplier, offset) = match l.joint {
-                    JointKind::Fixed => (0, 0, glam::Vec3::ZERO, 0.0, 0.0),
-                    JointKind::Revolute { dof, axis, multiplier, offset } => (1, dof as u32, axis, multiplier, offset),
-                    JointKind::Prismatic { dof, axis, multiplier, offset } => (2, dof as u32, axis, multiplier, offset),
-                };
-                GpuLink {
-                    c0: v4(l.origin.rot.x_axis, 0.0),
-                    c1: v4(l.origin.rot.y_axis, 0.0),
-                    c2: v4(l.origin.rot.z_axis, 0.0),
-                    trans: v4(l.origin.trans, offset),
-                    axis: v4(axis, multiplier),
-                    parent: l.parent.map_or(-1, |p| p as i32),
-                    kind,
-                    dof,
-                    chain: l.chain,
-                    joint,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        let gpu_spheres: Vec<GpuSphere> = robot
-            .spheres
-            .iter()
-            .map(|s| GpuSphere {
-                c: v4(s.center, s.radius),
-                link: s.link as u32,
-                self_buf: s.self_buffer,
-                ..Default::default()
-            })
-            .collect();
-        let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
-
+        let buffers = RobotBuffers::new(&device, robot);
         Ok(Self {
             robot: robot.clone(),
             info,
-            links: storage(&device, "links", &gpu_links),
-            spheres: storage(&device, "spheres", &gpu_spheres),
-            pairs: storage(&device, "pairs", &robot.self_pairs),
-            limits: storage(&device, "limits", &gpu_limits),
+            buffers,
             device,
             queue,
             layout0,
@@ -388,12 +410,13 @@ impl GpuBackend {
         }
         let limits = self.device.limits();
         let bytes = (grid_words.len() * 4) as u64;
-        ensure!(
-            bytes <= limits.max_storage_buffer_binding_size.min(limits.max_buffer_size),
-            "the distance grids take {} MiB, more than {} can bind",
-            bytes >> 20,
-            self.info.name
-        );
+        if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err(Error::Gpu(format!(
+                "the distance grids take {} MiB, more than {} can bind",
+                bytes >> 20,
+                self.info.name
+            )));
+        }
         Ok(GpuWorlds {
             obstacles: storage(&self.device, "obstacles", &obstacles),
             ranges: storage(&self.device, "world ranges", &ranges),
@@ -412,10 +435,10 @@ impl GpuBackend {
     fn bind_main(&self, b: &CallBuffers) -> wgpu::BindGroup {
         let buffers = [
             b.params,
-            &self.links,
-            &self.spheres,
-            &self.pairs,
-            &self.limits,
+            &self.buffers.links,
+            &self.buffers.spheres,
+            &self.buffers.pairs,
+            &self.buffers.limits,
             &b.worlds.obstacles,
             &b.worlds.ranges,
             b.item_world,
@@ -446,6 +469,11 @@ impl GpuBackend {
         self.queue.submit([enc.finish()]);
     }
 
+    /// Blocks until the GPU has finished all submitted work.
+    fn wait(&self) -> Result<()> {
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map(|_| ()).map_err(|e| Error::Gpu(e.to_string()))
+    }
+
     fn read(&self, buf: &wgpu::Buffer, floats: usize) -> Result<Vec<f32>> {
         let size = (floats * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -461,9 +489,11 @@ impl GpuBackend {
         staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        rx.recv()??;
-        let out = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()?).to_vec();
+        self.wait()?;
+        rx.recv().map_err(|e| Error::Gpu(e.to_string()))?.map_err(|e| Error::Gpu(e.to_string()))?;
+        let mapped = staging.slice(..).get_mapped_range().map_err(|e| Error::Gpu(e.to_string()))?;
+        let out = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
         staging.unmap();
         Ok(out)
     }
@@ -512,6 +542,12 @@ impl Backend for GpuBackend {
 
     fn upload(&self, worlds: &[World]) -> Result<Box<dyn Any + Send + Sync>> {
         Ok(Box::new(self.upload_worlds(worlds)?))
+    }
+
+    fn with_robot(&self, robot: &Robot) -> Result<Box<dyn Backend>> {
+        check_kernel_limits(robot)?;
+        let buffers = RobotBuffers::new(&self.device, robot);
+        Ok(Box::new(Self { robot: robot.clone(), buffers, ..self.clone() }))
     }
 
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
@@ -595,7 +631,14 @@ impl Backend for GpuBackend {
         Ok(self.read(&out, items * 2)?.chunks(2).map(|e| [e[0], e[1]]).collect())
     }
 
-    fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
+    fn trajopt(
+        &self,
+        worlds: &Worlds,
+        item_world: &[u32],
+        paths: &mut JointPaths,
+        o: &PlanOptions,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let worlds: &GpuWorlds = worlds.prepared();
         let (points, n) = (paths.points, paths.dof);
         if item_world.is_empty() || o.iterations == 0 {
@@ -606,7 +649,10 @@ impl Backend for GpuBackend {
         let bytes = 4 * lbfgs_stride(points, n, o) as u64;
         let chunk = (limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / bytes).max(1) as usize;
         for (chunk_world, chunk_paths) in item_world.chunks(chunk).zip(paths.positions.chunks_mut(chunk * points * n)) {
-            self.trajopt_chunk(worlds, chunk_world, chunk_paths, points, o)?;
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            self.trajopt_chunk(worlds, chunk_world, chunk_paths, points, o, deadline)?;
         }
         Ok(())
     }
@@ -626,6 +672,7 @@ impl GpuBackend {
         traj: &mut [f32],
         points: usize,
         o: &PlanOptions,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         let items = item_world.len();
         let mut params = self.params(items, &o.collision);
@@ -675,6 +722,13 @@ impl GpuBackend {
                 }
             });
             k = end;
+            // Waiting for the GPU is only needed to keep a deadline.
+            if let Some(d) = deadline {
+                self.wait()?;
+                if Instant::now() >= d {
+                    break;
+                }
+            }
         }
         traj.copy_from_slice(&self.read(&q_buf, traj.len())?);
         Ok(())

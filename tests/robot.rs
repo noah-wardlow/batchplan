@@ -21,7 +21,7 @@ fn load(path: &str) -> Robot {
 }
 
 fn devices(robot: &Robot) -> Vec<Device> {
-    let mut devices = vec![Device::cpu(robot)];
+    let mut devices = vec![Device::cpu(robot).unwrap()];
     match Device::gpu(robot) {
         Ok(gpu) => devices.push(gpu),
         Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => eprintln!("skipping GPU: {e}"),
@@ -134,7 +134,7 @@ fn between_the_fingers(robot: &Robot) -> World {
 #[test]
 fn mimic_collision_gradients_match_finite_differences() {
     let robot = load(GRIPPER);
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let worlds = cpu.upload(&[between_the_fingers(&robot)]).unwrap();
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.02, self_margin: 0.01 };
     let cost = |q: f32| cpu.evaluate(&worlds, &[0], &[q], &w).unwrap().cost[0];
@@ -258,7 +258,7 @@ fn collision_models_round_trip_through_files() {
     let q: Vec<f32> = (0..200).flat_map(|_| random_q(&fitted, &mut rng)).collect();
     let item_world = vec![0; 200];
     let evaluate = |r: &Robot| {
-        let cpu = Device::cpu(r);
+        let cpu = Device::cpu(r).unwrap();
         cpu.evaluate(&cpu.upload(&[World::default()]).unwrap(), &item_world, &q, &CollisionWeights::NONE).unwrap()
     };
     assert_eq!(evaluate(&fitted).self_clearance, evaluate(&reloaded).self_clearance);
@@ -282,7 +282,7 @@ fn srdf_disabled_pairs_are_not_checked() {
     let q: Vec<f32> = (0..5000).flat_map(|_| random_q(&plain, &mut rng)).collect();
     let item_world = vec![0; 5000];
     let clearance = |r: &Robot| {
-        let cpu = Device::cpu(r);
+        let cpu = Device::cpu(r).unwrap();
         cpu.evaluate(&cpu.upload(&[World::default()]).unwrap(), &item_world, &q, &CollisionWeights::NONE)
             .unwrap()
             .self_clearance
@@ -324,6 +324,9 @@ fn load_errors_name_the_problem() {
     assert!(message.contains("default_q has 6 values"), "{message}");
     let message = err("robot.sdf", RobotOptions::default());
     assert!(message.contains("unsupported robot description format"), "{message}");
+    // Hosts can match on the kind, which names the file.
+    let kind = Robot::load("robot.sdf", &RobotOptions::default()).unwrap_err();
+    assert!(matches!(&kind, Error::Load { path, .. } if path.ends_with("robot.sdf")), "{kind:?}");
     let mut model = common::panda_options().collision_model.unwrap();
     model.spheres.insert("gripper".into(), vec![[0.0, 0.0, 0.0, 0.1]]);
     let message = err(&panda, RobotOptions { collision_model: Some(model), ..common::panda_options() });
@@ -341,7 +344,7 @@ fn every_test_arm_loads_spherizes_and_plans() {
     ];
     for (path, options) in arms {
         let robot = Robot::load(common::asset(path), &options).unwrap();
-        let cpu = Device::cpu(&robot);
+        let cpu = Device::cpu(&robot).unwrap();
         let mut rng = Rng::new(12);
         let scene: Vec<World> = (0..4).map(|_| common::tabletop_for(&robot, &cpu, &mut rng)).collect();
         let worlds = cpu.upload(&scene).unwrap();

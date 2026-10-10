@@ -20,7 +20,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use crate::error::{Error, Result, ensure_input};
 use arrow_array::builder::{Float64Builder, Int64Builder, ListBuilder, StringBuilder};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -59,16 +59,16 @@ impl Default for ExportOptions {
 /// Writes `demos` as a LeRobot v3.0 dataset under `root`, which must not already hold one.
 /// All demonstrations must share a sample period that is a whole number of frames per second.
 pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
-    ensure!(!demos.is_empty(), "no demonstrations to export");
-    ensure!(!root.join("meta/info.json").exists(), "{} already holds a LeRobot dataset", root.display());
+    ensure_input!(!demos.is_empty(), "no demonstrations to export");
+    ensure_input!(!root.join("meta/info.json").exists(), "{} already holds a LeRobot dataset", root.display());
     let dt = demos[0].trajectory.dt;
     let fps = (1.0 / dt).round();
-    ensure!(
+    ensure_input!(
         fps >= 1.0 && (fps * dt - 1.0).abs() < 1e-4,
         "LeRobot needs a whole number of frames per second; dt = {dt} s is {} fps",
         1.0 / dt
     );
-    ensure!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
+    ensure_input!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
     let fps = fps as u32;
     let max_obstacles = demos.iter().map(|d| worlds[d.world as usize].obstacles.len()).max().unwrap_or(0);
 
@@ -441,7 +441,7 @@ impl DataFiles {
             let dir = self.dir.join(format!("chunk-{:03}", self.chunk));
             fs::create_dir_all(&dir)?;
             let path = dir.join(format!("file-{:03}.parquet", self.file));
-            let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+            let file = File::create(&path).map_err(|e| Error::Write(format!("creating {}: {e}", path.display())))?;
             self.writer = Some(ArrowWriter::try_new(file, batch.schema(), Some(properties()))?);
             self.bytes = 0;
         }
@@ -457,5 +457,17 @@ impl DataFiles {
             w.close()?;
         }
         Ok(())
+    }
+}
+
+impl From<parquet::errors::ParquetError> for Error {
+    fn from(e: parquet::errors::ParquetError) -> Self {
+        Error::Write(e.to_string())
+    }
+}
+
+impl From<arrow_schema::ArrowError> for Error {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        Error::Write(e.to_string())
     }
 }

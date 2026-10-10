@@ -12,7 +12,7 @@ use batchplan::*;
 const UR5E: &str = "ur5e/ur_description/urdf/ur5e.urdf";
 
 fn devices(robot: &Robot) -> Vec<Device> {
-    let mut devices = vec![Device::cpu(robot)];
+    let mut devices = vec![Device::cpu(robot).unwrap()];
     match Device::gpu(robot) {
         Ok(gpu) => devices.push(gpu),
         Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => eprintln!("skipping GPU: {e}"),
@@ -79,7 +79,7 @@ fn worst_clearance(cpu: &Device, worlds: &Worlds, paths: &[(u32, &[f32])], resol
 #[test]
 fn rrt_paths_are_collision_free_under_a_denser_check() {
     let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let n = robot.dof();
     let (scene, problems) = far_reaches(&robot, &cpu, 12, true);
     let on_cpu = cpu.upload(&scene).unwrap();
@@ -108,7 +108,7 @@ fn rrt_paths_are_collision_free_under_a_denser_check() {
 #[test]
 fn shortcutting_never_lengthens_a_path() {
     let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let n = robot.dof();
     let (scene, problems) = far_reaches(&robot, &cpu, 12, true);
     let worlds = cpu.upload(&scene).unwrap();
@@ -136,7 +136,7 @@ fn shortcutting_never_lengthens_a_path() {
 #[test]
 fn fixed_seeds_give_fixed_results() {
     let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let (scene, problems) = far_reaches(&robot, &cpu, 6, true);
     let worlds = cpu.upload(&scene).unwrap();
     let run = |rrt: RrtOptions, short: ShortcutOptions| {
@@ -157,7 +157,7 @@ fn fixed_seeds_give_fixed_results() {
 #[test]
 fn plan_falls_back_to_rrt_where_trajectory_optimization_fails() {
     let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let n = robot.dof();
     let (scene, problems) = far_reaches(&robot, &cpu, 24, false);
     let on_cpu = cpu.upload(&scene).unwrap();
@@ -194,5 +194,29 @@ fn plan_falls_back_to_rrt_where_trajectory_optimization_fails() {
         let e = cpu.evaluate(&on_cpu, &item_world, &q, &CollisionWeights::NONE).unwrap();
         let worst = e.world_clearance.iter().chain(&e.self_clearance).fold(f32::INFINITY, |m, &v| m.min(v));
         assert!(worst > -2e-3, "{}: a plan penetrates by {worst}", d.name());
+    }
+}
+
+#[test]
+fn the_fallback_keeps_the_time_budget() {
+    // Several of these goals are unreachable, so RRT-Connect searches all its rounds for them.
+    let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
+    let cpu = Device::cpu(&robot).unwrap();
+    let (scene, problems) = far_reaches(&robot, &cpu, 24, false);
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let timed = |o: &PlanOptions| {
+            let t = std::time::Instant::now();
+            plan(&d, &worlds, &problems, o).unwrap();
+            t.elapsed()
+        };
+        let full = timed(&PlanOptions::default());
+        let alone = timed(&PlanOptions { fallback: None, ..Default::default() });
+        // The budget runs out during the search, after trajectory optimization.
+        let budget = alone + (full - alone) / 4;
+        let spent = timed(&PlanOptions { time_budget: Some(budget), ..Default::default() });
+        eprintln!("{}: full {full:?}, without fallback {alone:?}, budget {budget:?} -> {spent:?}", d.name());
+        assert!(full > 2 * alone, "{}: the search is too short to cut ({full:?})", d.name());
+        assert!(spent < budget + (full - alone) / 4, "{}: took {spent:?} of a {budget:?} budget", d.name());
     }
 }

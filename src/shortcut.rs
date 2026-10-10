@@ -3,7 +3,9 @@
 //! advance in lockstep, each round trying several shortcuts per path and keeping the one that
 //! shortens it most, so each round checks all of them in one batched evaluation.
 
-use anyhow::{Result, ensure};
+use std::time::Instant;
+
+use crate::error::{Result, ensure_input};
 
 use crate::device::{Device, Worlds};
 use crate::rng::Rng;
@@ -37,17 +39,30 @@ pub fn shortcut(
     paths: &mut [Vec<f32>],
     o: &ShortcutOptions,
 ) -> Result<()> {
+    shortcut_until(device, worlds, world, paths, o, None)
+}
+
+/// [`shortcut`] that stops between rounds once `deadline` passes.
+pub(crate) fn shortcut_until(
+    device: &Device,
+    worlds: &Worlds,
+    world: &[u32],
+    paths: &mut [Vec<f32>],
+    o: &ShortcutOptions,
+    deadline: Option<Instant>,
+) -> Result<()> {
     let n = device.robot().dof();
-    ensure!(o.attempts_per_round > 0, "try at least one shortcut per round");
-    ensure!(world.len() == paths.len(), "{} worlds for {} paths", world.len(), paths.len());
-    ensure!(paths.iter().all(|p| !p.is_empty() && p.len() % n == 0), "paths must hold whole waypoints");
+    let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+    ensure_input!(o.attempts_per_round > 0, "try at least one shortcut per round");
+    ensure_input!(world.len() == paths.len(), "{} worlds for {} paths", world.len(), paths.len());
+    ensure_input!(paths.iter().all(|p| !p.is_empty() && p.len() % n == 0), "paths must hold whole waypoints");
     let mut rngs: Vec<Rng> =
         (0..paths.len()).map(|i| Rng::new(o.rng_seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))).collect();
     let (mut failures, mut attempts) = (vec![0; paths.len()], vec![0; paths.len()]);
     let active = |failures: usize, attempts: usize, path: &[f32]| {
         failures < o.patience && attempts < o.max_attempts && path.len() >= 3 * n
     };
-    while (0..paths.len()).any(|i| active(failures[i], attempts[i], &paths[i])) {
+    while !expired() && (0..paths.len()).any(|i| active(failures[i], attempts[i], &paths[i])) {
         let mut segments = Segments::new(n, o.resolution);
         let mut tries = vec![];
         let mut round = vec![];
@@ -92,7 +107,7 @@ pub fn shortcut(
     }
     // Drop waypoints whose neighbors are connected by a free edge.
     let mut next = vec![1; paths.len()];
-    loop {
+    while !expired() {
         let mut segments = Segments::new(n, o.resolution);
         let mut tries = vec![];
         for (i, path) in paths.iter().enumerate() {

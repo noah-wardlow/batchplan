@@ -124,7 +124,7 @@ fn round_obstacle_distances_match_closed_forms() {
 #[test]
 fn default_pose_is_collision_free_on_table() {
     let robot = panda();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let world = common::tabletop(&mut Rng::new(1));
     let table_only = World { obstacles: world.obstacles[..1].to_vec() };
     let e =
@@ -136,7 +136,7 @@ fn default_pose_is_collision_free_on_table() {
 #[test]
 fn collision_gradient_matches_finite_differences() {
     let robot = panda();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let n = robot.dof();
     let w = CollisionWeights { world: 1000.0, self_collision: 1000.0, margin: 0.05, self_margin: 0.02 };
     let mut rng = Rng::new(11);
@@ -177,7 +177,7 @@ fn collision_gradient_matches_finite_differences() {
 #[test]
 fn ik_reaches_targets_from_collision_free_configurations() {
     let robot = panda();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let mut rng = Rng::new(5);
     let empty = cpu.upload(&[World::default()]).unwrap();
     let mut problems = vec![];

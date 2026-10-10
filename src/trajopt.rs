@@ -5,13 +5,15 @@
 //! are pinned to the start and goal, so every path starts and ends at rest. Problems no seed
 //! solves fall back to RRT-Connect: its shortcut path, traced by a B-spline and optimized again.
 
-use anyhow::{Result, ensure};
+use std::time::{Duration, Instant};
+
+use crate::error::{Result, ensure_input};
 
 use crate::device::{CollisionWeights, Device, Worlds};
 use crate::rng::Rng;
 use crate::robot::Robot;
-use crate::rrt::{RrtOptions, RrtProblem, connect, distance};
-use crate::shortcut::{ShortcutOptions, length, locate, shortcut};
+use crate::rrt::{RrtOptions, RrtProblem, connect_until, distance};
+use crate::shortcut::{ShortcutOptions, length, locate, shortcut_until};
 use crate::spline;
 use crate::types::{JointPaths, Solved};
 
@@ -38,6 +40,11 @@ pub struct PlanOptions {
     pub rng_seed: u64,
     /// What to do for problems no seed solves; `None` leaves them unsolved.
     pub fallback: Option<Fallback>,
+    /// Stop optimizing and searching once this much time has passed, and return the best valid
+    /// paths so far. The budget is checked between rounds (on a GPU, between submissions of
+    /// several rounds), and validation still runs after it. Results then depend on machine
+    /// speed; without a budget they are the same on every run.
+    pub time_budget: Option<Duration>,
 }
 
 /// Fractions of the L-BFGS direction each line search tries, in order of preference on ties.
@@ -67,6 +74,7 @@ impl Default for PlanOptions {
             validate_substeps: 8,
             rng_seed: 2,
             fallback: Some(Fallback::default()),
+            time_budget: None,
         }
     }
 }
@@ -112,25 +120,26 @@ impl PlanResult {
 }
 
 pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &PlanOptions) -> Result<PlanResult> {
+    let deadline = o.time_budget.map(|budget| Instant::now() + budget);
     let robot = device.robot();
     let n = robot.dof();
     let points = o.control_points;
-    ensure!(points >= 7 && o.seeds > 0, "need at least 7 control points and one seed");
-    ensure!(o.samples_per_span > 0, "need at least one collision sample per span");
-    ensure!((1..=MAX_HISTORY).contains(&o.history), "L-BFGS history must be 1 to {MAX_HISTORY} steps");
-    ensure!(o.initial_step > 0.0, "the initial step must be positive");
+    ensure_input!(points >= 7 && o.seeds > 0, "need at least 7 control points and one seed");
+    ensure_input!(o.samples_per_span > 0, "need at least one collision sample per span");
+    ensure_input!((1..=MAX_HISTORY).contains(&o.history), "L-BFGS history must be 1 to {MAX_HISTORY} steps");
+    ensure_input!(o.initial_step > 0.0, "the initial step must be positive");
     let items = problems.len() * o.seeds;
     let mut rng = Rng::new(o.rng_seed);
     let mut paths = JointPaths::zeros(items, points, n);
     let mut item_world = Vec::with_capacity(items);
     for (pi, p) in problems.iter().enumerate() {
-        ensure!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
+        ensure_input!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
         for s in 0..o.seeds {
             seed_path(robot, &p.start, &p.goal, s, &mut rng, paths.path_mut(pi * o.seeds + s));
             item_world.push(p.world);
         }
     }
-    device.trajopt(worlds, &item_world, &mut paths, o)?;
+    device.trajopt(worlds, &item_world, &mut paths, o, deadline)?;
     let (min_clearance, length) = validate(device, worlds, &paths, &item_world, o)?;
     let mut result = PlanResult {
         problems: problems.to_vec(),
@@ -141,7 +150,7 @@ pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &Plan
         length,
     };
     if let Some(fallback) = &o.fallback {
-        fall_back(device, worlds, &mut result, fallback, o)?;
+        fall_back(device, worlds, &mut result, fallback, o, deadline)?;
     }
     Ok(result)
 }
@@ -177,9 +186,16 @@ fn validate(
 /// Gives each problem without a valid seed an RRT-Connect path, shortcut, traced by a B-spline and
 /// then optimized. The better valid one of the refit and the
 /// optimized spline replaces the problem's first seed.
-fn fall_back(device: &Device, worlds: &Worlds, result: &mut PlanResult, f: &Fallback, o: &PlanOptions) -> Result<()> {
+fn fall_back(
+    device: &Device,
+    worlds: &Worlds,
+    result: &mut PlanResult,
+    f: &Fallback,
+    o: &PlanOptions,
+    deadline: Option<Instant>,
+) -> Result<()> {
     let failed: Vec<usize> = (0..result.problems.len()).filter(|&p| result.best(p).is_none()).collect();
-    if failed.is_empty() {
+    if failed.is_empty() || deadline.is_some_and(|d| Instant::now() >= d) {
         return Ok(());
     }
     let searches: Vec<RrtProblem> = failed
@@ -189,7 +205,7 @@ fn fall_back(device: &Device, worlds: &Worlds, result: &mut PlanResult, f: &Fall
             RrtProblem { world: problem.world, start: problem.start.clone(), goals: vec![problem.goal.clone()] }
         })
         .collect();
-    let found = connect(device, worlds, &searches, &f.rrt)?;
+    let found = connect_until(device, worlds, &searches, &f.rrt, deadline)?;
     let (mut solved, mut world, mut waypoints) = (vec![], vec![], vec![]);
     for (&p, path) in failed.iter().zip(found.paths) {
         if let Some(path) = path {
@@ -201,7 +217,7 @@ fn fall_back(device: &Device, worlds: &Worlds, result: &mut PlanResult, f: &Fall
     if solved.is_empty() {
         return Ok(());
     }
-    shortcut(device, worlds, &world, &mut waypoints, &f.shortcut)?;
+    shortcut_until(device, worlds, &world, &mut waypoints, &f.shortcut, deadline)?;
     let (n, points) = (result.paths.dof, result.paths.points);
     let mut refit = JointPaths::zeros(solved.len(), points, n);
     for (i, path) in waypoints.iter().enumerate() {
@@ -210,7 +226,7 @@ fn fall_back(device: &Device, worlds: &Worlds, result: &mut PlanResult, f: &Fall
         }
     }
     let mut optimized = refit.clone();
-    device.trajopt(worlds, &world, &mut optimized, o)?;
+    device.trajopt(worlds, &world, &mut optimized, o, deadline)?;
     // The optimized splines, then the refit ones.
     let candidates = JointPaths { positions: [optimized.positions, refit.positions].concat(), ..refit };
     let both_worlds: Vec<u32> = world.iter().chain(&world).copied().collect();

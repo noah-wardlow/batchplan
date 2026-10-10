@@ -16,18 +16,20 @@ Deliberate scope decisions:
 ## Commands
 
 ```bash
-cargo build --release --all-targets [--features lerobot]
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 59 tests; without the env var, GPU tests skip silently when no adapter exists
+cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 66 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
-cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt)
+cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
-cargo clippy --release --all-targets [--features lerobot,usd]   # keep at zero warnings in every feature combination
+cargo clippy --release --all-targets [--features lerobot,usd | --no-default-features]   # zero warnings everywhere; CI denies them (lints in Cargo.toml)
+cargo build --release --lib --target aarch64-unknown-linux-gnu --no-default-features     # the CPU-only robot build CI checks
 cargo doc --no-deps --features lerobot,usd                      # keep at zero warnings
 cargo run --release --example bench -- 512                      # GPU vs CPU throughput; BENCH_LLVMPIPE=1 adds the WGSL kernels on Mesa's CPU Vulkan driver
 scripts/fetch_benchmark.sh && cargo run --release --example benchmark   # MotionBenchMaker + MπNets (2,600 Panda problems), GPU and CPU
 cargo run --release --example datagen -- data/demo 512 20       # .npy dataset: <out_dir> [worlds] [fps]
 cargo run --release --example depth [-- --cpu]                  # a distance grid from a rendered depth image, then plans around it
+cargo run --release --example control_loop -- [seconds]         # a planner thread feeding a 50 Hz loop
 cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20
 REMOTE=user@host SSH_OPTS='...' scripts/sync.sh '<command>'     # rsync to ~/batchplan on a GPU box and run there
 ```
@@ -48,7 +50,7 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python "lerobot
 These decisions are settled. Keep to them unless the user decides otherwise.
 
 - **Batch-first.** Every query covers many items. Items reference worlds by index (`item_world`, `IkProblem.world`, `PlanProblem.world`), so one call spans many scenes.
-- **Worlds live on the device.** `Device::upload(&[World]) -> Worlds` prepares worlds once (GPU buffers, CPU rotation matrices); every algorithm takes `&Worlds`. Each backend's `upload` returns its own form, which `Worlds::prepared` hands back; `Device` checks that worlds were uploaded to it. Exporters take `&[World]` (`worlds.as_slice()`).
+- **Worlds live on the device.** `Device::upload(&[World]) -> Worlds` prepares worlds once (GPU buffers, CPU rotation matrices); every algorithm takes `&Worlds`. Each backend's `upload` returns its own form, which `Worlds::prepared` hands back; `Device` checks that worlds were uploaded to it. Exporters take `&[World]` (`worlds.as_slice()`). `Device::with_robot` shares the device id (and the GPU context or thread pool), so worlds stay valid when the robot changes, as with `Robot::attach`; attached objects are fixed links appended after every robot link.
 - **One public handle, two hidden implementations.** `Device` (`device.rs`) is the only way to run batched work. `CpuBackend` and `GpuBackend` sit behind the crate-private `Backend` trait. Never make `Backend` public, and never add a way to call a backend that bypasses `Device`.
 - **`Device` validates every batch** (array shapes, world indices, the device the worlds were uploaded to) before either backend sees it, so malformed input is an `Err` on both devices. New `Device` entry points must go through `check_batch`.
 - **Algorithms are separate modules over shared types.** `ik`, `trajopt`, `timing`, `datagen`, `npy` and `lerobot` are plain functions taking `&Device`, `&Worlds` and the `types` (`Pose`, `JointPaths`, `JointTrajectory`, `Solved`). There are no planner plugins and no runtime configuration.
@@ -57,6 +59,8 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - **Small interfaces.** `Robot` exposes accessors and pose queries only; its internals are `pub(crate)`. Prefer deepening an existing module to adding a new public one.
 - **Loaders stay thin.** A loader (`urdf.rs`, `mjcf.rs`, `usd.rs` behind feature `usd`) only translates a file into the crate-private `Model` (`description.rs`): a `RobotDescription` and static scene shapes. Kinematics, sphere fitting, self-collision analysis and `World::load` work on those, never on a file format. Format semantics are translated, not approximated away: MJCF mesh geoms become `Geometry::ConvexHull` because MuJoCo collides their hulls.
 - **Distance grids err toward collision.** `sdf.rs` builders store at most the true signed distance per point, minus half a voxel diagonal (the most trilinear interpolation overestimates by). Keep that invariant when touching a builder; `tests/sdf.rs` checks it.
+- **Typed errors at the surface.** Public functions return `batchplan::Error` (`error.rs`); its kinds are what a host matches on, so choose the kind deliberately (`ensure_input!`/`input!` for bad input). The format loaders and robot building keep `anyhow` internally for context chains; `Robot::load`, `World::load` and `CollisionModel::load` turn them into `Error::Load` with the path.
+- **Embeddable.** The CPU device owns its rayon pool (`Device::cpu_threads`); every parallel loop in `cpu.rs` runs inside `self.pool.install`, never on the global pool (`tests/threads.rs` counts OS threads). `PlanOptions::time_budget` becomes a deadline passed to `Backend::trajopt` and to the fallback's `connect_until`/`shortcut_until`; without one, nothing waits or checks the clock, and results are deterministic.
 - **USD stays optional.** The `openusd` crates are pinned exactly (`=0.7.0`, pre-1.0) and only built with feature `usd`.
 - **Standalone, with optional bridges.**
   - The core has no middleware and reads no environment variables. Env vars appear only in tests and examples (`BATCHPLAN_REQUIRE_GPU`, `BENCH_LLVMPIPE`).

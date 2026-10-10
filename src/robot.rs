@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::description::{self, JointType, RobotDescription, TriMesh};
+use crate::description::{self, Geometry, JointType, RobotDescription, Shape, TriMesh};
+use crate::error::{self, Error, ensure_input, input};
 use crate::spheres::{self, SphereGeometry, SphereOptions};
 use crate::types::Pose;
 
@@ -106,15 +107,17 @@ pub struct CollisionModel {
 }
 
 impl CollisionModel {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(path: impl AsRef<Path>) -> error::Result<Self> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let load = |message: String| Error::Load { path: path.to_path_buf(), message };
+        let text = std::fs::read_to_string(path).map_err(|e| load(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| load(e.to_string()))
     }
 
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn save(&self, path: impl AsRef<Path>) -> error::Result<()> {
         let path = path.as_ref();
-        std::fs::write(path, serde_json::to_string_pretty(self)?).with_context(|| format!("writing {}", path.display()))
+        std::fs::write(path, serde_json::to_string_pretty(self)?)
+            .map_err(|e| Error::Write(format!("writing {}: {e}", path.display())))
     }
 }
 
@@ -184,6 +187,23 @@ pub struct Robot {
     pub(crate) ee_link: usize,
     pub(crate) default_q: Vec<f32>,
     collision_model: CollisionModel,
+    /// Names of attached objects, each a fixed link at the end of `links`.
+    attached: Vec<String>,
+}
+
+/// An object the robot holds, attached the way MoveIt attaches one: it becomes a frame fixed to
+/// `link` with spheres fitted to its shapes, collides with the world and the rest of the robot,
+/// and never with `link` or `touch_links` (such as the fingers holding it).
+#[derive(Clone, Debug)]
+pub struct AttachedObject {
+    /// The object's frame name, which must not name a link of the robot.
+    pub name: String,
+    pub link: String,
+    /// The object's shapes, placed in `link`'s frame. Distance grids are not supported.
+    pub shapes: Vec<crate::world::Obstacle>,
+    pub touch_links: Vec<String>,
+    /// How spheres are fitted to the shapes; a held object rarely needs more than 8 to 16.
+    pub spheres: SphereOptions,
 }
 
 /// World-frame kinematic state for one configuration.
@@ -207,10 +227,11 @@ impl Fk {
 
 impl Robot {
     /// Loads a robot from URDF, MJCF (`.xml`, `.mjcf`) or OpenUSD (`.usd*`, feature `usd`).
-    pub fn load(path: impl AsRef<Path>, o: &RobotOptions) -> Result<Self> {
+    pub fn load(path: impl AsRef<Path>, o: &RobotOptions) -> error::Result<Self> {
         let path = path.as_ref();
-        let description = description::load_robot(path, &o.package_dirs, &o.variants)?;
-        Self::from_description(&description, o).with_context(|| format!("building the robot in {}", path.display()))
+        description::load_robot(path, &o.package_dirs, &o.variants)
+            .and_then(|description| Self::from_description(&description, o))
+            .map_err(|e| Error::Load { path: path.to_path_buf(), message: format!("{e:#}") })
     }
 
     fn from_description(desc: &RobotDescription, o: &RobotOptions) -> Result<Self> {
@@ -297,6 +318,58 @@ impl Robot {
         self.self_pairs = self_pairs;
         self.collision_model = model;
         Ok(())
+    }
+
+    /// This robot holding `object`. Errors if the link is unknown or an attached object, the name
+    /// is taken, or the robot would exceed the kernel limits.
+    pub fn attach(&self, object: &AttachedObject) -> error::Result<Robot> {
+        let link = |name: &str| self.links.iter().position(|l| l.name == name);
+        let parent = link(&object.link).ok_or_else(|| input!("unknown link '{}'", object.link))?;
+        ensure_input!(!self.attached.contains(&object.link), "objects attach to robot links, not to '{}'", object.link);
+        ensure_input!(link(&object.name).is_none(), "'{}' already names a link", object.name);
+        if let Some(t) = object.touch_links.iter().find(|t| link(t).is_none()) {
+            return Err(input!("unknown touch link '{t}'"));
+        }
+        ensure_input!(self.links.len() < MAX_LINKS, "attaching '{}' exceeds MAX_LINKS={MAX_LINKS}", object.name);
+        let meshes = object
+            .shapes
+            .iter()
+            .map(|shape| attached_shape(shape)?.mesh().map_err(|e| input!("{e:#}")))
+            .collect::<error::Result<Vec<TriMesh>>>()?;
+        ensure_input!(!meshes.is_empty(), "'{}' has no shapes", object.name);
+        let (fitted, _) = spheres::fit(&[meshes], &object.spheres);
+        let mut robot = self.clone();
+        let chain = robot.links[parent].chain;
+        robot.links.push(Link {
+            name: object.name.clone(),
+            parent: Some(parent),
+            origin: Transform::IDENTITY,
+            joint: JointKind::Fixed,
+            chain,
+        });
+        robot.attached.push(object.name.clone());
+        let mut model = self.collision_model.clone();
+        model.spheres.insert(object.name.clone(), fitted.into_iter().flatten().collect());
+        let ignored = model.self_collision_ignore.entry(object.name.clone()).or_default();
+        ignored.push(object.link.clone());
+        ignored.extend(object.touch_links.iter().cloned());
+        robot.set_collision_model(model).map_err(|e| input!("{e:#}"))?;
+        Ok(robot)
+    }
+
+    /// This robot without the attached object `name`.
+    pub fn detach(&self, name: &str) -> error::Result<Robot> {
+        let index =
+            self.attached.iter().position(|a| a == name).ok_or_else(|| input!("nothing named '{name}' is attached"))?;
+        let mut robot = self.clone();
+        robot.attached.remove(index);
+        // Attached objects are leaves after every robot link, so no other link refers to this one.
+        robot.links.retain(|l| l.name != name);
+        let mut model = self.collision_model.clone();
+        model.spheres.remove(name);
+        model.self_collision_ignore.remove(name);
+        robot.set_collision_model(model).map_err(|e| input!("{e:#}"))?;
+        Ok(robot)
     }
 
     /// The robot name from its description.
@@ -589,6 +662,29 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         ee_link,
         default_q,
         collision_model: CollisionModel::default(),
+        attached: vec![],
+    })
+}
+
+/// An attached object's shape, placed in its link's frame.
+fn attached_shape(shape: &crate::world::Obstacle) -> error::Result<Shape> {
+    use crate::world::Obstacle;
+    let placed = |center: Vec3, rotation: Quat, geometry: Geometry| Shape {
+        origin: Transform { rot: Mat3::from_quat(rotation), trans: center },
+        geometry,
+    };
+    Ok(match *shape {
+        Obstacle::Cuboid { center, half_extents, rotation } => {
+            placed(center, rotation, Geometry::Box { half: half_extents })
+        }
+        Obstacle::Sphere { center, radius } => placed(center, Quat::IDENTITY, Geometry::Sphere { radius }),
+        Obstacle::Cylinder { center, rotation, radius, half_height } => {
+            placed(center, rotation, Geometry::Cylinder { radius, half_length: half_height })
+        }
+        Obstacle::Capsule { center, rotation, radius, half_length } => {
+            placed(center, rotation, Geometry::Capsule { radius, half_length })
+        }
+        Obstacle::Sdf { .. } => return Err(input!("attached objects cannot be distance grids")),
     })
 }
 

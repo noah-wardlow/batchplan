@@ -1,5 +1,6 @@
 //! The GPU device against the CPU device, plus end-to-end validity of GPU plans.
 //! Skipped when no adapter is available unless `BATCHPLAN_REQUIRE_GPU=1`.
+#![cfg(feature = "gpu")]
 
 #[path = "../examples/common/mod.rs"]
 mod common;
@@ -12,7 +13,7 @@ fn setup() -> Option<(Robot, Device, Device)> {
     match Device::gpu(&robot) {
         Ok(gpu) => {
             eprintln!("using {}", gpu.name());
-            let cpu = Device::cpu(&robot);
+            let cpu = Device::cpu(&robot).unwrap();
             Some((robot, gpu, cpu))
         }
         Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => {
@@ -26,8 +27,8 @@ fn setup() -> Option<(Robot, Device, Device)> {
 #[test]
 fn unknown_adapter_is_a_clear_error() {
     let robot = common::panda().unwrap();
-    let err = Device::gpu_named(&robot, "no-such-gpu").err().expect("should fail").to_string();
-    assert!(err.contains("no-such-gpu"), "{err}");
+    let err = Device::gpu_named(&robot, "no-such-gpu").err().expect("should fail");
+    assert!(matches!(&err, Error::Gpu(m) if m.contains("no-such-gpu")), "{err:?}");
 }
 
 fn worlds(n: usize, seed: u64) -> Vec<World> {

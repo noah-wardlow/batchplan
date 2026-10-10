@@ -1,7 +1,7 @@
 //! Planner output as policy-training demonstrations: nominal reaches plus recoveries from
 //! perturbed states, timed within the robot's limits at randomized speeds.
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::device::{CollisionWeights, Device, Worlds};
 use crate::ik::{IkOptions, IkProblem, solve_ik};

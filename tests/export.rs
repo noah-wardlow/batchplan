@@ -12,7 +12,7 @@ use batchplan::*;
 
 fn demos(dt: f32) -> (Robot, Vec<World>, Vec<Demonstration>) {
     let robot = common::panda().unwrap();
-    let device = Device::cpu(&robot);
+    let device = Device::cpu(&robot).unwrap();
     let mut rng = Rng::new(3);
     let worlds: Vec<World> = (0..6).map(|_| common::tabletop(&mut rng)).collect();
     let goals: Vec<IkProblem> = worlds

@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Result, ensure};
+use crate::error::{Result, ensure_input};
 use serde_json::{Map, Value, json};
 
 use crate::datagen::Demonstration;
@@ -27,10 +27,10 @@ pub struct ExportOptions {
 ///
 /// All demonstrations must share one sample period.
 pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
-    ensure!(!demos.is_empty(), "no demonstrations to export");
-    ensure!(!root.join("meta.json").exists(), "{} already holds a dataset", root.display());
+    ensure_input!(!demos.is_empty(), "no demonstrations to export");
+    ensure_input!(!root.join("meta.json").exists(), "{} already holds a dataset", root.display());
     let dt = demos[0].trajectory.dt;
-    ensure!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
+    ensure_input!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
     std::fs::create_dir_all(root)?;
 
     let (n, m) = (robot.dof(), demos.len());
@@ -99,7 +99,11 @@ impl Element for u8 {
 
 /// One `.npy` file (format version 1.0, little-endian, C order).
 fn write<T: Element>(path: impl AsRef<Path>, shape: &[usize], data: &[T]) -> Result<()> {
-    ensure!(shape.iter().product::<usize>() == data.len(), "shape {shape:?} does not match {} elements", data.len());
+    ensure_input!(
+        shape.iter().product::<usize>() == data.len(),
+        "shape {shape:?} does not match {} elements",
+        data.len()
+    );
     let dims = match shape {
         [n] => format!("{n},"),
         _ => shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),

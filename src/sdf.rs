@@ -8,7 +8,7 @@
 //! than its geometry, and walls thinner than a voxel still block. The price is that obstacles grow,
 //! by up to a voxel diagonal for meshes and about three voxels for points and depth images.
 
-use anyhow::{Result, anyhow, ensure};
+use crate::error::{Result, ensure_input, input};
 use glam::{UVec3, Vec3};
 use half::f16;
 use parry3d::query::PointQuery;
@@ -77,17 +77,17 @@ impl SdfGrid {
     /// A grid holding `distances` at `dims` points (`dims[0] * dims[1] * dims[2]` values, x
     /// fastest), as given: no conservative offset is applied.
     pub fn new(dims: [u32; 3], voxel: f32, origin: Vec3, distances: &[f32]) -> Result<Self> {
-        ensure!(dims.iter().all(|&d| d >= 2), "a grid needs at least 2 points per axis, got {dims:?}");
-        ensure!(voxel.is_finite() && voxel > 0.0, "the voxel size must be positive, got {voxel}");
-        ensure!(origin.is_finite(), "the grid origin must be finite");
+        ensure_input!(dims.iter().all(|&d| d >= 2), "a grid needs at least 2 points per axis, got {dims:?}");
+        ensure_input!(voxel.is_finite() && voxel > 0.0, "the voxel size must be positive, got {voxel}");
+        ensure_input!(origin.is_finite(), "the grid origin must be finite");
         let count = dims.iter().map(|&d| u64::from(d)).product::<u64>();
-        ensure!(count <= MAX_POINTS, "{dims:?} is {count} points, more than {MAX_POINTS}; use larger voxels");
-        ensure!(distances.len() as u64 == count, "{dims:?} needs {count} distances, got {}", distances.len());
+        ensure_input!(count <= MAX_POINTS, "{dims:?} is {count} points, more than {MAX_POINTS}; use larger voxels");
+        ensure_input!(distances.len() as u64 == count, "{dims:?} needs {count} distances, got {}", distances.len());
         let values = distances
             .iter()
             .map(|&d| {
                 let h = f16::from_f32(d);
-                ensure!(h.is_finite(), "distance {d} does not fit a half float");
+                ensure_input!(h.is_finite(), "distance {d} does not fit a half float");
                 // GPUs may flush subnormal halves to zero; storing them as zero keeps devices equal.
                 Ok(if h.is_normal() { h.to_bits() } else { 0 })
             })
@@ -98,13 +98,13 @@ impl SdfGrid {
     /// The distance field of a closed triangle mesh, in the mesh's frame. Triangles may face in
     /// or out, consistently; meshes that are open or not manifold have no inside and are refused.
     pub fn from_mesh(vertices: &[Vec3], triangles: &[[u32; 3]], o: &SdfOptions) -> Result<Self> {
-        ensure!(!triangles.is_empty(), "the mesh has no triangles");
-        ensure!(
+        ensure_input!(!triangles.is_empty(), "the mesh has no triangles");
+        ensure_input!(
             triangles.iter().flatten().all(|&i| (i as usize) < vertices.len()),
             "a triangle refers to a vertex past the {} given",
             vertices.len()
         );
-        ensure!(vertices.iter().all(|v| v.is_finite()), "mesh vertices must be finite");
+        ensure_input!(vertices.iter().all(|v| v.is_finite()), "mesh vertices must be finite");
         let mut mesh = TriMesh { vertices: vertices.to_vec(), triangles: triangles.to_vec() };
         mesh.orient_outward();
         let flags = TriMeshFlags::HALF_EDGE_TOPOLOGY
@@ -112,11 +112,11 @@ impl SdfGrid {
             | TriMeshFlags::MERGE_DUPLICATE_VERTICES
             | TriMeshFlags::DELETE_DEGENERATE_TRIANGLES;
         // `with_flags` drops topology errors, so the flags are set separately.
-        let mut solid = ParryMesh::new(mesh.vertices.clone(), mesh.triangles)?;
-        solid.set_flags(flags).map_err(|e| anyhow!("the mesh is not a manifold surface: {e}"))?;
+        let mut solid = ParryMesh::new(mesh.vertices.clone(), mesh.triangles).map_err(|e| input!("{e}"))?;
+        solid.set_flags(flags).map_err(|e| input!("the mesh is not a manifold surface: {e}"))?;
         let topology = solid.topology().expect("set_flags computed the topology");
         let open = topology.half_edges.iter().filter(|h| h.twin == u32::MAX).count();
-        ensure!(open == 0, "the mesh is not closed ({open} edges border a single triangle), so it has no inside");
+        ensure_input!(open == 0, "the mesh is not closed ({open} edges border a single triangle), so it has no inside");
         let (lo, hi) = bounds(&mesh.vertices);
         let (dims, origin) = layout(lo, hi, o)?;
         let distances = (0..dims.element_product())
@@ -134,8 +134,8 @@ impl SdfGrid {
     /// The distance field of surface points, such as a point cloud. Voxels holding a point are
     /// solid; the inside of a closed surface reads as free beyond its shell of voxels.
     pub fn from_points(points: &[Vec3], o: &SdfOptions) -> Result<Self> {
-        ensure!(!points.is_empty(), "no points");
-        ensure!(points.iter().all(|p| p.is_finite()), "points must be finite");
+        ensure_input!(!points.is_empty(), "no points");
+        ensure_input!(points.iter().all(|p| p.is_finite()), "points must be finite");
         let (lo, hi) = bounds(points);
         let (dims, origin) = layout(lo, hi, o)?;
         let mut occupied = vec![false; dims.element_product() as usize];
@@ -162,13 +162,13 @@ impl SdfGrid {
         behind: Occlusion,
         o: &SdfOptions,
     ) -> Result<Self> {
-        ensure!(
+        ensure_input!(
             width > 0 && depth.len().is_multiple_of(width),
             "{} depth values do not form rows of {width}",
             depth.len()
         );
         let Intrinsics { fx, fy, cx, cy } = intrinsics;
-        ensure!(fx > 0.0 && fy > 0.0 && cx.is_finite() && cy.is_finite(), "invalid intrinsics {intrinsics:?}");
+        ensure_input!(fx > 0.0 && fy > 0.0 && cx.is_finite() && cy.is_finite(), "invalid intrinsics {intrinsics:?}");
         let height = depth.len() / width;
         let reading = |u: usize, v: usize| Some(depth[v * width + u]).filter(|z| z.is_finite() && *z > 0.0);
         let to_world = |u: f32, v: f32, z: f32| camera.rotation * Vec3::new((u - cx) / fx * z, (v - cy) / fy * z, z);
@@ -176,7 +176,7 @@ impl SdfGrid {
             .flat_map(|v| (0..width).filter_map(move |u| Some((u, v, reading(u, v)?))))
             .map(|(u, v, z)| to_world(u as f32, v as f32, z) + camera.position)
             .collect();
-        ensure!(!points.is_empty(), "the depth image has no valid pixels");
+        ensure_input!(!points.is_empty(), "the depth image has no valid pixels");
         let (lo, hi) = bounds(&points);
         let (dims, origin) = layout(lo, hi, o)?;
         let to_camera = camera.rotation.inverse();
@@ -241,7 +241,7 @@ impl SdfGrid {
     /// `d` away; an occupied point is at most `d - 1 / 2` deep when the nearest free center is `d`
     /// away. Both bounds keep each value at or below the true distance.
     fn from_occupancy(dims: UVec3, origin: Vec3, voxel: f32, occupied: &[bool]) -> Result<Self> {
-        ensure!(!occupied.iter().all(|&o| o), "every voxel is occupied; increase the padding");
+        ensure_input!(!occupied.iter().all(|&o| o), "every voxel is occupied; increase the padding");
         let dims = dims.to_array().map(|d| d as usize);
         let (to_solid, to_free) = (squared_edt(occupied, true, dims), squared_edt(occupied, false, dims));
         let half_diagonal = 3f64.sqrt() / 2.0;
@@ -287,12 +287,12 @@ fn bounds(points: &[Vec3]) -> (Vec3, Vec3) {
 
 /// Grid dimensions and origin covering `lo..=hi` plus the padding.
 fn layout(lo: Vec3, hi: Vec3, o: &SdfOptions) -> Result<(UVec3, Vec3)> {
-    ensure!(o.voxel.is_finite() && o.voxel > 0.0, "the voxel size must be positive, got {}", o.voxel);
-    ensure!(o.padding.is_finite() && o.padding >= 0.0, "the padding must not be negative, got {}", o.padding);
+    ensure_input!(o.voxel.is_finite() && o.voxel > 0.0, "the voxel size must be positive, got {}", o.voxel);
+    ensure_input!(o.padding.is_finite() && o.padding >= 0.0, "the padding must not be negative, got {}", o.padding);
     let origin = lo - o.padding;
     let dims = ((hi + o.padding - origin) / o.voxel).ceil().max(Vec3::ONE) + 1.0;
     let points = dims.as_dvec3().element_product();
-    ensure!(points <= MAX_POINTS as f64, "a grid of {} m voxels over {} m is too large", o.voxel, hi - lo);
+    ensure_input!(points <= MAX_POINTS as f64, "a grid of {} m voxels over {} m is too large", o.voxel, hi - lo);
     Ok((dims.as_uvec3(), origin))
 }
 

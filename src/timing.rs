@@ -7,7 +7,7 @@
 //! stays within the largest of its control values, so choosing `h` from the differences bounds the
 //! whole curve.
 
-use anyhow::{Result, bail, ensure};
+use crate::error::{Error, Result, ensure_input};
 use serde::{Deserialize, Serialize};
 
 use crate::robot::Robot;
@@ -119,17 +119,27 @@ impl Trajectory {
     pub fn check(&self, robot: &Robot) -> Result<()> {
         let n = robot.dof();
         let cp = &self.control_points;
-        ensure!(self.dof == n, "trajectory has {} joints, the robot has {n}", self.dof);
-        ensure!(cp.len().is_multiple_of(n) && cp.len() / n >= 7, "need a whole number of at least 7 control points");
-        ensure!(cp.iter().all(|v| v.is_finite()), "control points must be finite");
+        ensure_input!(self.dof == n, "trajectory has {} joints, the robot has {n}", self.dof);
+        ensure_input!(
+            cp.len().is_multiple_of(n) && cp.len() / n >= 7,
+            "need a whole number of at least 7 control points"
+        );
+        macro_rules! ensure_safe {
+            ($cond:expr, $($message:tt)+) => {
+                if !$cond {
+                    return Err(Error::Unsafe(format!($($message)+)));
+                }
+            };
+        }
+        ensure_safe!(cp.iter().all(|v| v.is_finite()), "control points must be finite");
         let h = self.knot_interval;
-        ensure!(h.is_finite() && h >= 0.0, "knot interval must be finite and non-negative, got {h}");
+        ensure_safe!(h.is_finite() && h >= 0.0, "knot interval must be finite and non-negative, got {h}");
         let points = cp.len() / n;
         if h == 0.0 {
-            ensure!(cp.chunks(n).all(|p| p == &cp[..n]), "a trajectory that takes no time must not move");
+            ensure_safe!(cp.chunks(n).all(|p| p == &cp[..n]), "a trajectory that takes no time must not move");
         }
         for end in [0, points - 3] {
-            ensure!(
+            ensure_safe!(
                 (end..end + 3).all(|i| cp[i * n..(i + 1) * n] == cp[end * n..(end + 1) * n]),
                 "trajectory must start and end at rest (three equal control points at each end)"
             );
@@ -139,13 +149,16 @@ impl Trajectory {
         for j in 0..n {
             let (lo, hi) = (robot.lower()[j], robot.upper()[j]);
             if let Some(i) = (0..points).find(|&i| !(lo..=hi).contains(&cp[i * n + j])) {
-                bail!("joint {j} leaves its range [{lo}, {hi}] at control point {i}");
+                return Err(Error::Unsafe(format!("joint {j} leaves its range [{lo}, {hi}] at control point {i}")));
             }
             for (order, &(width, weights)) in DIFFERENCES.iter().enumerate().filter(|_| h > 0.0) {
                 let peak = largest_difference(cp, n, j, width, weights) / h.powi(order as i32 + 1);
                 let limit = limits[order][j];
                 if peak > limit * (1.0 + 1e-4) {
-                    bail!("joint {j} reaches {} {peak}, over its limit {limit}", names[order]);
+                    return Err(Error::Unsafe(format!(
+                        "joint {j} reaches {} {peak}, over its limit {limit}",
+                        names[order]
+                    )));
                 }
             }
         }

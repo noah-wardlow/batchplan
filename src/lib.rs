@@ -27,6 +27,8 @@ mod cpu;
 pub mod datagen;
 mod description;
 pub mod device;
+pub mod error;
+#[cfg(feature = "gpu")]
 mod gpu;
 pub mod ik;
 #[cfg(feature = "lerobot")]
@@ -49,8 +51,9 @@ mod usd;
 pub mod world;
 
 pub use device::{CollisionWeights, Device, Evaluation, Worlds};
+pub use error::Error;
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
-pub use robot::{CollisionModel, Robot, RobotOptions};
+pub use robot::{AttachedObject, CollisionModel, Robot, RobotOptions};
 pub use rrt::{RrtOptions, RrtProblem, RrtResult};
 pub use sdf::{Intrinsics, Occlusion, SdfGrid, SdfOptions};
 pub use shortcut::ShortcutOptions;

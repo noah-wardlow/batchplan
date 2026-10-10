@@ -1,7 +1,7 @@
 //! Batched collision-aware inverse kinematics: damped least squares from many seeds per target,
 //! with the collision gradient projected into the Jacobian null space.
 
-use anyhow::{Result, ensure};
+use crate::error::{Result, ensure_input};
 
 use crate::device::{CollisionWeights, Device, Worlds};
 use crate::rng::Rng;
@@ -89,7 +89,7 @@ impl IkResult {
 pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &IkOptions) -> Result<IkResult> {
     let robot = device.robot();
     let n = robot.dof();
-    ensure!(o.seeds > 0, "need at least one seed");
+    ensure_input!(o.seeds > 0, "need at least one seed");
     let items = problems.len() * o.seeds;
     let mut rng = Rng::new(o.rng_seed);
     let mut q = Vec::with_capacity(items * n);

@@ -54,7 +54,7 @@ fn render(scene: &World, camera: Pose, k: Intrinsics) -> Vec<f32> {
 
 fn main() -> Result<()> {
     let robot = common::panda()?;
-    let device = if std::env::args().any(|a| a == "--cpu") { Device::cpu(&robot) } else { Device::gpu(&robot)? };
+    let device = if std::env::args().any(|a| a == "--cpu") { Device::cpu(&robot)? } else { Device::gpu(&robot)? };
     println!("device: {}", device.name());
     let mut rng = Rng::new(3);
     let scene = common::tabletop(&mut rng);
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
     );
 
     // Every plan, timed and sampled densely, against the true scene.
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot)?;
     let truth = cpu.upload(std::slice::from_ref(&scene))?;
     let (mut samples, mut worst) = (vec![], f32::INFINITY);
     for s in result.solved() {

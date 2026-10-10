@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         Ok(gpu) => devices.push(gpu),
         Err(e) => eprintln!("no GPU device: {e}"),
     }
-    devices.push(Device::cpu(&robot));
+    devices.push(Device::cpu(&robot)?);
     if std::env::var("BENCH_LLVMPIPE").is_ok() {
         devices.push(Device::gpu_named(&robot, "llvmpipe")?);
     }

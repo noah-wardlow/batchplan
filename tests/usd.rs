@@ -156,7 +156,7 @@ fn franka_usd_converted_from_our_urdf_matches_it() {
         q_all.extend(q);
     }
     assert!(worst < 1e-5, "USD and URDF Franka differ by {worst}");
-    let (a, b) = (Device::cpu(&usd), Device::cpu(&urdf));
+    let (a, b) = (Device::cpu(&usd).unwrap(), Device::cpu(&urdf).unwrap());
     let item_world = vec![0; 100];
     let (ea, eb) = (
         a.evaluate(&a.upload(&[World::default()]).unwrap(), &item_world, &q_all, &CollisionWeights::NONE).unwrap(),

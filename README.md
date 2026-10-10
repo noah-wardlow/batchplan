@@ -22,7 +22,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 
 | Module | Interface | Behind it |
 |---|---|---|
-| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `device.upload(&worlds)`, `device.evaluate(..)` | Robot uploaded once; worlds uploaded once into a `Worlds` handle that every algorithm takes. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices, worlds uploaded to this device), so malformed input is an `Err` on both devices. |
+| `device` | `Device::gpu(&robot)`, `Device::cpu(&robot)`, `Device::cpu_threads(&robot, n)`, `device.with_robot(&robot)`, `device.upload(&worlds)`, `device.evaluate(..)` | Robot uploaded once; worlds uploaded once into a `Worlds` handle that every algorithm takes. The CPU device runs on threads it owns. Batched FK, sphere collision cost, analytic gradient and clearances. WGSL kernels on the GPU, rayon on the CPU. Every batch is checked first (array shapes, world indices, worlds uploaded to this device), so malformed input is an `Err` on both devices. |
 | `ik` | `solve_ik(&device, &worlds, &problems, &IkOptions)` | Many seeds per target. Damped least squares, with the collision gradient projected into the Jacobian null space. Success = pose tolerance + collision-free. The result keeps its problems; `ik.solved()` yields each one with its best configuration. |
 | `trajopt` | `plan(&device, &worlds, &problems, &PlanOptions)` | Many seeds per start/goal, each a uniform cubic B-spline that starts and ends at rest. L-BFGS on smoothness plus collision cost sampled along the curve, with a line search that prices four step sizes at once, then validation by sampling the curve densely. Problems no seed solves fall back to RRT-Connect. `result.solved()` yields each problem with its shortest valid path's control points. |
 | `rrt`, `shortcut` | `rrt::connect(&device, &worlds, &problems, &RrtOptions)`, `shortcut::shortcut(..)` | RRT-Connect with goal sets, and random shortcutting followed by redundant-waypoint removal; see [Fallback](#fallback-rrt-connect). |
@@ -30,7 +30,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `datagen` | `demonstrations(&device, &worlds, &goals, &DemoOptions)` | The full demonstration pipeline; see [Training data](#training-data). `recovery_problems(&device, &worlds, &plan_result, ..)` exposes the recovery step on its own. |
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
-| `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
+| `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `robot.attach(&AttachedObject)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
 | `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
 
 Design choices:
@@ -162,6 +162,18 @@ Trajectory optimization cannot escape a seed that has to go around an obstacle t
 2. **Shortcutting** tries 8 random shortcuts per path per round and keeps the one that shortens it most. It stops after 32 failures in a row, then drops waypoints whose neighbors see each other. On the UR5e test paths the result is within 5% of the straight-line lower bound.
 3. **Tracing** turns the waypoints into B-spline control points: each waypoint three times, the rest along the edges. The spline then runs exactly along the checked path and stops at its corners. Spreading control points evenly by arc length instead cut corners into the obstacles RRT-Connect had found its way around. The traced spline and an optimized version are validated like any seed, and the shorter valid one is the result.
 
+## Embedding in a control process
+
+batchplan can run inside a robot's own controller process, next to a fixed-rate control loop:
+- **CPU-only builds.** `default-features = false` drops the `gpu` feature and wgpu with it; CI builds that for `aarch64-unknown-linux-gnu`. `Device::gpu` then returns an error instead of a device.
+- **Threads the host controls.** `Device::cpu_threads(&robot, n)` starts `n` workers and runs every batch on them, never on rayon's global pool; a test counts the process's threads around IK, planning, RRT-Connect and shortcutting with a one-thread device. Loading a robot that needs sphere fitting and building distance grids use rayon's global pool; call them inside `pool.install(..)` of the host's own rayon pool to keep them there.
+- **Time budgets.** `PlanOptions::time_budget` stops optimization and the fallback between rounds (on a GPU, between submissions of 8 rounds) and returns the best valid paths so far. On the M4 Pro, a 1 ms budget for 64 problems returns in 25 ms on the CPU (3.0 s without a budget) and in 104 ms on the GPU (507 ms), where one submission takes about 110 ms. Without a budget, every run gives bit-identical results.
+- **Batch-1 latency.** When a batch has fewer paths than the CPU device has threads, each path's line search and gradient spread over threads too. On the Framework's CPU, IK and planning for one problem at a time went from 117–131 / 142–161 / 268–370 ms (mean / p75 / p98, two runs) to 63–65 / 78–79 / 140–149 ms, with batched throughput unchanged.
+- **Typed errors.** Every public function returns a `batchplan::Error` whose kind a host can act on: `Input` (shapes, indices, options, geometry), `Load` (with the file's path), `Gpu`, `Threads`, `Unsafe` (`Trajectory::check`) and `Write`.
+- **Holding objects.** `robot.attach(&AttachedObject)` follows MoveIt: the object becomes a frame fixed to a link, with spheres fitted to its shapes; it collides with the world and the rest of the robot, never with its link or the `touch_links` that hold it. `detach` takes it off. `device.with_robot(&held)` gives a device for the new robot that shares the old one's GPU or threads and its uploaded worlds, so picking something up costs no new device and no new upload.
+
+`examples/control_loop.rs` puts these together, shaped like a ros2_control or robotd controller. A planner thread with a two-thread CPU device plans reaches under a 500 ms budget, checks each trajectory, and hands it over through a latest-value slot. The 50 Hz loop takes a new trajectory when one is ready without ever waiting on the lock, samples it with the allocation-free `at(t)`, and holds its pose otherwise. On the M4 Pro, while other work loaded the machine, plans took 150–180 ms and the loop's worst tick was 5 ms late.
+
 ## Benchmark
 
 `scripts/fetch_benchmark.sh` downloads the standard Panda problem sets that [robometrics](https://github.com/fishbotics/robometrics) packages as plain YAML (MIT): MotionBenchMaker's 800 problems in 8 sets and MπNets' 1,800 in 12, at a pinned commit with checksums. No ROS is involved. `cargo run --release --example benchmark` runs every set on the GPU and the CPU in two modes:
@@ -198,7 +210,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 59 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 6 OpenUSD tests. Both configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal). An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 66 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 6 OpenUSD tests. Without default features (CPU only), 58 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -254,6 +266,11 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
   - The Franka converted from our URDF matches it to 1e-5, with identical self-collision results under the same collision model.
   - `scripts/validate_usd.py` rebuilds every fixture's kinematics with Pixar's `usd-core` and agrees with batchplan to within 6e-6.
 - **Adapter errors:** adapters below the required limits are rejected with the reason, and an unknown adapter name is a clear error.
+- **Embedding:**
+  - A one-thread CPU device starts exactly one thread and no others while it plans; planting one use of rayon's global pool fails the test.
+  - A 1 ms time budget returns within one more chunk of work than the budget, on the CPU and the GPU, and the fallback stops at the budget too. Without a budget, two runs give identical paths. Planting a backend or a fallback that ignores the deadline fails a test.
+  - Errors have the documented kinds: a malformed batch is `Input`, an unknown adapter `Gpu`, a bad file `Load` with its path, an unsafe trajectory `Unsafe`.
+  - An attached box moves with the hand, collides with an obstacle between the fingers that the bare hand misses, and collides with the fingers unless they are touch links. Collision gradients through it match finite differences. Detaching restores the robot exactly. Devices made with `with_robot` plan around the box in worlds uploaded to the original device, and see it exactly as a device made for the held robot does, on the CPU and the GPU. Planting ignored touch links, a wrong kinematic chain, a GPU device that keeps the old robot, or a detach that keeps the spheres fails a test.
 
 ## Training data
 

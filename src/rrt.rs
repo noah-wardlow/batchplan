@@ -4,7 +4,9 @@
 //! node; each of those two steps checks all problems' edges in one batched [`Device::evaluate`]
 //! call, so a device sees few, large batches.
 
-use anyhow::{Result, ensure};
+use std::time::Instant;
+
+use crate::error::{Result, ensure_input};
 
 use crate::device::{CollisionWeights, Device, Worlds};
 use crate::rng::Rng;
@@ -150,14 +152,25 @@ impl Search {
 /// Finds a collision-free waypoint path from each problem's start to one of its goals. Starts and
 /// goals in collision are skipped; a problem without a free start or goal has no path.
 pub fn connect(device: &Device, worlds: &Worlds, problems: &[RrtProblem], o: &RrtOptions) -> Result<RrtResult> {
+    connect_until(device, worlds, problems, o, None)
+}
+
+/// [`connect`] that stops searching between rounds once `deadline` passes.
+pub(crate) fn connect_until(
+    device: &Device,
+    worlds: &Worlds,
+    problems: &[RrtProblem],
+    o: &RrtOptions,
+    deadline: Option<Instant>,
+) -> Result<RrtResult> {
     let robot = device.robot();
     let n = robot.dof();
-    ensure!(o.step > 0.0 && o.resolution > 0.0, "step and resolution must be positive");
+    ensure_input!(o.step > 0.0 && o.resolution > 0.0, "step and resolution must be positive");
     let mut ends = vec![];
     let mut end_world = vec![];
     for (i, p) in problems.iter().enumerate() {
-        ensure!(p.start.len() == n, "problem {i}: the start must have {n} values");
-        ensure!(p.goals.iter().all(|g| g.len() == n), "problem {i}: goals must have {n} values");
+        ensure_input!(p.start.len() == n, "problem {i}: the start must have {n} values");
+        ensure_input!(p.goals.iter().all(|g| g.len() == n), "problem {i}: goals must have {n} values");
         for q in std::iter::once(&p.start).chain(&p.goals) {
             ends.extend_from_slice(q);
             end_world.push(p.world);
@@ -183,8 +196,11 @@ pub fn connect(device: &Device, worlds: &Worlds, problems: &[RrtProblem], o: &Rr
     }
     let alive = |s: &Search| s.path.is_none() && s.trees.iter().all(|t| !t.parent.is_empty());
 
-    ensure!(o.extensions_per_round > 0, "extend toward at least one configuration per round");
+    ensure_input!(o.extensions_per_round > 0, "extend toward at least one configuration per round");
     for _ in 0..o.max_rounds {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         // Extend: a step from the nearest node toward each of several random configurations.
         let mut extend = Segments::new(n, o.resolution);
         let mut steps = vec![];

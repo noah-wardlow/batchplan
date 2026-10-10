@@ -26,7 +26,7 @@ pub fn panda_options() -> RobotOptions {
     }
 }
 
-pub fn panda() -> anyhow::Result<Robot> {
+pub fn panda() -> Result<Robot, batchplan::Error> {
     Robot::load(asset("franka/franka_panda.urdf"), &panda_options())
 }
 

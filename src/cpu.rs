@@ -1,4 +1,4 @@
-//! CPU reference backend (rayon over items). Every function here has a WGSL twin in
+//! CPU reference backend (rayon over items, on a pool it owns). Every function here has a WGSL twin in
 //! `kernels.wgsl`; the GPU parity tests compare the two.
 
 // Index loops here mirror kernels.wgsl line for line, which keeps the two easy to compare.
@@ -6,8 +6,9 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::Result;
+use crate::error::{Error, Result};
 use glam::{Mat3, Vec3};
 use rayon::prelude::*;
 
@@ -24,11 +25,19 @@ use crate::world::{
 
 pub(crate) struct CpuBackend {
     robot: Robot,
+    /// All batched work runs here, never on rayon's global pool.
+    pool: Arc<rayon::ThreadPool>,
 }
 
 impl CpuBackend {
-    pub(crate) fn new(robot: &Robot) -> Self {
-        Self { robot: robot.clone() }
+    /// `threads` workers; 0 means one per core.
+    pub(crate) fn new(robot: &Robot, threads: usize) -> Result<Self> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("batchplan-cpu-{i}"))
+            .build()
+            .map_err(|e| Error::Threads(format!("starting the CPU device's threads: {e}")))?;
+        Ok(Self { robot: robot.clone(), pool: Arc::new(pool) })
     }
 }
 
@@ -505,9 +514,18 @@ fn lbfgs_direction(st: &mut Lbfgs, n: usize, o: &PlanOptions) {
     }
 }
 
+/// `f(index, chunk)` over `size`-long chunks of `data`, on the pool's threads when `parallel`.
+fn each_chunk<T: Send>(parallel: bool, data: &mut [T], size: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    if parallel {
+        data.par_chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+    } else {
+        data.chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+    }
+}
+
 impl Backend for CpuBackend {
     fn name(&self) -> String {
-        format!("cpu ({} threads)", rayon::current_num_threads())
+        format!("cpu ({} threads)", self.pool.current_num_threads())
     }
 
     fn robot(&self) -> &Robot {
@@ -518,18 +536,23 @@ impl Backend for CpuBackend {
         Ok(Box::new(prepare(worlds)))
     }
 
+    fn with_robot(&self, robot: &Robot) -> Result<Box<dyn Backend>> {
+        Ok(Box::new(Self { robot: robot.clone(), pool: self.pool.clone() }))
+    }
+
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
         let n = self.robot.dof();
         let prepared: &CpuWorlds = worlds.prepared();
-        let rows: Vec<(f32, f32, f32, Vec<f32>)> = q
-            .par_chunks(n)
-            .zip(item_world.par_iter())
-            .map(|(qi, &s)| {
-                let mut g = vec![0.0; n];
-                let c = collision(&self.robot, &prepared[s as usize], &self.robot.fk(qi), w, &mut g);
-                (c.world_clearance, c.self_clearance, c.cost, g)
-            })
-            .collect();
+        let rows: Vec<(f32, f32, f32, Vec<f32>)> = self.pool.install(|| {
+            q.par_chunks(n)
+                .zip(item_world.par_iter())
+                .map(|(qi, &s)| {
+                    let mut g = vec![0.0; n];
+                    let c = collision(&self.robot, &prepared[s as usize], &self.robot.fk(qi), w, &mut g);
+                    (c.world_clearance, c.self_clearance, c.cost, g)
+                })
+                .collect()
+        });
         let mut out = Evaluation::default();
         for (wc, sc, cost, g) in rows {
             out.world_clearance.push(wc);
@@ -550,21 +573,30 @@ impl Backend for CpuBackend {
     ) -> Result<Vec<[f32; 2]>> {
         let n = self.robot.dof();
         let prepared: &CpuWorlds = worlds.prepared();
-        Ok(q.par_chunks_mut(n)
-            .zip(item_world.par_iter().zip(targets.par_iter()))
-            .map(|(qi, (&s, target))| {
-                let world = &prepared[s as usize];
-                let target = (target.position, Mat3::from_quat(target.rotation));
-                for _ in 0..o.iterations {
-                    ik_step(&self.robot, world, &target, qi, o);
-                }
-                let (_, pos_err, rot_err) = pose_error(&self.robot, &self.robot.fk(qi), &target, o.rot_weight);
-                [pos_err, rot_err]
-            })
-            .collect())
+        Ok(self.pool.install(|| {
+            q.par_chunks_mut(n)
+                .zip(item_world.par_iter().zip(targets.par_iter()))
+                .map(|(qi, (&s, target))| {
+                    let world = &prepared[s as usize];
+                    let target = (target.position, Mat3::from_quat(target.rotation));
+                    for _ in 0..o.iterations {
+                        ik_step(&self.robot, world, &target, qi, o);
+                    }
+                    let (_, pos_err, rot_err) = pose_error(&self.robot, &self.robot.fk(qi), &target, o.rot_weight);
+                    [pos_err, rot_err]
+                })
+                .collect()
+        }))
     }
 
-    fn trajopt(&self, worlds: &Worlds, item_world: &[u32], paths: &mut JointPaths, o: &PlanOptions) -> Result<()> {
+    fn trajopt(
+        &self,
+        worlds: &Worlds,
+        item_world: &[u32],
+        paths: &mut JointPaths,
+        o: &PlanOptions,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let n = self.robot.dof();
         let t_count = paths.points;
         let samples = (t_count - 3) * o.samples_per_span;
@@ -572,30 +604,37 @@ impl Backend for CpuBackend {
         if o.iterations == 0 {
             return Ok(());
         }
-        paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(|(tr, &s)| {
+        // Fewer paths than threads (batch-1 planning): spread each path's samples over threads too.
+        let per_sample = item_world.len() < self.pool.current_num_threads();
+        let optimize = |(tr, &s): (&mut [f32], &u32)| {
             let (world, k) = (&prepared[s as usize], o.samples_per_span);
             let mut sample_grad = vec![0.0f32; samples * n];
             let mut st = Lbfgs::new(t_count, n, samples, o);
             // The first round only prices the seed: its direction is still zero.
             for round in 0..=o.iterations {
-                for (c, &alpha) in LINE_SEARCH.iter().enumerate() {
-                    for i in 0..samples {
-                        st.costs[c * samples + i] = traj_cost(&self.robot, world, tr, &st.dir, alpha, i / k, i % k, o);
-                    }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    break;
                 }
+                let tr_ref = &*tr;
+                each_chunk(per_sample, &mut st.costs, 1, |i, cost| {
+                    let (c, i) = (i / samples, i % samples);
+                    cost[0] = traj_cost(&self.robot, world, tr_ref, &st.dir, LINE_SEARCH[c], i / k, i % k, o);
+                });
                 traj_search(&self.robot, tr, &mut st, o);
                 if round == o.iterations {
                     break;
                 }
-                for (i, g) in sample_grad.chunks_mut(n).enumerate() {
-                    traj_sample_grad(&self.robot, world, tr, i / k, i % k, o, g);
-                }
+                let tr_ref = &*tr;
+                each_chunk(per_sample, &mut sample_grad, n, |i, g| {
+                    traj_sample_grad(&self.robot, world, tr_ref, i / k, i % k, o, g);
+                });
                 for t in 3..t_count - 3 {
                     traj_grad(tr, &sample_grad, n, t, o, &mut st.grad[t * n..(t + 1) * n]);
                 }
                 lbfgs_direction(&mut st, n, o);
             }
-        });
+        };
+        self.pool.install(|| paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(optimize));
         Ok(())
     }
 }

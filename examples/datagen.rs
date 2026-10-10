@@ -30,10 +30,13 @@ fn main() -> Result<()> {
     let fps: u32 = args.next().map_or(Ok(20), |a| a.parse())?;
 
     let robot = common::panda()?;
-    let device = Device::gpu(&robot).unwrap_or_else(|e| {
-        eprintln!("no GPU ({e}); using the CPU");
-        Device::cpu(&robot)
-    });
+    let device = match Device::gpu(&robot) {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("no GPU ({e}); using the CPU");
+            Device::cpu(&robot)?
+        }
+    };
     println!("device: {}", device.name());
     let mut rng = Rng::new(7);
     let worlds: Vec<World> = (0..episodes).map(|_| common::tabletop(&mut rng)).collect();
@@ -70,7 +73,7 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "lerobot")]
 fn export_lerobot(out: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration]) -> Result<()> {
-    batchplan::lerobot::export(out, robot, worlds, demos, &Default::default())
+    Ok(batchplan::lerobot::export(out, robot, worlds, demos, &Default::default())?)
 }
 
 #[cfg(not(feature = "lerobot"))]

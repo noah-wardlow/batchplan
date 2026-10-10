@@ -33,7 +33,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// Collision-free plans from the default pose to IK solutions in tabletop worlds.
 fn planned(robot: &Robot, count: usize) -> Vec<Vec<f32>> {
-    let cpu = Device::cpu(robot);
+    let cpu = Device::cpu(robot).unwrap();
     let mut rng = Rng::new(31);
     let worlds: Vec<World> = (0..count).map(|_| common::tabletop(&mut rng)).collect();
     let goals: Vec<IkProblem> = worlds
@@ -136,8 +136,9 @@ fn check_rejects_unsafe_trajectories() {
     good.check(&robot).unwrap();
     let points = good.control_points.len() / n;
     let rejects = |t: Trajectory, why: &str| {
-        let err = t.check(&robot).expect_err(why).to_string();
+        let err = t.check(&robot).expect_err(why);
         eprintln!("{why}: {err}");
+        assert!(matches!(err, Error::Unsafe(_)), "{why} is an unsafe trajectory, not {err:?}");
     };
 
     let mut nan = good.clone();
@@ -171,7 +172,8 @@ fn check_rejects_unsafe_trajectories() {
     out_of_range.control_points[(points / 2) * n + 3] = robot.upper()[3] + 0.1;
     rejects(out_of_range, "leaving a joint range");
 
-    rejects(Trajectory { dof: n - 1, ..good.clone() }, "the wrong number of joints");
+    let err = Trajectory { dof: n - 1, ..good.clone() }.check(&robot).unwrap_err();
+    assert!(matches!(&err, Error::Input(m) if m.contains("joints")), "{err:?}");
 }
 
 #[test]

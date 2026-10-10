@@ -12,7 +12,7 @@ fn panda() -> Robot {
 }
 
 fn devices(robot: &Robot) -> Vec<Device> {
-    let mut devices = vec![Device::cpu(robot)];
+    let mut devices = vec![Device::cpu(robot).unwrap()];
     match Device::gpu(robot) {
         Ok(gpu) => devices.push(gpu),
         Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => eprintln!("skipping GPU: {e}"),
@@ -30,8 +30,9 @@ fn malformed_batches_are_errors_on_every_device() {
     for d in devices(&robot) {
         let name = d.name();
         let worlds = d.upload(&scene).unwrap();
-        let elsewhere = Device::cpu(&robot).upload(&scene).unwrap();
-        assert!(d.evaluate(&elsewhere, &[0], &q, &none).is_err(), "{name}: worlds uploaded to another device");
+        let elsewhere = Device::cpu(&robot).unwrap().upload(&scene).unwrap();
+        let err = d.evaluate(&elsewhere, &[0], &q, &none).unwrap_err();
+        assert!(matches!(err, Error::Input(_)), "{name}: worlds uploaded to another device give {err:?}");
         assert!(d.evaluate(&worlds, &[0, 0], &q, &none).is_err(), "{name}: two items, one configuration");
         assert!(d.evaluate(&worlds, &[0], &q[..6], &none).is_err(), "{name}: configuration missing a joint");
         assert!(d.evaluate(&worlds, &[1], &q, &none).is_err(), "{name}: world index past the end");
@@ -74,7 +75,7 @@ fn results_keep_the_worlds_of_their_problems() {
         .iter()
         .map(|&w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng) })
         .collect();
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let on_cpu = cpu.upload(&scene).unwrap();
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
@@ -222,7 +223,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
         }
         c
     };
-    let cpu = Device::cpu(&robot);
+    let cpu = Device::cpu(&robot).unwrap();
     let on_cpu = cpu.upload(&scene).unwrap();
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
@@ -275,5 +276,62 @@ fn trajopt_collision_gradient_matches_its_cost() {
         let touching = cpu.evaluate(&on_cpu, &vec![0; items], &seed_samples, &o.collision).unwrap().cost;
         assert!(touching.iter().filter(|&&c| c > 1.0).count() > 3, "{}: the straight seed misses the post", d.name());
         assert!(worst < 2e-2, "{}: trajectory gradient off by {worst:.2e} relative", d.name());
+    }
+}
+
+/// 64 tabletop reaches from the default pose, the worlds they live in, and their IK goals.
+fn reaches(robot: &Robot) -> (Vec<World>, Vec<PlanProblem>) {
+    let mut rng = batchplan::rng::Rng::new(41);
+    let scene: Vec<World> = (0..64).map(|_| common::tabletop(&mut rng)).collect();
+    let cpu = Device::cpu(robot).unwrap();
+    let goals: Vec<IkProblem> = scene
+        .iter()
+        .enumerate()
+        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
+        .collect();
+    let ik = solve_ik(&cpu, &cpu.upload(&scene).unwrap(), &goals, &IkOptions::default()).unwrap();
+    let problems = ik
+        .solved()
+        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .collect();
+    (scene, problems)
+}
+
+#[test]
+fn a_tiny_time_budget_returns_after_at_most_one_more_chunk() {
+    let robot = panda();
+    let (scene, problems) = reaches(&robot);
+    let o = PlanOptions::default();
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let timed = |o: &PlanOptions| {
+            let t = std::time::Instant::now();
+            let result = plan(&d, &worlds, &problems, o).unwrap();
+            (t.elapsed(), result)
+        };
+        timed(&o); // warm up
+        let (full, _) = timed(&o);
+        // A GPU checks the budget between submissions of 8 rounds; time one such chunk, with
+        // seeding and validation.
+        let (chunk, _) = timed(&PlanOptions { iterations: 8, fallback: None, ..o });
+        let budget = std::time::Duration::from_millis(1);
+        let (spent, result) = timed(&PlanOptions { time_budget: Some(budget), ..o });
+        eprintln!("{}: full {full:?}, one chunk {chunk:?}, budget {budget:?} -> {spent:?}", d.name());
+        assert!(spent < budget + 2 * chunk + std::time::Duration::from_millis(20), "{}: took {spent:?}", d.name());
+        assert!(spent < full / 2, "{}: the budget saved little ({spent:?} of {full:?})", d.name());
+        assert_eq!(result.valid.len(), problems.len() * o.seeds);
+    }
+}
+
+#[test]
+fn planning_without_a_budget_gives_the_same_result_every_run() {
+    let robot = panda();
+    let (scene, problems) = reaches(&robot);
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let a = plan(&d, &worlds, &problems, &PlanOptions::default()).unwrap();
+        let b = plan(&d, &worlds, &problems, &PlanOptions::default()).unwrap();
+        assert_eq!(a.paths, b.paths, "{}: paths differ between runs", d.name());
+        assert_eq!((a.valid, a.length), (b.valid, b.length), "{}", d.name());
     }
 }
