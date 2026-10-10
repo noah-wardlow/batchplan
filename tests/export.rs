@@ -26,6 +26,22 @@ fn demos(dt: f32) -> (Robot, Vec<World>, Vec<Demonstration>) {
     (robot, worlds, demos)
 }
 
+#[test]
+fn demonstration_options_are_checked_before_any_work() {
+    let robot = common::panda().unwrap();
+    let device = Device::cpu(&robot).unwrap();
+    let worlds = device.upload(&[World::default()]).unwrap();
+    let goals = [IkProblem { world: 0, target: robot.ee_pose(robot.default_q()) }];
+    for o in [
+        DemoOptions { speed_scale: (0.0, 1.0), ..Default::default() },
+        DemoOptions { speed_scale: (0.5, 1.5), ..Default::default() },
+        DemoOptions { dt: 0.0, ..Default::default() },
+    ] {
+        let err = demonstrations(&device, &worlds, &goals, &o).unwrap_err();
+        assert!(matches!(err, Error::Input(_)), "{err:?}");
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("batchplan-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -80,6 +96,11 @@ fn npy_export_round_trips_the_demonstrations() {
     }
     // Exporting over an existing dataset is refused.
     assert!(batchplan::npy::export(&root, &robot, &worlds, &demos, &Default::default()).is_err());
+    // Demonstrations must belong to the worlds given and match the robot.
+    let elsewhere = scratch("npy-elsewhere");
+    let lost = vec![Demonstration { world: worlds.len() as u32, ..demos[0].clone() }];
+    let err = batchplan::npy::export(&elsewhere, &robot, &worlds, &lost, &Default::default()).unwrap_err();
+    assert!(matches!(err, Error::Input(_)), "{err:?}");
     std::fs::remove_dir_all(&root).unwrap();
 }
 

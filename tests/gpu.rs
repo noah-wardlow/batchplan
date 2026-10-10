@@ -205,9 +205,9 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     let per_span = (o.validate_substeps * 4) as f32;
     let (mut dense, mut dense_world) = (vec![], vec![]);
     for Solved { problem: prob, solution: cp, .. } in result.solved() {
-        let trajectory = Trajectory::new(&robot, cp, 1.0);
+        let trajectory = Trajectory::new(&robot, cp, 1.0).unwrap();
         trajectory.check(&robot).unwrap();
-        let samples = trajectory.sample(per_span / trajectory.knot_interval);
+        let samples = trajectory.sample(per_span / trajectory.knot_interval).unwrap();
         let (first, last) = (&samples.positions[..n], &samples.positions[samples.positions.len() - n..]);
         assert!(first == &prob.start[..] && last == &prob.goal[..], "the trajectory does not run start to goal");
         dense.extend(&samples.positions);

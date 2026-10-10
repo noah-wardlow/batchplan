@@ -25,7 +25,9 @@ const READ_WRITE_STORAGE: u32 = 3;
 /// Upper bounds on work per queue submission, to stay clear of driver watchdogs.
 const EVAL_CHUNK: usize = 1 << 18;
 const IK_ITERS_PER_SUBMIT: u32 = 16;
+const IK_CHUNK: usize = 1 << 16;
 const TRAJ_ITERS_PER_SUBMIT: u32 = 8;
+const TRAJ_CHUNK: usize = 1 << 13;
 
 /// A `vec4<f32>` on the shader side.
 type Vec4 = [f32; 4];
@@ -576,6 +578,60 @@ impl Backend for GpuBackend {
         o: &IkOptions,
     ) -> Result<Vec<[f32; 2]>> {
         let worlds: &GpuWorlds = worlds.prepared();
+        let n = self.robot.dof();
+        let mut errors = Vec::with_capacity(item_world.len());
+        for ((chunk_world, chunk_targets), chunk_q) in
+            item_world.chunks(IK_CHUNK).zip(targets.chunks(IK_CHUNK)).zip(q.chunks_mut(IK_CHUNK * n))
+        {
+            errors.extend(self.ik_chunk(worlds, chunk_world, chunk_targets, chunk_q, o)?);
+        }
+        Ok(errors)
+    }
+
+    fn trajopt(
+        &self,
+        worlds: &Worlds,
+        item_world: &[u32],
+        paths: &mut JointPaths,
+        o: &PlanOptions,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let worlds: &GpuWorlds = worlds.prepared();
+        let (points, n) = (paths.points, paths.dof);
+        if item_world.is_empty() || o.iterations == 0 {
+            return Ok(());
+        }
+        // Paths are optimized in chunks whose L-BFGS state fits one binding and whose work per
+        // submission stays well under driver watchdogs.
+        let limits = self.device.limits();
+        let bytes = 4 * lbfgs_stride(points, n, o) as u64;
+        let fits = (limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / bytes).max(1) as usize;
+        let chunk = fits.min(TRAJ_CHUNK);
+        for (chunk_world, chunk_paths) in item_world.chunks(chunk).zip(paths.positions.chunks_mut(chunk * points * n)) {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            self.trajopt_chunk(worlds, chunk_world, chunk_paths, points, o, deadline)?;
+        }
+        Ok(())
+    }
+}
+
+/// Floats of L-BFGS state per path; must match `lbfgs_stride` in kernels.wgsl.
+fn lbfgs_stride(points: usize, n: usize, o: &PlanOptions) -> usize {
+    let samples = (points - 3) * o.samples_per_span;
+    samples * n + LINE_SEARCH.len() * samples + (4 + 2 * o.history) * points * n + 5
+}
+
+impl GpuBackend {
+    fn ik_chunk(
+        &self,
+        worlds: &GpuWorlds,
+        item_world: &[u32],
+        targets: &[Pose],
+        q: &mut [f32],
+        o: &IkOptions,
+    ) -> Result<Vec<[f32; 2]>> {
         let items = item_world.len();
         if items == 0 {
             return Ok(vec![]);
@@ -631,40 +687,6 @@ impl Backend for GpuBackend {
         Ok(self.read(&out, items * 2)?.chunks(2).map(|e| [e[0], e[1]]).collect())
     }
 
-    fn trajopt(
-        &self,
-        worlds: &Worlds,
-        item_world: &[u32],
-        paths: &mut JointPaths,
-        o: &PlanOptions,
-        deadline: Option<Instant>,
-    ) -> Result<()> {
-        let worlds: &GpuWorlds = worlds.prepared();
-        let (points, n) = (paths.points, paths.dof);
-        if item_world.is_empty() || o.iterations == 0 {
-            return Ok(());
-        }
-        // The L-BFGS state is large; paths are optimized in chunks whose state fits one binding.
-        let limits = self.device.limits();
-        let bytes = 4 * lbfgs_stride(points, n, o) as u64;
-        let chunk = (limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / bytes).max(1) as usize;
-        for (chunk_world, chunk_paths) in item_world.chunks(chunk).zip(paths.positions.chunks_mut(chunk * points * n)) {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                break;
-            }
-            self.trajopt_chunk(worlds, chunk_world, chunk_paths, points, o, deadline)?;
-        }
-        Ok(())
-    }
-}
-
-/// Floats of L-BFGS state per path; must match `lbfgs_stride` in kernels.wgsl.
-fn lbfgs_stride(points: usize, n: usize, o: &PlanOptions) -> usize {
-    let samples = (points - 3) * o.samples_per_span;
-    samples * n + LINE_SEARCH.len() * samples + (4 + 2 * o.history) * points * n + 5
-}
-
-impl GpuBackend {
     fn trajopt_chunk(
         &self,
         worlds: &GpuWorlds,

@@ -1,15 +1,16 @@
 //! Planner output as policy-training demonstrations: nominal reaches plus recoveries from
 //! perturbed states, timed within the robot's limits at randomized speeds.
 
-use crate::error::Result;
-
 use crate::device::{CollisionWeights, Device, Worlds};
+use crate::error::{Result, ensure_input};
 use crate::ik::{IkOptions, IkProblem, solve_ik};
 use crate::rng::Rng;
+use crate::robot::Robot;
 use crate::spline;
 use crate::timing::Trajectory;
 use crate::trajopt::{PlanOptions, PlanProblem, PlanResult, plan};
 use crate::types::{JointTrajectory, Pose, Solved};
+use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryOptions {
@@ -137,6 +138,13 @@ pub fn demonstrations(
 ) -> Result<Vec<Demonstration>> {
     let robot = device.robot();
     let n = robot.dof();
+    let (slowest, fastest) = o.speed_scale;
+    ensure_input!(
+        slowest > 0.0 && slowest <= fastest && fastest <= 1.0,
+        "speed scales must satisfy 0 < slowest <= fastest <= 1, got {:?}",
+        o.speed_scale
+    );
+    ensure_input!(o.dt.is_finite() && o.dt > 0.0, "dt must be positive, got {}", o.dt);
     let mut rng = Rng::new(o.rng_seed);
     let ik = solve_ik(device, worlds, goals, &o.ik)?;
 
@@ -167,7 +175,7 @@ pub fn demonstrations(
 
     let mut timed = |path: &[f32]| {
         let speed_scale = rng.range(o.speed_scale.0, o.speed_scale.1);
-        Trajectory::new(robot, path, speed_scale).sample(1.0 / o.dt)
+        Trajectory::new(robot, path, speed_scale)?.sample(1.0 / o.dt)
     };
     let mut demos = vec![];
     // Demonstration index of each solved nominal problem, for recovery parents.
@@ -179,7 +187,7 @@ pub fn demonstrations(
             origin: Origin::Nominal,
             world: s.problem.world,
             goal,
-            trajectory: timed(s.solution),
+            trajectory: timed(s.solution)?,
         });
     }
     for s in recovered.solved() {
@@ -189,8 +197,26 @@ pub fn demonstrations(
             origin: Origin::Recovery { parent, phase: rec.phase },
             world: s.problem.world,
             goal: demos[parent].goal,
-            trajectory: timed(s.solution),
+            trajectory: timed(s.solution)?,
         });
     }
     Ok(demos)
+}
+
+/// The shared sample period of demonstrations to export, after checking that each one belongs to
+/// one of `worlds`, has the robot's joints, holds whole samples, and shares that period.
+pub(crate) fn check_demos(robot: &Robot, worlds: &[World], demos: &[Demonstration]) -> Result<f32> {
+    ensure_input!(!demos.is_empty(), "no demonstrations to export");
+    let dt = demos[0].trajectory.dt;
+    for (i, d) in demos.iter().enumerate() {
+        let t = &d.trajectory;
+        ensure_input!((d.world as usize) < worlds.len(), "demonstration {i} is in world {}, past the end", d.world);
+        ensure_input!(t.dof == robot.dof(), "demonstration {i} has {} joints, the robot has {}", t.dof, robot.dof());
+        ensure_input!(
+            !t.positions.is_empty() && t.positions.len() == t.velocities.len() && t.positions.len() % t.dof == 0,
+            "demonstration {i} does not hold whole samples"
+        );
+        ensure_input!(t.dt == dt, "all demonstrations must share one dt");
+    }
+    Ok(dt)
 }

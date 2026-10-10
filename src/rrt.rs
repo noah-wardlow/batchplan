@@ -118,7 +118,7 @@ impl Tree {
 
     fn nearest(&self, q: &[f32]) -> usize {
         let squared = |i: usize| self.node(i).iter().zip(q).map(|(x, y)| (x - y) * (x - y)).sum::<f32>();
-        (0..self.parent.len()).min_by(|&a, &b| squared(a).total_cmp(&squared(b))).expect("trees have a root")
+        (0..self.parent.len()).map(|i| (squared(i), i)).min_by(|a, b| a.0.total_cmp(&b.0)).expect("trees have a root").1
     }
 
     /// Node `i` and its ancestors up to the root, `i` first.
@@ -166,11 +166,17 @@ pub(crate) fn connect_until(
     let robot = device.robot();
     let n = robot.dof();
     ensure_input!(o.step > 0.0 && o.resolution > 0.0, "step and resolution must be positive");
+    ensure_input!(o.extensions_per_round > 0, "extend toward at least one configuration per round");
+    let within = |q: &[f32]| q.iter().enumerate().all(|(j, &v)| v >= robot.lower[j] && v <= robot.upper[j]);
     let mut ends = vec![];
     let mut end_world = vec![];
     for (i, p) in problems.iter().enumerate() {
         ensure_input!(p.start.len() == n, "problem {i}: the start must have {n} values");
         ensure_input!(p.goals.iter().all(|g| g.len() == n), "problem {i}: goals must have {n} values");
+        ensure_input!(
+            within(&p.start) && p.goals.iter().all(|g| within(g)),
+            "problem {i}: the start and goals must be within the joint limits"
+        );
         for q in std::iter::once(&p.start).chain(&p.goals) {
             ends.extend_from_slice(q);
             end_world.push(p.world);
@@ -196,7 +202,6 @@ pub(crate) fn connect_until(
     }
     let alive = |s: &Search| s.path.is_none() && s.trees.iter().all(|t| !t.parent.is_empty());
 
-    ensure_input!(o.extensions_per_round > 0, "extend toward at least one configuration per round");
     for _ in 0..o.max_rounds {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;

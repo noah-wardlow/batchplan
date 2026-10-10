@@ -86,7 +86,14 @@ struct CollisionOut {
 }
 
 /// Collision cost of the configuration behind `fk`; adds d(cost)/dq into `grad`.
-fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, grad: &mut [f32]) -> CollisionOut {
+/// Without `GRADIENT` only the cost and clearances are computed, as the WGSL `gradient` flag does.
+fn collision<const GRADIENT: bool>(
+    robot: &Robot,
+    world: &[Prepared],
+    fk: &Fk,
+    w: &CollisionWeights,
+    grad: &mut [f32],
+) -> CollisionOut {
     let ns = robot.spheres.len();
     let mut sc = [Vec3::ZERO; MAX_SPHERES];
     let mut gc = [Vec3::ZERO; MAX_SPHERES];
@@ -113,7 +120,9 @@ fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, g
             let pen = w.margin - d;
             if pen > 0.0 {
                 cost += w.world * pen * pen;
-                gc[s] -= 2.0 * w.world * pen * g;
+                if GRADIENT {
+                    gc[s] -= 2.0 * w.world * pen * g;
+                }
             }
         }
     }
@@ -125,13 +134,18 @@ fn collision(robot: &Robot, world: &[Prepared], fk: &Fk, w: &CollisionWeights, g
         let d = dist - (sa.radius + sa.self_buffer) - (sb.radius + sb.self_buffer);
         smin = smin.min(d);
         let pen = w.self_margin - d;
-        if pen > 0.0 {
-            cost += w.self_collision * pen * pen;
+        if pen > 0.0 && GRADIENT {
             let u = if dist > 1e-9 { diff / dist } else { Vec3::X };
             let g = 2.0 * w.self_collision * pen * u;
             gc[a] -= g;
             gc[b] += g;
         }
+        if pen > 0.0 {
+            cost += w.self_collision * pen * pen;
+        }
+    }
+    if !GRADIENT {
+        return CollisionOut { cost, world_clearance: wmin, self_clearance: smin };
     }
     for s in 0..ns {
         if gc[s] == Vec3::ZERO {
@@ -248,7 +262,7 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     }
     if o.collision_step > 0.0 {
         let mut g = [0.0f32; MAX_DOF];
-        collision(robot, world, &fk, &o.collision, &mut g[..n]);
+        collision::<true>(robot, world, &fk, &o.collision, &mut g[..n]);
         let mut jg = [0.0f32; 6];
         for r in 0..6 {
             for j in 0..n {
@@ -286,7 +300,7 @@ fn traj_sample_grad(
     let mut q = [0.0f32; MAX_DOF];
     spline::blend(cp, n, span, spline::basis(spline::sample_u(s, o.samples_per_span)), &mut q[..n]);
     out.fill(0.0);
-    collision(robot, world, &robot.fk(&q[..n]), &o.collision, out);
+    collision::<true>(robot, world, &robot.fk(&q[..n]), &o.collision, out);
 }
 
 /// Gradient of the trajectory cost w.r.t. free control point `t`: the collision gradients of the
@@ -356,8 +370,7 @@ fn traj_cost(
         let c = |i: usize| candidate(robot, x, d, alpha, span + i, j);
         q[j] = w[0] * c(0) + w[1] * c(1) + w[2] * c(2) + w[3] * c(3);
     }
-    let mut unused = [0.0f32; MAX_DOF];
-    collision(robot, world, &robot.fk(&q[..n]), &o.collision, &mut unused[..n]).cost
+    collision::<false>(robot, world, &robot.fk(&q[..n]), &o.collision, &mut []).cost
 }
 
 /// One path's L-BFGS state, as kernels.wgsl keeps it in `aux`.
@@ -543,23 +556,23 @@ impl Backend for CpuBackend {
     fn evaluate(&self, worlds: &Worlds, item_world: &[u32], q: &[f32], w: &CollisionWeights) -> Result<Evaluation> {
         let n = self.robot.dof();
         let prepared: &CpuWorlds = worlds.prepared();
-        let rows: Vec<(f32, f32, f32, Vec<f32>)> = self.pool.install(|| {
-            q.par_chunks(n)
-                .zip(item_world.par_iter())
-                .map(|(qi, &s)| {
-                    let mut g = vec![0.0; n];
-                    let c = collision(&self.robot, &prepared[s as usize], &self.robot.fk(qi), w, &mut g);
-                    (c.world_clearance, c.self_clearance, c.cost, g)
-                })
-                .collect()
+        let items = item_world.len();
+        let mut out = Evaluation {
+            world_clearance: vec![0.0; items],
+            self_clearance: vec![0.0; items],
+            cost: vec![0.0; items],
+            grad: vec![0.0; items * n],
+        };
+        let rows =
+            out.world_clearance.par_iter_mut().zip(out.self_clearance.par_iter_mut()).zip(out.cost.par_iter_mut());
+        self.pool.install(|| {
+            rows.zip(out.grad.par_chunks_mut(n)).zip(q.par_chunks(n).zip(item_world.par_iter())).for_each(
+                |((((wc, sc), cost), g), (qi, &s))| {
+                    let c = collision::<true>(&self.robot, &prepared[s as usize], &self.robot.fk(qi), w, g);
+                    (*wc, *sc, *cost) = (c.world_clearance, c.self_clearance, c.cost);
+                },
+            )
         });
-        let mut out = Evaluation::default();
-        for (wc, sc, cost, g) in rows {
-            out.world_clearance.push(wc);
-            out.self_clearance.push(sc);
-            out.cost.push(cost);
-            out.grad.extend(g);
-        }
         Ok(out)
     }
 
@@ -620,8 +633,10 @@ impl Backend for CpuBackend {
                     let (c, i) = (i / samples, i % samples);
                     cost[0] = traj_cost(&self.robot, world, tr_ref, &st.dir, LINE_SEARCH[c], i / k, i % k, o);
                 });
+                let steepest = st.count == 0;
                 traj_search(&self.robot, tr, &mut st, o);
-                if round == o.iterations {
+                // A failed steepest-descent search leaves nothing to change in later rounds.
+                if round == o.iterations || (steepest && st.started && !st.pending) {
                     break;
                 }
                 let tr_ref = &*tr;
@@ -702,7 +717,9 @@ mod tests {
     #[test]
     fn a_failed_line_search_resets_the_history() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/franka");
-        let robot = Robot::load(format!("{dir}/franka_panda.urdf"), &Default::default()).unwrap();
+        let spheres = crate::robot::CollisionModel::load(format!("{dir}/panda_collision.json")).unwrap();
+        let options = crate::robot::RobotOptions { collision_model: Some(spheres), ..Default::default() };
+        let robot = Robot::load(format!("{dir}/franka_panda.urdf"), &options).unwrap();
         let (n, points) = (robot.dof(), 10);
         let o = PlanOptions { control_points: points, ..Default::default() };
         let mut st = Lbfgs::new(points, n, 1, &o);

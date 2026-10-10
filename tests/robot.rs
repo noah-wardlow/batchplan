@@ -322,6 +322,12 @@ fn load_errors_name_the_problem() {
     assert!(message.contains("unknown joint 'finger'"), "{message}");
     let message = err(&panda, RobotOptions { default_q: Some(vec![0.0; 6]), ..common::panda_options() });
     assert!(message.contains("default_q has 6 values"), "{message}");
+    let every_joint = (1..=7).map(|j| (format!("panda_joint{j}"), 0.0)).chain(common::panda_options().lock_joints);
+    let message = err(&panda, RobotOptions { lock_joints: every_joint.collect(), ..common::panda_options() });
+    assert!(message.contains("no actuated joints"), "{message}");
+    let exact = SphereOptions { tolerance: 0.0, ..Default::default() };
+    let message = err(&common::asset(SO101), RobotOptions { spheres: exact, ..Default::default() });
+    assert!(message.contains("positive tolerance"), "{message}");
     let message = err("robot.sdf", RobotOptions::default());
     assert!(message.contains("unsupported robot description format"), "{message}");
     // Hosts can match on the kind, which names the file.

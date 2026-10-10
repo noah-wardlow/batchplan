@@ -185,9 +185,9 @@ fn plan_falls_back_to_rrt_where_trajectory_optimization_fails() {
         // Every fallback path, timed and sampled 4x denser than validation, under the CPU model.
         let (mut q, mut item_world) = (vec![], vec![]);
         for s in with.solved() {
-            let trajectory = Trajectory::new(&robot, s.solution, 1.0);
+            let trajectory = Trajectory::new(&robot, s.solution, 1.0).unwrap();
             trajectory.check(&robot).unwrap();
-            let samples = trajectory.sample(32.0 / trajectory.knot_interval).positions;
+            let samples = trajectory.sample(32.0 / trajectory.knot_interval).unwrap().positions;
             item_world.extend(std::iter::repeat_n(s.problem.world, samples.len() / n));
             q.extend(samples);
         }

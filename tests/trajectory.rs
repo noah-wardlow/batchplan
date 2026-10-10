@@ -60,10 +60,10 @@ fn trajectories_stay_within_limits_everywhere() {
     let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
     let mut peak = [0.0f32; 3];
     for path in planned(&robot, 16) {
-        let trajectory = Trajectory::new(&robot, &path, 1.0);
+        let trajectory = Trajectory::new(&robot, &path, 1.0).unwrap();
         trajectory.check(&robot).unwrap();
         let dt = trajectory.knot_interval / 64.0;
-        let samples = trajectory.sample(1.0 / dt);
+        let samples = trajectory.sample(1.0 / dt).unwrap();
         let (p, v, a) = (&samples.positions, &samples.velocities, &samples.accelerations);
         assert_eq!(&p[..n], &path[..n], "starts exactly at the start");
         assert_eq!(&p[p.len() - n..], &path[path.len() - n..], "ends exactly at the goal");
@@ -79,7 +79,7 @@ fn trajectories_stay_within_limits_everywhere() {
         // Jerk is constant along each span, so finite differences of acceleration never exceed it.
         // A coarser step keeps f32 cancellation in the accelerations from dominating.
         let coarse_dt = trajectory.knot_interval / 4.0;
-        let coarse = trajectory.sample(1.0 / coarse_dt).accelerations;
+        let coarse = trajectory.sample(1.0 / coarse_dt).unwrap().accelerations;
         for i in n..coarse.len() - n {
             peak[2] = peak[2].max(((coarse[i] - coarse[i - n]) / coarse_dt).abs() / limits[2][i % n]);
         }
@@ -102,8 +102,8 @@ fn trajectories_stay_within_limits_everywhere() {
 fn slower_speed_scales_stretch_time() {
     let robot = common::panda().unwrap();
     let path = &planned(&robot, 4)[0];
-    let fast = Trajectory::new(&robot, path, 1.0);
-    let slow = Trajectory::new(&robot, path, 0.5);
+    let fast = Trajectory::new(&robot, path, 1.0).unwrap();
+    let slow = Trajectory::new(&robot, path, 0.5).unwrap();
     assert!((slow.duration() - 2.0 * fast.duration()).abs() < 1e-5 * fast.duration());
     slow.check(&robot).unwrap();
 }
@@ -111,7 +111,7 @@ fn slower_speed_scales_stretch_time() {
 #[test]
 fn sampling_does_not_allocate() {
     let robot = common::panda().unwrap();
-    let trajectory = Trajectory::new(&robot, &planned(&robot, 4)[0], 1.0);
+    let trajectory = Trajectory::new(&robot, &planned(&robot, 4)[0], 1.0).unwrap();
     let mut state = JointState::new(robot.dof());
     let before = ALLOCATIONS.with(Cell::get);
     let mut checksum = 0.0;
@@ -132,8 +132,15 @@ fn sampling_does_not_allocate() {
 fn check_rejects_unsafe_trajectories() {
     let robot = common::panda().unwrap();
     let n = robot.dof();
-    let good = Trajectory::new(&robot, &planned(&robot, 4)[0], 1.0);
+    let path = &planned(&robot, 4)[0];
+    let good = Trajectory::new(&robot, path, 1.0).unwrap();
     good.check(&robot).unwrap();
+    // Timing refuses what it cannot honour instead of producing an unsafe or empty trajectory.
+    for scale in [0.0, -1.0, 1.5, f32::NAN] {
+        assert!(matches!(Trajectory::new(&robot, path, scale), Err(Error::Input(_))), "speed scale {scale}");
+    }
+    assert!(matches!(Trajectory::new(&robot, &path[..6 * n], 1.0), Err(Error::Input(_))), "six control points");
+    assert!(matches!(good.sample(0.0), Err(Error::Input(_))), "sampling at 0 Hz");
     let points = good.control_points.len() / n;
     let rejects = |t: Trajectory, why: &str| {
         let err = t.check(&robot).expect_err(why);
@@ -154,7 +161,7 @@ fn check_rejects_unsafe_trajectories() {
         q[0] = q0;
         cp.extend(q);
     }
-    let sweep = Trajectory::new(&robot, &cp, 1.0);
+    let sweep = Trajectory::new(&robot, &cp, 1.0).unwrap();
     sweep.check(&robot).unwrap();
     let err = Trajectory { knot_interval: sweep.knot_interval * 0.9, ..sweep }.check(&robot).unwrap_err().to_string();
     assert!(err.contains("velocity"), "{err}");
@@ -179,7 +186,7 @@ fn check_rejects_unsafe_trajectories() {
 #[test]
 fn trajectories_round_trip_through_json() {
     let robot = common::panda().unwrap();
-    let trajectory = Trajectory::new(&robot, &planned(&robot, 4)[0], 0.7);
+    let trajectory = Trajectory::new(&robot, &planned(&robot, 4)[0], 0.7).unwrap();
     let text = serde_json::to_string(&trajectory).unwrap();
     let back: Trajectory = serde_json::from_str(&text).unwrap();
     assert_eq!(back, trajectory);

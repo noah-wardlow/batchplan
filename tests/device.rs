@@ -40,6 +40,27 @@ fn malformed_batches_are_errors_on_every_device() {
         assert!(solve_ik(&d, &worlds, &[IkProblem { world: 1, target }], &IkOptions::default()).is_err(), "{name}: IK");
         let problem = PlanProblem { world: 1, start: q.clone(), goal: q.clone() };
         assert!(plan(&d, &worlds, &[problem], &PlanOptions::default()).is_err(), "{name}: plan");
+        // Inputs no device could check consistently are refused before any work.
+        let input = |r: Result<_, Error>| matches!(r, Err(Error::Input(_)));
+        let mut beyond = q.clone();
+        beyond[3] = robot.upper()[3] + 0.5;
+        let past_limits = PlanProblem { world: 0, start: q.clone(), goal: beyond };
+        assert!(
+            input(plan(&d, &worlds, &[past_limits], &PlanOptions::default()).map(|_| ())),
+            "{name}: goal past limits"
+        );
+        let skewed = Pose { rotation: glam::Quat::from_xyzw(0.0, 0.0, 0.0, 2.0), ..target };
+        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target: skewed }], &IkOptions::default());
+        assert!(input(ik.map(|_| ())), "{name}: a non-unit target rotation");
+        let rotated = |rotation| Obstacle::Cuboid { center: Vec3::ZERO, half_extents: Vec3::ONE, rotation };
+        for bad in [
+            Obstacle::Sphere { center: Vec3::new(f32::NAN, 0.0, 0.0), radius: 0.1 },
+            Obstacle::Sphere { center: Vec3::ZERO, radius: -0.1 },
+            rotated(glam::Quat::from_xyzw(0.0, 0.0, 0.0, 0.5)),
+        ] {
+            let err = d.upload(&[World { obstacles: vec![bad.clone()] }]).map(|_| ());
+            assert!(input(err), "{name}: {bad:?} uploaded");
+        }
     }
 }
 
@@ -100,8 +121,8 @@ fn results_keep_the_worlds_of_their_problems() {
             assert_eq!(s.problem.world, problems[s.index].world);
             // Every reported path is collision-free in its own world along its whole length.
             let n = robot.dof();
-            let trajectory = Trajectory::new(&robot, s.solution, 1.0);
-            let q = trajectory.sample(32.0 / trajectory.knot_interval).positions;
+            let trajectory = Trajectory::new(&robot, s.solution, 1.0).unwrap();
+            let q = trajectory.sample(32.0 / trajectory.knot_interval).unwrap().positions;
             let item_world = vec![s.problem.world; q.len() / n];
             let e = cpu.evaluate(&on_cpu, &item_world, &q, &CollisionWeights::NONE).unwrap();
             assert!(

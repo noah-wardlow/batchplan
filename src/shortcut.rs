@@ -85,12 +85,15 @@ pub(crate) fn shortcut_until(
         let mut best: Vec<Option<Vec<f32>>> = vec![None; paths.len()];
         for ((i, ia, pa, ib, pb), known) in tries.into_iter().zip(segments.check(device, worlds)?) {
             // Waypoints 0..=ia, then the shortcut, then ib + 1.. (pa lies on edge ia, pb on edge ib).
+            if known < 1.0 {
+                continue;
+            }
             let path = &paths[i];
             let mut shorter = path[..(ia + 1) * n].to_vec();
             shorter.extend(pa.iter().chain(&pb));
             shorter.extend_from_slice(&path[(ib + 1) * n..]);
             let bar = best[i].as_deref().map_or(length(path, n), |b| length(b, n));
-            if known == 1.0 && length(&shorter, n) < bar {
+            if length(&shorter, n) < bar {
                 best[i] = Some(shorter);
             }
         }

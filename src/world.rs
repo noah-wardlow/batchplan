@@ -134,7 +134,45 @@ pub(crate) fn worlds_json(worlds: &[World]) -> serde_json::Result<serde_json::Va
     Ok(serde_json::json!({ "grids": grids, "worlds": worlds }))
 }
 
+impl World {
+    /// Why these obstacles cannot be collision-checked, if they cannot.
+    pub(crate) fn check(&self) -> Result<()> {
+        for (k, o) in self.obstacles.iter().enumerate() {
+            o.check().map_err(|e| Error::Input(format!("obstacle {k}: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
 impl Obstacle {
+    fn check(&self) -> Result<()> {
+        let size = |v: f32| v.is_finite() && v >= 0.0;
+        let pose = |center: Vec3, rotation: Quat| {
+            center.is_finite() && rotation.is_finite() && (rotation.length() - 1.0).abs() < 1e-3
+        };
+        let ok = match *self {
+            Obstacle::Cuboid { center, half_extents, rotation } => {
+                pose(center, rotation) && half_extents.to_array().into_iter().all(size)
+            }
+            Obstacle::Sphere { center, radius } => center.is_finite() && size(radius),
+            Obstacle::Cylinder { center, rotation, radius, half_height: half } => {
+                pose(center, rotation) && size(radius) && size(half)
+            }
+            Obstacle::Capsule { center, rotation, radius, half_length: half } => {
+                pose(center, rotation) && size(radius) && size(half)
+            }
+            Obstacle::Sdf { ref grid, center, rotation } => {
+                grid.check()?;
+                pose(center, rotation)
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Input("needs finite, non-negative sizes and a unit-quaternion rotation".into()))
+        }
+    }
+
     /// Signed distance from `p` to the obstacle surface and its gradient (the unit outward
     /// direction, except inside distance grids, where it is the interpolation's gradient).
     pub fn distance(&self, p: Vec3) -> (f32, Vec3) {

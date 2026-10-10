@@ -135,8 +135,8 @@ fn devices_for_an_attached_robot_plan_in_worlds_already_uploaded() {
         let n = held.dof();
         let (mut q, mut item_world) = (vec![], vec![]);
         for s in result.solved() {
-            let trajectory = Trajectory::new(&held, s.solution, 1.0);
-            let samples = trajectory.sample(32.0 / trajectory.knot_interval).positions;
+            let trajectory = Trajectory::new(&held, s.solution, 1.0).unwrap();
+            let samples = trajectory.sample(32.0 / trajectory.knot_interval).unwrap().positions;
             item_world.extend(std::iter::repeat_n(s.problem.world, samples.len() / n));
             q.extend(samples);
         }

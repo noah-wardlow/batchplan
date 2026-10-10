@@ -29,7 +29,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde_json::{Map, Value, json};
 
-use crate::datagen::{Demonstration, Origin};
+use crate::datagen::{Demonstration, Origin, check_demos};
 use crate::robot::Robot;
 use crate::world::{Obstacle, World, worlds_json};
 
@@ -59,16 +59,14 @@ impl Default for ExportOptions {
 /// Writes `demos` as a LeRobot v3.0 dataset under `root`, which must not already hold one.
 /// All demonstrations must share a sample period that is a whole number of frames per second.
 pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
-    ensure_input!(!demos.is_empty(), "no demonstrations to export");
+    let dt = check_demos(robot, worlds, demos)?;
     ensure_input!(!root.join("meta/info.json").exists(), "{} already holds a LeRobot dataset", root.display());
-    let dt = demos[0].trajectory.dt;
     let fps = (1.0 / dt).round();
     ensure_input!(
         fps >= 1.0 && (fps * dt - 1.0).abs() < 1e-4,
         "LeRobot needs a whole number of frames per second; dt = {dt} s is {} fps",
         1.0 / dt
     );
-    ensure_input!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
     let fps = fps as u32;
     let max_obstacles = demos.iter().map(|d| worlds[d.world as usize].obstacles.len()).max().unwrap_or(0);
 

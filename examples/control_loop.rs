@@ -39,7 +39,7 @@ fn planner(
         let options = PlanOptions { time_budget: Some(Duration::from_millis(500)), ..Default::default() };
         let result = plan(&device, &worlds, &[problem], &options)?;
         let Some(path) = result.best(0) else { continue };
-        let trajectory = Trajectory::new(&robot, path, 0.8);
+        let trajectory = Trajectory::new(&robot, path, 0.8)?;
         // The controller only ever receives trajectories that pass the safety check.
         trajectory.check(&robot)?;
         println!("planner: {:.2} s reach planned in {:.0} ms", trajectory.duration(), t.elapsed().as_secs_f64() * 1e3);

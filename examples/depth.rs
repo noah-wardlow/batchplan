@@ -95,8 +95,8 @@ fn main() -> Result<()> {
     let truth = cpu.upload(std::slice::from_ref(&scene))?;
     let (mut samples, mut worst) = (vec![], f32::INFINITY);
     for s in result.solved() {
-        let trajectory = Trajectory::new(&robot, s.solution, 1.0);
-        samples.extend(trajectory.sample(32.0 / trajectory.knot_interval).positions);
+        let trajectory = Trajectory::new(&robot, s.solution, 1.0)?;
+        samples.extend(trajectory.sample(32.0 / trajectory.knot_interval)?.positions);
     }
     let items = samples.len() / robot.dof();
     let eval = cpu.evaluate(&truth, &vec![0; items], &samples, &CollisionWeights::NONE)?;

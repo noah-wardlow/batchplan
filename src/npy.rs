@@ -8,6 +8,7 @@ use crate::error::{Result, ensure_input};
 use serde_json::{Map, Value, json};
 
 use crate::datagen::Demonstration;
+use crate::datagen::check_demos;
 use crate::robot::Robot;
 use crate::world::{World, worlds_json};
 
@@ -27,10 +28,8 @@ pub struct ExportOptions {
 ///
 /// All demonstrations must share one sample period.
 pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
-    ensure_input!(!demos.is_empty(), "no demonstrations to export");
+    let dt = check_demos(robot, worlds, demos)?;
     ensure_input!(!root.join("meta.json").exists(), "{} already holds a dataset", root.display());
-    let dt = demos[0].trajectory.dt;
-    ensure_input!(demos.iter().all(|d| d.trajectory.dt == dt), "all demonstrations must share one dt");
     std::fs::create_dir_all(root)?;
 
     let (n, m) = (robot.dof(), demos.len());

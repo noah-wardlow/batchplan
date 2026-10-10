@@ -259,6 +259,7 @@ impl Robot {
             });
             meshes.push(shapes.iter().map(|s| s.mesh()).collect::<Result<_>>()?);
         }
+        o.check().map_err(anyhow::Error::msg)?;
         let with_geometry = meshes.iter().filter(|m| !m.is_empty()).count();
         let o = SphereOptions { budget: o.budget.min(MAX_SPHERES), ..*o };
         ensure!(
@@ -331,13 +332,26 @@ impl Robot {
             return Err(input!("unknown touch link '{t}'"));
         }
         ensure_input!(self.links.len() < MAX_LINKS, "attaching '{}' exceeds MAX_LINKS={MAX_LINKS}", object.name);
+        object.spheres.check().map_err(Error::Input)?;
         let meshes = object
             .shapes
             .iter()
             .map(|shape| attached_shape(shape)?.mesh().map_err(|e| input!("{e:#}")))
             .collect::<error::Result<Vec<TriMesh>>>()?;
         ensure_input!(!meshes.is_empty(), "'{}' has no shapes", object.name);
-        let (fitted, _) = spheres::fit(&[meshes], &object.spheres);
+        // Attaching happens inside control processes: fit on the caller's rayon pool if it has
+        // one, otherwise on the calling thread alone, never on the global pool.
+        let fit = || spheres::fit(&[meshes], &object.spheres);
+        let (fitted, _) = if rayon::current_thread_index().is_some() {
+            fit()
+        } else {
+            let here = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build()
+                .map_err(|e| Error::Threads(e.to_string()))?;
+            here.install(fit)
+        };
         let mut robot = self.clone();
         let chain = robot.links[parent].chain;
         robot.links.push(Link {
@@ -377,6 +391,7 @@ impl Robot {
         &self.name
     }
 
+    #[inline]
     pub fn dof(&self) -> usize {
         self.dof_names.len()
     }
@@ -553,6 +568,7 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         max_acceleration.push(or_default(joint.max_acceleration, o.max_acceleration));
         max_jerk.push(or_default(joint.max_jerk, o.max_jerk));
     }
+    ensure!(!dof_names.is_empty(), "the robot has no actuated joints to plan with");
     ensure!(dof_names.len() <= MAX_DOF, "{} actuated joints exceeds MAX_DOF={MAX_DOF}", dof_names.len());
 
     let root =

@@ -43,10 +43,16 @@ pub struct Trajectory {
 const DIFFERENCES: [(usize, &[f32]); 3] = [(2, &[-1.0, 1.0]), (3, &[1.0, -2.0, 1.0]), (4, &BASIS_D3)];
 
 impl Trajectory {
-    /// Times a planned path (`[points, dof]` control points) as fast as the robot's velocity,
-    /// acceleration and jerk limits allow, then slows it by `speed_scale` in (0, 1].
-    pub fn new(robot: &Robot, control_points: &[f32], speed_scale: f32) -> Self {
+    /// Times a planned path (`[points, dof]` control points, at least 7) as fast as the robot's
+    /// velocity, acceleration and jerk limits allow, then slows it by `speed_scale` in (0, 1].
+    pub fn new(robot: &Robot, control_points: &[f32], speed_scale: f32) -> Result<Self> {
         let n = robot.dof();
+        ensure_input!(speed_scale > 0.0 && speed_scale <= 1.0, "speed_scale must be in (0, 1], got {speed_scale}");
+        ensure_input!(
+            control_points.len().is_multiple_of(n) && control_points.len() / n >= 7,
+            "a path needs a whole number of at least 7 control points of {n} joints"
+        );
+        ensure_input!(control_points.iter().all(|v| v.is_finite()), "control points must be finite");
         let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
         let mut h = 0.0f32;
         for (order, &(width, weights)) in DIFFERENCES.iter().enumerate() {
@@ -55,7 +61,7 @@ impl Trajectory {
                 h = h.max((largest / limit).powf(1.0 / (order + 1) as f32));
             }
         }
-        Self { dof: n, knot_interval: h / speed_scale, control_points: control_points.to_vec() }
+        Ok(Self { dof: n, knot_interval: h / speed_scale, control_points: control_points.to_vec() })
     }
 
     fn spans(&self) -> usize {
@@ -91,8 +97,12 @@ impl Trajectory {
     }
 
     /// The trajectory sampled `hz` times per second, from its start to its exact end.
-    pub fn sample(&self, hz: f32) -> JointTrajectory {
+    pub fn sample(&self, hz: f32) -> Result<JointTrajectory> {
         let duration = self.duration();
+        ensure_input!(
+            hz.is_finite() && hz > 0.0 && (duration * hz) < 1e8,
+            "cannot sample a {duration} s trajectory at {hz} Hz"
+        );
         let dt = 1.0 / hz;
         let samples = (duration * hz).ceil() as usize + 1;
         let mut state = JointState::new(self.dof);
@@ -111,7 +121,7 @@ impl Trajectory {
             out.velocities.extend_from_slice(&state.velocity);
             out.accelerations.extend_from_slice(&state.acceleration);
         }
-        out
+        Ok(out)
     }
 
     /// Verifies the trajectory is safe to run on `robot`: finite, at rest at both ends, and within

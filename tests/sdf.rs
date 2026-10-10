@@ -505,3 +505,17 @@ fn lerobot_exports_describe_grids_by_their_boxes() {
         serde_json::from_slice(&std::fs::read(root.join("meta/batchplan.json")).unwrap()).unwrap();
     assert_eq!(meta["worlds"]["grids"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn deserialized_grids_are_checked_like_built_ones() {
+    let mut mesh = (vec![], vec![]);
+    add_box(&mut mesh, Vec3::ZERO, Vec3::splat(0.1));
+    let grid = SdfGrid::from_mesh(&mesh.0, &mesh.1, &SdfOptions::default()).unwrap();
+    let mut json = serde_json::to_value(&grid).unwrap();
+    assert_eq!(serde_json::from_value::<SdfGrid>(json.clone()).unwrap(), grid);
+    // A grid missing values would index past its data on the CPU and read the next grid on a GPU.
+    json["values"].as_array_mut().unwrap().pop();
+    assert!(serde_json::from_value::<SdfGrid>(json.clone()).is_err());
+    json["values"].as_array_mut().unwrap().push(0x7c00.into()); // an infinite half float
+    assert!(serde_json::from_value::<SdfGrid>(json).is_err());
+}

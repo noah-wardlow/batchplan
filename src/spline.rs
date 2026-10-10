@@ -1,6 +1,6 @@
 //! Uniform cubic B-splines, the shape of every planned path. Span `k` of a spline blends control
 //! points `k..k + 4`; a path's first three and last three control points are equal, so it starts
-//! and ends at rest. Mirrored by `basis` and `spline_q` in kernels.wgsl.
+//! and ends at rest. `basis` in kernels.wgsl mirrors `basis`.
 
 /// Weights of the four control points of a span for the position at `u` in [0, 1].
 #[inline]
@@ -39,11 +39,10 @@ pub(crate) fn blend(cp: &[f32], dof: usize, span: usize, weights: [f32; 4], out:
     }
 }
 
-/// The spline at `per_span` evenly spaced points of every span plus its exact end:
-/// `[(points - 3) * per_span + 1, dof]`.
-pub(crate) fn dense(cp: &[f32], dof: usize, per_span: usize) -> Vec<f32> {
+/// The spline at `per_span` evenly spaced points of every span plus its exact end, written into
+/// `out`, which holds `[(points - 3) * per_span + 1, dof]`.
+pub(crate) fn dense(cp: &[f32], dof: usize, per_span: usize, out: &mut [f32]) {
     let spans = cp.len() / dof - 3;
-    let mut out = vec![0.0; (spans * per_span + 1) * dof];
     for span in 0..spans {
         for s in 0..per_span {
             let row = (span * per_span + s) * dof;
@@ -51,7 +50,6 @@ pub(crate) fn dense(cp: &[f32], dof: usize, per_span: usize) -> Vec<f32> {
         }
     }
     out[spans * per_span * dof..].copy_from_slice(&cp[cp.len() - dof..]);
-    out
 }
 
 /// The point a fraction `phase` in [0, 1] of the way along the spline.

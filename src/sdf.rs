@@ -8,7 +8,7 @@
 //! than its geometry, and walls thinner than a voxel still block. The price is that obstacles grow,
 //! by up to a voxel diagonal for meshes and about three voxels for points and depth images.
 
-use crate::error::{Result, ensure_input, input};
+use crate::error::{Error, Result, ensure_input, input};
 use glam::{UVec3, Vec3};
 use half::f16;
 use parry3d::query::PointQuery;
@@ -66,6 +66,7 @@ pub enum Occlusion {
 /// every surface it holds ([`SdfOptions::padding`]): both the grid and the true distance then
 /// report clearance beyond the margin.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "GridParts")]
 pub struct SdfGrid {
     pub(crate) dims: [u32; 3],
     pub(crate) voxel: f32,
@@ -73,26 +74,47 @@ pub struct SdfGrid {
     pub(crate) values: Vec<u16>,
 }
 
+/// A grid as serialized, checked like [`SdfGrid::new`] before it becomes one.
+#[derive(Deserialize)]
+struct GridParts {
+    dims: [u32; 3],
+    voxel: f32,
+    origin: Vec3,
+    values: Vec<u16>,
+}
+
+impl TryFrom<GridParts> for SdfGrid {
+    type Error = Error;
+
+    fn try_from(p: GridParts) -> Result<Self> {
+        let grid = SdfGrid { dims: p.dims, voxel: p.voxel, origin: p.origin, values: p.values };
+        grid.check()?;
+        Ok(grid)
+    }
+}
+
 impl SdfGrid {
     /// A grid holding `distances` at `dims` points (`dims[0] * dims[1] * dims[2]` values, x
-    /// fastest), as given: no conservative offset is applied.
+    /// fastest), rounded to the nearest half float: no conservative offset is applied.
     pub fn new(dims: [u32; 3], voxel: f32, origin: Vec3, distances: &[f32]) -> Result<Self> {
+        let values = distances.iter().map(|&d| flush(f16::from_f32(d)).to_bits()).collect();
+        let grid = Self { dims, voxel, origin, values };
+        grid.check()?;
+        Ok(grid)
+    }
+
+    /// Why this grid cannot be sampled, if it cannot: the rules of [`SdfGrid::new`].
+    pub(crate) fn check(&self) -> Result<()> {
+        let (dims, voxel) = (self.dims, self.voxel);
         ensure_input!(dims.iter().all(|&d| d >= 2), "a grid needs at least 2 points per axis, got {dims:?}");
         ensure_input!(voxel.is_finite() && voxel > 0.0, "the voxel size must be positive, got {voxel}");
-        ensure_input!(origin.is_finite(), "the grid origin must be finite");
+        ensure_input!(self.origin.is_finite(), "the grid origin must be finite");
         let count = dims.iter().map(|&d| u64::from(d)).product::<u64>();
         ensure_input!(count <= MAX_POINTS, "{dims:?} is {count} points, more than {MAX_POINTS}; use larger voxels");
-        ensure_input!(distances.len() as u64 == count, "{dims:?} needs {count} distances, got {}", distances.len());
-        let values = distances
-            .iter()
-            .map(|&d| {
-                let h = f16::from_f32(d);
-                ensure_input!(h.is_finite(), "distance {d} does not fit a half float");
-                // GPUs may flush subnormal halves to zero; storing them as zero keeps devices equal.
-                Ok(if h.is_normal() { h.to_bits() } else { 0 })
-            })
-            .collect::<Result<_>>()?;
-        Ok(Self { dims, voxel, origin, values })
+        ensure_input!(self.values.len() as u64 == count, "{dims:?} needs {count} distances, got {}", self.values.len());
+        let bad = self.values.iter().map(|&v| f16::from_bits(v)).find(|h| !h.is_finite() || subnormal(*h));
+        ensure_input!(bad.is_none(), "distance {bad:?} is not finite or is subnormal");
+        Ok(())
     }
 
     /// The distance field of a closed triangle mesh, in the mesh's frame. Triangles may face in
@@ -229,11 +251,14 @@ impl SdfGrid {
         f16::from_bits(self.values[n as usize]).to_f32()
     }
 
-    /// Exact distances lowered by half a voxel diagonal (see the module documentation).
-    fn conservative(dims: UVec3, voxel: f32, origin: Vec3, mut distances: Vec<f32>) -> Result<Self> {
+    /// Exact distances lowered by half a voxel diagonal (see the module documentation), each
+    /// rounded down to a half float so the stored value never exceeds it.
+    fn conservative(dims: UVec3, voxel: f32, origin: Vec3, distances: Vec<f32>) -> Result<Self> {
         let shift = voxel * 3f32.sqrt() / 2.0;
-        distances.iter_mut().for_each(|d| *d -= shift);
-        Self::new(dims.into(), voxel, origin, &distances)
+        let values = distances.iter().map(|&d| at_most(d - shift).to_bits()).collect();
+        let grid = Self { dims: dims.into(), voxel, origin, values };
+        grid.check()?;
+        Ok(grid)
     }
 
     /// Signed distances to the occupied voxels as solid cubes, from their centers' distances.
@@ -252,6 +277,32 @@ impl SdfGrid {
             })
             .collect();
         Self::conservative(UVec3::from(dims.map(|d| d as u32)), voxel, origin, distances)
+    }
+}
+
+fn subnormal(h: f16) -> bool {
+    h.classify() == std::num::FpCategory::Subnormal
+}
+
+/// GPUs may flush subnormal halves to zero; storing them as zero keeps devices equal.
+fn flush(h: f16) -> f16 {
+    if subnormal(h) { f16::ZERO } else { h }
+}
+
+/// The largest half float that is not subnormal and not above `d` (infinite when `d` overflows).
+fn at_most(d: f32) -> f16 {
+    let mut h = f16::from_f32(d);
+    if h.to_f32() > d {
+        h = match h.to_bits() {
+            0x0000 | 0x8000 => f16::from_bits(0x8001),
+            bits if h.is_sign_negative() => f16::from_bits(bits + 1),
+            bits => f16::from_bits(bits - 1),
+        };
+    }
+    match subnormal(h) {
+        true if h.is_sign_negative() => -f16::MIN_POSITIVE,
+        true => f16::ZERO,
+        false => h,
     }
 }
 

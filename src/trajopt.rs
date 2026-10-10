@@ -134,6 +134,11 @@ pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &Plan
     let mut item_world = Vec::with_capacity(items);
     for (pi, p) in problems.iter().enumerate() {
         ensure_input!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
+        let within = |q: &[f32]| q.iter().enumerate().all(|(j, &v)| v >= robot.lower[j] && v <= robot.upper[j]);
+        ensure_input!(
+            within(&p.start) && within(&p.goal),
+            "problem {pi}: start and goal must be within the joint limits"
+        );
         for s in 0..o.seeds {
             seed_path(robot, &p.start, &p.goal, s, &mut rng, paths.path_mut(pi * o.seeds + s));
             item_world.push(p.world);
@@ -166,9 +171,9 @@ fn validate(
     let (n, items) = (paths.dof, paths.len());
     let k = o.validate_substeps.max(1);
     let samples = (paths.points - 3) * k + 1;
-    let mut dense = Vec::with_capacity(items * samples * n);
-    for item in 0..items {
-        dense.extend(spline::dense(paths.path(item), n, k));
+    let mut dense = vec![0.0; items * samples * n];
+    for (item, out) in dense.chunks_mut(samples * n).enumerate() {
+        spline::dense(paths.path(item), n, k, out);
     }
     let dense_world: Vec<u32> = item_world.iter().flat_map(|&w| std::iter::repeat_n(w, samples)).collect();
     let eval = device.evaluate(worlds, &dense_world, &dense, &CollisionWeights::NONE)?;
@@ -176,7 +181,8 @@ fn validate(
         .map(|item| {
             (item * samples..(item + 1) * samples)
                 .map(|i| eval.world_clearance[i].min(eval.self_clearance[i]))
-                .fold(f32::INFINITY, f32::min)
+                // NaN marks the path invalid rather than vanishing in a minimum.
+                .fold(f32::INFINITY, |m, c| if m.is_nan() || c.is_nan() { f32::NAN } else { m.min(c) })
         })
         .collect();
     let lengths = (0..items).map(|item| length(&dense[item * samples * n..(item + 1) * samples * n], n)).collect();

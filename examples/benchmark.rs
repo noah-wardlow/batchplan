@@ -154,8 +154,8 @@ fn score(
     for s in result.solved() {
         // Check the timed trajectory a controller would run, sampled 4x denser per span than the
         // planner validates.
-        let trajectory = Trajectory::new(robot, s.solution, 1.0);
-        let dense = trajectory.sample(per_span / trajectory.knot_interval).positions;
+        let trajectory = Trajectory::new(robot, s.solution, 1.0)?;
+        let dense = trajectory.sample(per_span / trajectory.knot_interval)?.positions;
         let items = dense.len() / n;
         let eval = cpu.evaluate(worlds, &vec![s.problem.world; items], &dense, &CollisionWeights::NONE)?;
         let collision_free = (0..items).all(|i| eval.collision_free(i));
@@ -172,7 +172,7 @@ fn score(
             (0..items - 1).map(|i| q(i).iter().zip(q(i + 1)).map(|(a, b)| (b - a).powi(2)).sum::<f32>().sqrt()).sum(),
         );
         let dt = 0.01;
-        let traj = trajectory.sample(1.0 / dt);
+        let traj = trajectory.sample(1.0 / dt)?;
         out.motion_time.push(traj.duration);
         let v = &traj.velocities;
         let acc: Vec<f32> = (0..v.len().saturating_sub(n)).map(|i| (v[i + n] - v[i]) / dt).collect();
@@ -192,9 +192,10 @@ fn median(v: &[f32]) -> f32 {
     v[v.len() / 2]
 }
 
+/// NaN for an empty set (no latency runs).
 fn percentile(v: &mut [f64], p: f64) -> f64 {
     v.sort_by(f64::total_cmp);
-    v[((v.len() - 1) as f64 * p).round() as usize]
+    if v.is_empty() { f64::NAN } else { v[((v.len() - 1) as f64 * p).round() as usize] }
 }
 
 fn ik_problems(problems: &[Problem]) -> Vec<IkProblem> {

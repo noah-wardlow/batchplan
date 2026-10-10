@@ -52,5 +52,16 @@ fn a_one_thread_device_works_on_its_one_thread() {
         problems.iter().zip(found.paths).filter_map(|(p, path)| Some((p.world, path?))).unzip();
     assert!(!paths.is_empty());
     shortcut::shortcut(&device, &worlds, &world, &mut paths, &ShortcutOptions::default()).unwrap();
+    // Picking something up mid-task fits its spheres on the calling thread.
+    let held = robot
+        .attach(&AttachedObject {
+            name: "box".into(),
+            link: "panda_hand".into(),
+            shapes: vec![Obstacle::Sphere { center: glam::Vec3::new(0.0, 0.0, 0.1), radius: 0.03 }],
+            touch_links: vec!["panda_leftfinger".into(), "panda_rightfinger".into()],
+            spheres: SphereOptions { budget: 4, ..Default::default() },
+        })
+        .unwrap();
+    device.with_robot(&held).unwrap();
     assert_eq!(threads(), at_start + 1, "batched work started other threads");
 }

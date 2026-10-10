@@ -133,8 +133,13 @@ impl Device {
         Ok(Self { id: self.id, backend: self.backend.with_robot(robot)? })
     }
 
-    /// Prepares `worlds` for this device. Calls on other devices refuse the result.
+    /// Prepares `worlds` for this device. Calls on other devices refuse the result. Errors if an
+    /// obstacle has non-finite or negative sizes, a rotation that is not a unit quaternion, or a
+    /// malformed distance grid.
     pub fn upload(&self, worlds: &[World]) -> Result<Worlds> {
+        for (i, w) in worlds.iter().enumerate() {
+            w.check().map_err(|e| input!("world {i}: {e}"))?;
+        }
         Ok(Worlds { device: self.id, worlds: worlds.to_vec(), prepared: self.backend.upload(worlds)? })
     }
 

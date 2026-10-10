@@ -90,6 +90,18 @@ pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &Ik
     let robot = device.robot();
     let n = robot.dof();
     ensure_input!(o.seeds > 0, "need at least one seed");
+    let positive = |v: f32| v.is_finite() && v > 0.0;
+    ensure_input!(
+        positive(o.max_step) && positive(o.rot_weight) && o.damping.is_finite() && o.damping >= 0.0,
+        "IK needs a positive max_step and rot_weight and a non-negative damping"
+    );
+    for (i, p) in problems.iter().enumerate() {
+        let (position, rotation) = (p.target.position, p.target.rotation);
+        ensure_input!(
+            position.is_finite() && rotation.is_finite() && (rotation.length() - 1.0).abs() < 1e-3,
+            "IK problem {i}: the target needs a finite position and a unit-quaternion rotation"
+        );
+    }
     let items = problems.len() * o.seeds;
     let mut rng = Rng::new(o.rng_seed);
     let mut q = Vec::with_capacity(items * n);

@@ -41,6 +41,19 @@ pub struct SphereOptions {
     pub rng_seed: u64,
 }
 
+impl SphereOptions {
+    /// Why these options cannot fit spheres, if they cannot.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if self.budget == 0 || !positive(self.tolerance) || !positive(self.voxel_size) {
+            return Err(format!(
+                "sphere fitting needs a budget of at least one sphere and positive tolerance and voxel size, got {self:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SphereOptions {
     fn default() -> Self {
         Self {
@@ -191,6 +204,9 @@ impl LinkFit {
     /// sample outside them grows the pick that reaches it with the least overhang, judged by the
     /// picks' original radii so growth cannot snowball onto one sphere.
     fn spheres(&self, picks: &[usize]) -> (Vec<[f32; 4]>, f32) {
+        // A cover that picked nothing still needs one sphere to grow: the largest candidate.
+        let largest = (0..self.candidates.len()).max_by(|&a, &b| self.candidates[a].1.total_cmp(&self.candidates[b].1));
+        let picks: Vec<usize> = if picks.is_empty() { largest.into_iter().collect() } else { picks.to_vec() };
         let mut spheres: Vec<(Vec3, f32)> = picks.iter().map(|&i| self.candidates[i]).collect();
         for &s in self.samples.iter().chain(&self.dense) {
             if spheres.iter().any(|&(c, r)| (s - c).length() <= r) {
@@ -241,6 +257,7 @@ fn search_overhang(fits: &[Option<LinkFit>], o: &SphereOptions) -> f32 {
 /// one overhang: `o.tolerance` when the budget allows, otherwise the smallest the budget can
 /// achieve.
 pub(crate) fn fit(links: &[Vec<TriMesh>], o: &SphereOptions) -> (Vec<Vec<[f32; 4]>>, f32) {
+    debug_assert!(o.check().is_ok(), "callers check the options");
     let mut rng = Rng::new(o.rng_seed);
     let fits: Vec<Option<LinkFit>> = links.iter().map(|m| LinkFit::new(m, o, &mut rng)).collect();
     let overhang = search_overhang(&fits, o);
