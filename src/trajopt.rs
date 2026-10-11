@@ -83,6 +83,9 @@ impl Default for PlanOptions {
 pub struct PlanProblem {
     pub world: u32,
     pub start: Vec<f32>,
+    /// Where the path ends, up to whole turns: continuous joints turn the short way (or the long
+    /// way, if that is the one that is free), and a joint whose range spans more than a turn may
+    /// end a turn away from this value when that is nearer or free. Every such end is the same pose.
     pub goal: Vec<f32>,
 }
 
@@ -134,13 +137,20 @@ pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &Plan
     let mut item_world = Vec::with_capacity(items);
     for (pi, p) in problems.iter().enumerate() {
         ensure_input!(p.start.len() == n && p.goal.len() == n, "problem {pi}: start/goal must have {n} values");
-        let within = |q: &[f32]| q.iter().enumerate().all(|(j, &v)| v >= robot.lower[j] && v <= robot.upper[j]);
         ensure_input!(
-            within(&p.start) && within(&p.goal),
+            robot.within(&p.start) && robot.within(&p.goal),
             "problem {pi}: start and goal must be within the joint limits"
         );
+        // Seed 0 runs straight to the nearest equivalent goal; odd seeds run straight to the others
+        // while they last, the rest bend toward the nearest through a random via point.
+        let goals = robot.goal_variants(&p.start, &p.goal);
         for s in 0..o.seeds {
-            seed_path(robot, &p.start, &p.goal, s, &mut rng, paths.path_mut(pi * o.seeds + s));
+            let (goal, straight) = match s {
+                0 => (&goals[0], true),
+                s if s % 2 == 1 && s.div_ceil(2) < goals.len() => (&goals[s.div_ceil(2)], true),
+                _ => (&goals[0], false),
+            };
+            seed_path(robot, &p.start, goal, straight, &mut rng, paths.path_mut(pi * o.seeds + s));
             item_world.push(p.world);
         }
     }
@@ -208,7 +218,12 @@ fn fall_back(
         .iter()
         .map(|&p| {
             let problem = &result.problems[p];
-            RrtProblem { world: problem.world, start: problem.start.clone(), goals: vec![problem.goal.clone()] }
+            let goals = result.problems[p].goal.clone();
+            RrtProblem {
+                world: problem.world,
+                start: problem.start.clone(),
+                goals: device.robot().goal_variants(&problem.start, &goals),
+            }
         })
         .collect();
     let found = connect_until(device, worlds, &searches, &f.rrt, deadline)?;
@@ -305,12 +320,12 @@ fn spread(path: &[f32], n: usize, out: &mut [f32]) {
     }
 }
 
-/// Control points of seed 0 lie on the straight line; other seeds bend through a random via point.
+/// Control points on the straight line from `start` to `goal`, or bent through a random via point.
 /// The first three and last three are the start and goal.
-fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], seed: usize, rng: &mut Rng, out: &mut [f32]) {
+fn seed_path(robot: &Robot, start: &[f32], goal: &[f32], straight: bool, rng: &mut Rng, out: &mut [f32]) {
     let n = start.len();
     let t_count = out.len() / n;
-    let (via_u, via): (f32, Vec<f32>) = if seed == 0 {
+    let (via_u, via): (f32, Vec<f32>) = if straight {
         (0.5, (0..n).map(|j| 0.5 * (start[j] + goal[j])).collect())
     } else {
         let u = rng.range(0.3, 0.7);

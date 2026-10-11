@@ -180,6 +180,8 @@ pub struct Robot {
     pub(crate) dof_names: Vec<String>,
     pub(crate) lower: Vec<f32>,
     pub(crate) upper: Vec<f32>,
+    /// Joints that turn without limit; their values wrap every 2π.
+    pub(crate) continuous: Vec<bool>,
     pub(crate) max_velocity: Vec<f32>,
     pub(crate) max_acceleration: Vec<f32>,
     pub(crate) max_jerk: Vec<f32>,
@@ -467,6 +469,75 @@ impl Robot {
         &self.upper
     }
 
+    /// Which joints are continuous: they turn without limit and their values wrap every 2π. For
+    /// them, [`Robot::lower`] and [`Robot::upper`] give the turn (−π to π) that seeds and samples
+    /// come from, not limits.
+    pub fn continuous(&self) -> &[bool] {
+        &self.continuous
+    }
+
+    /// Joint `j`'s position limits; unbounded for continuous joints.
+    #[inline]
+    pub(crate) fn bounds(&self, j: usize) -> (f32, f32) {
+        if self.continuous[j] { (f32::NEG_INFINITY, f32::INFINITY) } else { (self.lower[j], self.upper[j]) }
+    }
+
+    /// `q` with each continuous joint turned by whole turns to lie within half a turn of `from`.
+    pub(crate) fn turn_toward(&self, from: &[f32], q: &mut [f32]) {
+        use std::f32::consts::{PI, TAU};
+        for (j, v) in q.iter_mut().enumerate().filter(|&(j, _)| self.continuous[j]) {
+            *v = from[j] + (*v - from[j] + PI).rem_euclid(TAU) - PI;
+        }
+    }
+
+    /// The configurations equivalent to `goal` that a path from `start` may end at, nearest first:
+    /// `goal` with continuous joints turned the short way (see [`Robot::turn_toward`]) and each
+    /// joint whose range spans more than a turn at its value nearest `start`, then, for each such
+    /// joint, the same with it a turn further either way where its limits allow. All are one pose.
+    pub(crate) fn goal_variants(&self, start: &[f32], goal: &[f32]) -> Vec<Vec<f32>> {
+        use std::f32::consts::TAU;
+        let mut base = goal.to_vec();
+        self.turn_toward(start, &mut base);
+        // Each wide joint's values, nearest the start first.
+        let turns: Vec<Vec<f32>> = (0..goal.len())
+            .map(|j| {
+                if self.continuous[j] {
+                    return vec![base[j]];
+                }
+                let mut values: Vec<f32> = (-2..=2)
+                    .map(|k| goal[j] + k as f32 * TAU)
+                    .filter(|v| (self.lower[j]..=self.upper[j]).contains(v))
+                    .collect();
+                values.sort_by(|a, b| (a - start[j]).abs().total_cmp(&(b - start[j]).abs()));
+                values
+            })
+            .collect();
+        for (j, t) in turns.iter().enumerate() {
+            base[j] = t[0];
+        }
+        let mut variants = vec![base.clone()];
+        let distance = |q: &[f32]| q.iter().zip(start).map(|(a, b)| (a - b) * (a - b)).sum::<f32>();
+        let mut flips = vec![];
+        for (j, t) in turns.iter().enumerate() {
+            for &v in &t[1..] {
+                let mut q = base.clone();
+                q[j] = v;
+                flips.push(q);
+            }
+        }
+        flips.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+        variants.extend(flips);
+        variants
+    }
+
+    /// Whether `q` is within every joint's limits.
+    pub(crate) fn within(&self, q: &[f32]) -> bool {
+        q.iter().enumerate().all(|(j, &v)| {
+            let (lo, hi) = self.bounds(j);
+            v >= lo && v <= hi
+        })
+    }
+
     pub fn max_velocity(&self) -> &[f32] {
         &self.max_velocity
     }
@@ -705,7 +776,7 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
     }
     let moving = |j: usize| desc.joints[j].kind != JointType::Fixed;
     let mut dof_of: HashMap<usize, usize> = HashMap::new();
-    let (mut dof_names, mut lower, mut upper) = (vec![], vec![], vec![]);
+    let (mut dof_names, mut lower, mut upper, mut continuous) = (vec![], vec![], vec![], vec![]);
     let (mut max_velocity, mut max_acceleration, mut max_jerk) = (vec![], vec![], vec![]);
     let or_default = |v: f32, default: f32| if v.is_finite() { v } else { default };
     for &j in order.iter().filter(|&&j| moving(j) && desc.joints[j].mimic.is_none()) {
@@ -720,6 +791,8 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
             (None, JointType::Continuous) => (-std::f32::consts::PI, std::f32::consts::PI),
             (None, _) => (joint.lower, joint.upper),
         };
+        // Limits given in the options make a continuous joint an ordinary one.
+        continuous.push(joint.kind == JointType::Continuous && !o.joint_limits.contains_key(&joint.name));
         ensure!(
             lo.is_finite() && hi.is_finite(),
             "joint '{}' has no position limits; give them in RobotOptions::joint_limits",
@@ -837,6 +910,7 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         dof_names,
         lower,
         upper,
+        continuous,
         max_velocity,
         max_acceleration,
         max_jerk,

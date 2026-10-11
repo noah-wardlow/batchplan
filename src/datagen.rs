@@ -56,8 +56,9 @@ pub fn recovery_problems(
         for _ in 0..o.per_trajectory {
             let phase = rng.range(o.phase.0, o.phase.1);
             spline::at_phase(path, n, phase, &mut on_path);
-            let start: Vec<f32> =
-                (0..n).map(|j| (on_path[j] + o.sigma * rng.normal()).clamp(robot.lower[j], robot.upper[j])).collect();
+            let start: Vec<f32> = (0..n)
+                .map(|j| (on_path[j] + o.sigma * rng.normal()).clamp(robot.bounds(j).0, robot.bounds(j).1))
+                .collect();
             let next = PlanProblem { world: problem.world, start, goal: problem.goal.clone() };
             candidates.push(Recovery { parent, phase, problem: next });
         }
@@ -151,7 +152,9 @@ pub fn demonstrations(
     let mut starts: Vec<f32> = (0..goals.len())
         .flat_map(|_| {
             (0..n)
-                .map(|j| (robot.default_q[j] + o.start_noise * rng.normal()).clamp(robot.lower[j], robot.upper[j]))
+                .map(|j| {
+                    (robot.default_q[j] + o.start_noise * rng.normal()).clamp(robot.bounds(j).0, robot.bounds(j).1)
+                })
                 .collect::<Vec<_>>()
         })
         .collect();

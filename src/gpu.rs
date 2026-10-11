@@ -455,7 +455,8 @@ impl RobotBuffers {
             .flat_map(|lp| [[lp.a, lp.b], [skip + lp.first, lp.count]])
             .chain(robot.self_pairs.iter().copied())
             .collect();
-        let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
+        // Continuous joints are unbounded: clamping to infinite limits leaves them as they are.
+        let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| robot.bounds(j).into()).collect();
 
         Self {
             links: storage(device, "links", &gpu_links),

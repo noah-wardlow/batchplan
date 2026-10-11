@@ -401,7 +401,8 @@ fn reaches(robot: &Robot) -> (Vec<World>, Vec<PlanProblem>) {
 fn a_tiny_time_budget_returns_after_at_most_one_more_chunk() {
     let robot = panda();
     let (scene, problems) = reaches(&robot);
-    let o = PlanOptions::default();
+    // Enough rounds (20 chunks) that a fast GPU's plan still lasts well beyond one chunk.
+    let o = PlanOptions { iterations: 160, ..Default::default() };
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
         let timed = |o: &PlanOptions| {

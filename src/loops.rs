@@ -163,7 +163,8 @@ fn settle(tree: &Robot, l: &Loop, q: &mut [f32]) -> f64 {
             };
             let mut trial = q.to_vec();
             for (i, &(d, ..)) in l.passive.iter().enumerate() {
-                trial[d] = (q[d] as f64 + step[i]).clamp(tree.lower()[d] as f64, tree.upper()[d] as f64) as f32;
+                let (lo, hi) = tree.bounds(d);
+                trial[d] = (q[d] as f64 + step[i]).clamp(lo as f64, hi as f64) as f32;
             }
             let next = cost(&trial);
             if next < current {

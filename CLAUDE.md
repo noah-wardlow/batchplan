@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 75 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 77 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -115,11 +115,11 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   The first round only prices the seeds (their direction is still zero). The per-path passes run one workgroup per path: each invocation owns every `WORKGROUP`-th element (coalesced loads), and sums go through `workgroup_sum`/`workgroup_max`, whose results come back through `workgroupUniformLoad` so later barriers stay in uniform control flow. `aux` holds each path's L-BFGS state (`lbfgs_stride`, mirrored by the `Lbfgs` struct in `cpu.rs`); paths are optimized in chunks whose state fits one storage binding.
 
 **Planning flow.** In `trajopt::plan`:
-1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Seed 0's free points lie on the straight line; the others bend through random via points.
+1. Seed the paths: B-spline control points, the first three and last three pinned to start and goal. Goals come from `Robot::goal_variants`: continuous joints turned the short way, and joints wider than a turn at their nearest equivalent, then a turn further either way. Seed 0 runs straight to the nearest variant, odd seeds straight to the others while they last, and the rest bend toward the nearest through random via points.
 2. Run the backend's trajopt on the free control points.
 3. Validate by sampling each spline densely (`validate_substeps` per span) and running `Device::clearance` (crate-private: world and self clearance without cost or gradient; IK, RRT and datagen use it too).
 4. `best()` picks the shortest valid seed.
-5. Problems without a valid seed fall back (`PlanOptions::fallback`): `rrt::connect` (RRT-Connect, several extensions per problem per round, every problem's edges checked in one `evaluate`), `shortcut::shortcut`, then `trace` turns the waypoints into control points whose spline runs exactly along them (each waypoint tripled). The traced spline and its optimized version are validated; the shorter valid one replaces seed 0.
+5. Problems without a valid seed fall back (`PlanOptions::fallback`): `rrt::connect` (RRT-Connect toward every goal variant, several extensions per problem per round, every problem's edges checked in one `Device::clearance`; continuous joints step and measure the short way, `Robot::turn_toward`, and the found path is unwrapped), `shortcut::shortcut`, then `trace` turns the waypoints into control points whose spline runs exactly along them (each waypoint tripled). The traced spline and its optimized version are validated; the shorter valid one replaces seed 0.
 
 `timing::Trajectory` times a path from bounds on its control-point differences (velocity, acceleration, jerk), so limits hold along the whole curve; `check` re-verifies them.
 
@@ -139,6 +139,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 
 **Robot model.**
 - `Robot::load` → `description::load_robot` (by extension) → if the description has loops, `loops::close_loops` on the open tree (each loop's passive joints become quartic mimics of its one actuated joint: the least spring energy that closes the loop within their limits, by projected Levenberg-Marquardt over the driver's range; `tests/mjcf.rs` holds MuJoCo's settled 2F-85 as the reference) → `kinematics` (planar, ball and floating joints expanded into one-axis joints on massless links by `expand_compound_joints`, so nothing downstream sees them; breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a `Curve` (a polynomial of degree ≤ 4, composed along mimic chains; `Fk` records each nonlinear joint's slope, which gradients and Jacobians use in place of the multiplier), locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
+- Continuous joints (`Robot::continuous`) are unbounded reals whose values wrap every 2π; `lower`/`upper` give them only the turn that seeds and samples come from. Clamp and check with `Robot::bounds`/`Robot::within`, never with `lower`/`upper` directly; the GPU limits buffer holds ±∞ for them.
 - IK Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order (`robot_wgsl` unrolls it).
 - `assets/franka/panda_collision.json` holds cuRobo's hand-tuned Panda spheres (Apache-2.0, credited in the README and `assets/README.md`); keep that credit when touching assets. `examples/common/mod.rs` has the Panda's options (locked fingers, `ee_link`, default pose).
 

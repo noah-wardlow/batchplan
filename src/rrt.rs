@@ -97,13 +97,15 @@ pub(crate) fn distance(a: &[f32], b: &[f32]) -> f32 {
 /// Nodes with parents; roots have none.
 struct Tree {
     dof: usize,
+    /// Joints whose values wrap every turn (continuous joints).
+    wrap: Vec<bool>,
     nodes: Vec<f32>,
     parent: Vec<Option<usize>>,
 }
 
 impl Tree {
-    fn new(dof: usize) -> Self {
-        Self { dof, nodes: vec![], parent: vec![] }
+    fn new(wrap: &[bool]) -> Self {
+        Self { dof: wrap.len(), wrap: wrap.to_vec(), nodes: vec![], parent: vec![] }
     }
 
     fn node(&self, i: usize) -> &[f32] {
@@ -116,8 +118,13 @@ impl Tree {
         self.parent.len() - 1
     }
 
+    /// The node nearest `q`, continuous joints measured the short way around.
     fn nearest(&self, q: &[f32]) -> usize {
-        let squared = |i: usize| self.node(i).iter().zip(q).map(|(x, y)| (x - y) * (x - y)).sum::<f32>();
+        use std::f32::consts::{PI, TAU};
+        let difference = |j: usize, d: f32| if self.wrap[j] { (d + PI).rem_euclid(TAU) - PI } else { d };
+        let squared = |i: usize| {
+            self.node(i).iter().zip(q).enumerate().map(|(j, (x, y))| difference(j, x - y).powi(2)).sum::<f32>()
+        };
         (0..self.parent.len()).map(|i| (squared(i), i)).min_by(|a, b| a.0.total_cmp(&b.0)).expect("trees have a root").1
     }
 
@@ -167,14 +174,13 @@ pub(crate) fn connect_until(
     let n = robot.dof();
     ensure_input!(o.step > 0.0 && o.resolution > 0.0, "step and resolution must be positive");
     ensure_input!(o.extensions_per_round > 0, "extend toward at least one configuration per round");
-    let within = |q: &[f32]| q.iter().enumerate().all(|(j, &v)| v >= robot.lower[j] && v <= robot.upper[j]);
     let mut ends = vec![];
     let mut end_world = vec![];
     for (i, p) in problems.iter().enumerate() {
         ensure_input!(p.start.len() == n, "problem {i}: the start must have {n} values");
         ensure_input!(p.goals.iter().all(|g| g.len() == n), "problem {i}: goals must have {n} values");
         ensure_input!(
-            within(&p.start) && p.goals.iter().all(|g| within(g)),
+            robot.within(&p.start) && p.goals.iter().all(|g| robot.within(g)),
             "problem {i}: the start and goals must be within the joint limits"
         );
         for q in std::iter::once(&p.start).chain(&p.goals) {
@@ -186,11 +192,11 @@ pub(crate) fn connect_until(
     let mut searches = vec![];
     let mut next_end = 0;
     for (i, p) in problems.iter().enumerate() {
-        let mut start = Tree::new(n);
+        let mut start = Tree::new(&robot.continuous);
         if free[next_end] {
             start.add(&p.start, None);
         }
-        let mut goals = Tree::new(n);
+        let mut goals = Tree::new(&robot.continuous);
         for (k, g) in p.goals.iter().enumerate() {
             if free[next_end + 1 + k] {
                 goals.add(g, None);
@@ -216,10 +222,12 @@ pub(crate) fn connect_until(
         for &s in &active {
             let search = &mut searches[s];
             for _ in 0..o.extensions_per_round {
-                let target: Vec<f32> = (0..n).map(|j| search.rng.range(robot.lower[j], robot.upper[j])).collect();
+                let mut target: Vec<f32> = (0..n).map(|j| search.rng.range(robot.lower[j], robot.upper[j])).collect();
                 let tree = &search.trees[0];
                 let near = tree.nearest(&target);
                 let from = tree.node(near);
+                // Continuous joints step the short way around.
+                robot.turn_toward(from, &mut target);
                 let reach = (o.step / distance(from, &target)).min(1.0);
                 let new: Vec<f32> = from.iter().zip(&target).map(|(a, b)| a + (b - a) * reach).collect();
                 extend.push(search.world, from, &new);
@@ -236,7 +244,9 @@ pub(crate) fn connect_until(
             let search = &mut searches[s];
             let added = search.trees[0].add(&new, Some(near));
             let other = search.trees[1].nearest(&new);
-            connect.push(search.world, search.trees[1].node(other), &new);
+            let mut toward = new.clone();
+            robot.turn_toward(search.trees[1].node(other), &mut toward);
+            connect.push(search.world, search.trees[1].node(other), &toward);
             joins.push((s, added, other));
         }
         for ((s, added, other), known) in joins.into_iter().zip(connect.check(device, worlds)?) {
@@ -245,7 +255,9 @@ pub(crate) fn connect_until(
                 continue;
             }
             let [extended, connecting] = &mut search.trees;
-            let (from, to) = (connecting.node(other).to_vec(), extended.node(added).to_vec());
+            let from = connecting.node(other).to_vec();
+            let mut to = extended.node(added).to_vec();
+            robot.turn_toward(&from, &mut to);
             let length = distance(&from, &to);
             let mut parent = other;
             let mut along = o.step;
@@ -259,6 +271,11 @@ pub(crate) fn connect_until(
                 path.extend(connecting.branch(parent));
                 if !search.start_first {
                     path = path.chunks(n).rev().flatten().copied().collect();
+                }
+                // The two trees may hold a continuous joint a turn apart where they meet.
+                for k in 1..path.len() / n {
+                    let (before, after) = path.split_at_mut(k * n);
+                    robot.turn_toward(&before[(k - 1) * n..], &mut after[..n]);
                 }
                 search.path = Some(path);
             }

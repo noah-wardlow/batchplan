@@ -380,7 +380,8 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     let largest = dq[..n].iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let scale = if largest > o.max_step { o.max_step / largest } else { 1.0 };
     for j in 0..n {
-        q[j] = (q[j] + dq[j] * scale).clamp(robot.lower[j], robot.upper[j]);
+        let (lo, hi) = robot.bounds(j);
+        q[j] = (q[j] + dq[j] * scale).clamp(lo, hi);
     }
 }
 
@@ -448,7 +449,8 @@ fn candidate(robot: &Robot, x: &[f32], d: &[f32], alpha: f32, t: usize, j: usize
     if t < 3 || t >= x.len() / n - 3 {
         return x[i];
     }
-    (x[i] + alpha * d[i]).clamp(robot.lower[j], robot.upper[j])
+    let (lo, hi) = robot.bounds(j);
+    (x[i] + alpha * d[i]).clamp(lo, hi)
 }
 
 /// Collision cost at sample `s` of span `span` of the candidate path `x + alpha d`. Must match

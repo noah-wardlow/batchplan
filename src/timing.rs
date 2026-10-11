@@ -157,7 +157,7 @@ impl Trajectory {
         let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
         let names = ["velocity", "acceleration", "jerk"];
         for j in 0..n {
-            let (lo, hi) = (robot.lower()[j], robot.upper()[j]);
+            let (lo, hi) = robot.bounds(j);
             if let Some(i) = (0..points).find(|&i| !(lo..=hi).contains(&cp[i * n + j])) {
                 return Err(Error::Unsafe(format!("joint {j} leaves its range [{lo}, {hi}] at control point {i}")));
             }
