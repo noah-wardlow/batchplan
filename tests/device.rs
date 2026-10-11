@@ -482,3 +482,42 @@ fn plans_from_a_moving_start_continue_its_motion() {
         }
     }
 }
+
+#[test]
+fn a_robot_mounted_on_a_table_is_not_in_collision_with_it() {
+    // Spheres fitted to the Panda's meshes reach below its base, into the table it stands on.
+    let robot = Robot::load(
+        common::asset("franka/franka_panda.urdf"),
+        &RobotOptions { collision_model: None, ..common::panda_options() },
+    )
+    .unwrap();
+    let base = robot.link_pose(robot.default_q(), "panda_link0").unwrap();
+    let lowest = robot.collision_model().spheres["panda_link0"]
+        .iter()
+        .map(|s| (base.position + base.rotation * Vec3::new(s[0], s[1], s[2])).z - s[3])
+        .fold(f32::INFINITY, f32::min);
+    assert!(lowest < 0.0, "the base's spheres should reach below the table: {lowest}");
+    let table = Obstacle::Cuboid {
+        center: Vec3::new(0.4, 0.0, -0.02),
+        half_extents: Vec3::new(0.7, 0.8, 0.02),
+        rotation: glam::Quat::IDENTITY,
+    };
+    let mounted = World { obstacles: vec![table.clone()] };
+    // A pin through the elbow still collides.
+    let elbow = robot.link_pose(robot.default_q(), "panda_link4").unwrap().position;
+    let pin =
+        Obstacle::Cuboid { center: elbow, half_extents: Vec3::new(0.3, 0.005, 0.005), rotation: glam::Quat::IDENTITY };
+    let pinned = World { obstacles: vec![table, pin] };
+    let goal = vec![0.5, -0.8, 0.0, -2.2, 0.0, 1.6, 0.8];
+    for d in devices(&robot) {
+        let worlds = d.upload(&[mounted.clone(), pinned.clone()]).unwrap();
+        let q: Vec<f32> = robot.default_q().iter().chain(robot.default_q()).copied().collect();
+        let e = d.evaluate(&worlds, &[0, 1], &q, &CollisionWeights::NONE).unwrap();
+        assert!(e.collision_free(0), "{}: on its table, world clearance {}", d.name(), e.world_clearance[0]);
+        assert!(!e.collision_free(1), "{}: the pin should collide", d.name());
+        let problem =
+            PlanProblem { world: 0, start: robot.default_q().to_vec(), goal: goal.clone(), start_motion: None };
+        let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
+        assert!(result.best(0).is_some(), "{}: no plan on the table", d.name());
+    }
+}

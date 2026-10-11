@@ -164,10 +164,12 @@ fn collision<const GRADIENT: bool>(
     let (mut cost, mut wmin, mut smin) = (0.0f32, FAR, FAR);
     // An obstacle farther from a link's bounding sphere than the margin cannot add cost through the
     // link's spheres; the gap bounds their clearance from below. Distance grids are interpolated,
-    // not exact, so their spheres are always checked.
+    // not exact, so their spheres are always checked. Links no joint moves are not checked against
+    // the world: they touch it the same way in every configuration, as a mounted robot's base
+    // rests on its table.
     let world_gate = w.margin.max(0.0);
     for (link, &[first, count]) in robot.sphere_ranges.iter().enumerate() {
-        if count == 0 {
+        if count == 0 || robot.links[link].chain.is_empty() {
             continue;
         }
         let b = robot.link_bounds[link];

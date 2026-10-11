@@ -65,6 +65,9 @@ pub(crate) struct Link {
     pub(crate) joint: JointKind,
     /// The links at or above this one with a moving joint, root first.
     pub(crate) chain: Vec<usize>,
+    /// The link's collision geometry in its frame (the visual geometry where spheres are fitted
+    /// to that); mesh files are read only when something needs the meshes.
+    pub(crate) shapes: Vec<Shape>,
 }
 
 /// A pair of links checked for self-collision: sphere pairs `first..first + count` of
@@ -277,9 +280,17 @@ impl Robot {
             &closed
         };
         let mut robot = kinematics(desc, o)?;
+        for link in &mut robot.links {
+            if let Some(l) = desc.links.iter().find(|l| l.name == link.name) {
+                link.shapes = match o.spheres.geometry {
+                    SphereGeometry::Collision => l.collision.clone(),
+                    SphereGeometry::Visual => l.visual.clone(),
+                };
+            }
+        }
         let mut model = match &o.collision_model {
             Some(model) => model.clone(),
-            None => robot.fit_collision_model(desc, &o.spheres)?,
+            None => robot.fit_collision_model(&o.spheres)?,
         };
         if let Some(srdf) = &o.srdf {
             for (a, b) in crate::urdf::srdf_disabled_pairs(srdf)? {
@@ -291,15 +302,9 @@ impl Robot {
     }
 
     /// Fits spheres to every link's geometry, then finds the link pairs not worth checking.
-    fn fit_collision_model(&mut self, desc: &RobotDescription, o: &SphereOptions) -> Result<CollisionModel> {
-        let mut meshes: Vec<Vec<TriMesh>> = vec![];
-        for link in &self.links {
-            let shapes = desc.links.iter().find(|l| l.name == link.name).map_or(&[][..], |l| match o.geometry {
-                SphereGeometry::Collision => &l.collision[..],
-                SphereGeometry::Visual => &l.visual[..],
-            });
-            meshes.push(shapes.iter().map(|s| s.mesh()).collect::<Result<_>>()?);
-        }
+    fn fit_collision_model(&mut self, o: &SphereOptions) -> Result<CollisionModel> {
+        let meshes: Vec<Vec<TriMesh>> =
+            self.links.iter().map(|link| link.shapes.iter().map(|s| s.mesh()).collect()).collect::<Result<_>>()?;
         o.check().map_err(anyhow::Error::msg)?;
         let with_geometry = meshes.iter().filter(|m| !m.is_empty()).count();
         ensure!(
@@ -394,10 +399,10 @@ impl Robot {
             return Err(input!("unknown touch link '{t}'"));
         }
         object.spheres.check().map_err(Error::Input)?;
-        let meshes = object
-            .shapes
+        let shapes = object.shapes.iter().map(attached_shape).collect::<error::Result<Vec<Shape>>>()?;
+        let meshes = shapes
             .iter()
-            .map(|shape| attached_shape(shape)?.mesh().map_err(|e| input!("{e:#}")))
+            .map(|shape| shape.mesh().map_err(|e| input!("{e:#}")))
             .collect::<error::Result<Vec<TriMesh>>>()?;
         ensure_input!(!meshes.is_empty(), "'{}' has no shapes", object.name);
         // Attaching happens inside control processes: fit on the caller's rayon pool if it has
@@ -421,6 +426,7 @@ impl Robot {
             origin: Transform::IDENTITY,
             joint: JointKind::Fixed,
             chain,
+            shapes,
         });
         robot.attached.push(object.name.clone());
         let mut model = self.collision_model.clone();
@@ -806,8 +812,14 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
     }
     ensure!(!dof_names.is_empty(), "the robot has no actuated joints to plan with");
 
-    let root =
-        Link { name: base.clone(), parent: None, origin: Transform::IDENTITY, joint: JointKind::Fixed, chain: vec![] };
+    let root = Link {
+        name: base.clone(),
+        parent: None,
+        origin: Transform::IDENTITY,
+        joint: JointKind::Fixed,
+        chain: vec![],
+        shapes: vec![],
+    };
     let mut links = vec![root];
     let mut link_index: HashMap<String, usize> = HashMap::from([(base, 0)]);
     for &j in &order {
@@ -868,7 +880,14 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
             chain.push(links.len());
         }
         link_index.insert(joint.child.clone(), links.len());
-        links.push(Link { name: joint.child.clone(), parent: Some(parent), origin, joint: kind, chain });
+        links.push(Link {
+            name: joint.child.clone(),
+            parent: Some(parent),
+            origin,
+            joint: kind,
+            chain,
+            shapes: vec![],
+        });
     }
     if let Some(dof) =
         (0..dof_names.len()).find(|&d| lower[d] > upper[d] || !(lower[d].is_finite() && upper[d].is_finite()))

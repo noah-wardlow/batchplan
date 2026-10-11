@@ -34,6 +34,7 @@ pub mod ik;
 #[cfg(feature = "lerobot")]
 pub mod lerobot;
 mod loops;
+pub mod meshes;
 mod mjcf;
 pub mod npy;
 pub mod rng;
@@ -55,6 +56,7 @@ pub mod world;
 pub use device::{CollisionWeights, Device, Evaluation, Worlds};
 pub use error::Error;
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
+pub use meshes::MeshModel;
 pub use robot::{AttachedObject, CollisionModel, Robot, RobotOptions};
 pub use rrt::{RrtOptions, RrtProblem, RrtResult};
 pub use sdf::{DepthImage, Intrinsics, Occlusion, OccupancyMap, SdfGrid, SdfOptions};

@@ -31,6 +31,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
 | `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `robot.attach(&AttachedObject)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
+| `meshes` | `MeshModel::new(&robot)`, `meshes.clearance(&worlds, &item_world, &q)` | Clearances measured on the links' meshes rather than their spheres, on the CPU, for checking finished trajectories. See [Checking against meshes](#checking-against-meshes). |
 | `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `OccupancyMap`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
 
 Design choices:
@@ -123,11 +124,28 @@ Performance claims come from alternating runs of two builds on one machine. Two 
 
   `RobotOptions::srdf` adds a MoveIt SRDF's disabled pairs.
 - **Collision-model files.** `robot.collision_model().save(path)` writes the spheres, self-collision buffers and ignored pairs as JSON. Commit the file, tune it by hand if needed, and load it back through `RobotOptions::collision_model`.
+- **Mounted robots.** Links that no joint moves (the base and anything fixed to it) are not checked against the world: they touch it the same way in every configuration, so a robot standing on its table is not in collision with it. They still collide with the robot's moving links.
 
 Test robots live in `assets/` with their licences ([assets/README.md](assets/README.md)):
 - URDF: the Franka Panda (with cuRobo's hand-tuned spheres), the UR5e, the SO-101 and the Robotiq 2F-85 (one actuated joint driving five mimic joints);
 - MJCF: MuJoCo Menagerie's Panda, UR5e and 2F-85;
 - USD: newton-assets' UR5e and 2F-85, a Franka converted from our URDF with NVIDIA's urdf-usd-converter, and handwritten fixtures for each UsdPhysics convention.
+
+### Checking against meshes
+
+Planning and validation run on spheres, which only approximate the links. `MeshModel::new(&robot)` loads each link's collision meshes (or visual meshes, where spheres were fitted to those), and `clearance(&worlds, &item_world, &q)` measures world and self clearance between meshes for a batch of configurations, as MoveIt checks a planning scene with FCL. It runs on the CPU, for finished trajectories rather than inner loops:
+- **Distances are exact.** They are parry3d's, searched by branch and bound: pairs in order of their bounding spheres' gap, then each pair's convex hulls, then the meshes. That makes it about 110 µs per Panda configuration on the M4 Pro's 14 threads, down from 620 µs.
+- **Meshes are surfaces, as in FCL.** A link entirely inside another closed mesh does not touch it.
+- **Distance grids hold no exact surface.** Against them, a link's clearance is the grid's distance at points covering its surface to within 5 mm, less 5 mm.
+
+`cargo run --release --example benchmark -- --meshes` checks every successful plan the same way, at 4× the planner's validation density:
+
+| Spheres | Ends free | IK + plan (spheres) | Also clear on meshes |
+|---|---|---|---|
+| cuRobo's hand-tuned (the default) | 98.1% | 95.6% | 88.5% |
+| Fitted to the meshes (`--fitted`) | 40.0% | 49.7% | 49.7% |
+
+cuRobo's spheres leave parts of the Panda's collision meshes uncovered, by up to 18 mm on `panda_link5`, so about one plan in thirteen grazes an obstacle on the meshes. Spheres fitted to the meshes cover them: every plan clears them, but their 3 cm overhang already puts most of these tight scenes' start or goal states in collision. Checking plans with a `MeshModel` keeps the fast spheres and drops the rare grazing plan.
 
 ## Distance grids
 
@@ -247,7 +265,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 84 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 76 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 91 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 83 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -290,6 +308,12 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
   - Fitted spheres contain independently sampled link surfaces, and fitting is deterministic.
   - Collision-model files round-trip, SRDF pairs stop being checked, and `package://` paths resolve.
   - The UR5e, SO-101 and Panda (with fitted spheres) each plan 12 of 12 tabletop motions on the CPU and the GPU.
+  - A Panda with fitted spheres, whose base spheres reach into the table it stands on, is collision-free on it and plans on every device, while a pin through its elbow still collides. Planting the base back into either device's world check fails the test.
+- **Mesh clearances:**
+  - Distances to every obstacle kind match closed forms to 0.1 mm, follow the joints, stay exact among several obstacles in any order, and read zero across a surface. Self clearance between links matches too, and a concave link is measured on its surface, not its hull.
+  - Against a grid of a cube, clearance stays within the grid's documented slack. Held objects are checked as part of the robot, and the Panda's meshes load and read clear of its own table.
+  - Fitted spheres never read farther than the meshes over 300 random configurations.
+  - Planting cylinders along the wrong axis, unturned link poses, grid points left in the link frame, dropped self pairs, vertex-only grid checks, dropped held shapes, an unsorted search, a search that stops at the hulls, or hulls in place of meshes fails a test.
 - **MJCF:**
   - Menagerie's Panda matches our URDF Panda link for link to 1e-5.
   - Menagerie's UR5e matches the UR5e URDF up to constant per-link frame offsets (within 3 mm; Menagerie rounds a few dimensions), and plans like the others.
@@ -356,7 +380,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 ## Limits of the MVP
 
-- **Geometry.** The robot is modeled as spheres only.
+- **Geometry.** Planning runs on spheres; `MeshModel` checks results against the meshes on the CPU, as a filter after planning.
 - **Kinematics.** A closed loop must have exactly one actuated joint, and its passive joints must follow it by a quartic to within 0.5 mm of closure; other loops are rejected when loading. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
 - **Timing.** Time-optimal timing smooths a velocity- and acceleration-optimal profile, so it is not jerk-optimal. Trajectories end at rest.
 - **Kernel performance.** Small batches stay latency-bound on the GPU: one IK-and-plan query takes about 16 ms on the Radeon and 29 ms on the M4 Pro, mostly serial IK iterations. Shader modules without bounds checks would add 6–12% but need `unsafe`.

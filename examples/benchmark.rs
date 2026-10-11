@@ -3,6 +3,8 @@
 //!
 //! cargo run --release --example benchmark -- [data_dir=data/robometrics] [--latency N=20] [--device gpu|cpu|all]
 //!     [--points N] [--samples K]   (B-spline control points, collision samples per span)
+//!     [--meshes]                   (also check successful plans against the Panda's meshes)
+//!     [--fitted]                   (spheres fitted to the meshes instead of cuRobo's hand-tuned ones)
 //!
 //! For every set and device it reports two modes:
 //! - **plan**: plan from the start to the set's first IK solution (planning only);
@@ -11,7 +13,8 @@
 //! A problem succeeds when the final `panda_hand` position is within 1 cm of the goal, every joint
 //! is within its limits, and an independent CPU check at 4x the planner's validation density finds
 //! no collision. Batch-1 latency is measured on the first N problems of each set; everything else
-//! runs each set as one batch.
+//! runs each set as one batch. With `--meshes`, "meshes ok" counts the successes whose dense samples
+//! also clear the obstacles and each other on the Panda's collision meshes (`MeshModel`).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -103,6 +106,8 @@ struct Args {
     latency: usize,
     device: String,
     plan: PlanOptions,
+    meshes: bool,
+    fitted: bool,
 }
 
 fn args() -> Result<Args> {
@@ -111,6 +116,8 @@ fn args() -> Result<Args> {
         latency: 20,
         device: "all".into(),
         plan: PlanOptions::default(),
+        meshes: false,
+        fitted: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -122,6 +129,8 @@ fn args() -> Result<Args> {
             "--iterations" => a.plan.iterations = it.next().context("--iterations N")?.parse()?,
             "--history" => a.plan.history = it.next().context("--history M")?.parse()?,
             "--no-fallback" => a.plan.fallback = None,
+            "--meshes" => a.meshes = true,
+            "--fitted" => a.fitted = true,
             s if s.starts_with("--") => bail!("unknown flag {s}"),
             s => a.data = PathBuf::from(s),
         }
@@ -132,6 +141,8 @@ fn args() -> Result<Args> {
 #[derive(Default)]
 struct Outcome {
     success: usize,
+    /// Successes that also clear everything on the meshes.
+    on_meshes: usize,
     seconds: f64,
     path_length: Vec<f32>,
     motion_time: Vec<f32>,
@@ -144,6 +155,7 @@ fn score(
     robot: &Robot,
     cpu: &Device,
     worlds: &Worlds,
+    meshes: Option<&MeshModel>,
     problems: &[Problem],
     result: &PlanResult,
     o: &PlanOptions,
@@ -167,6 +179,11 @@ fn score(
             continue;
         }
         out.success += 1;
+        if let Some(meshes) = meshes {
+            let clear = meshes.clearance(worlds.as_slice(), &vec![s.problem.world; items], &dense)?;
+            out.on_meshes +=
+                usize::from(clear.iter().all(|&[world, self_collision]| world > 0.0 && self_collision > 0.0));
+        }
         let q = |i: usize| &dense[i * n..(i + 1) * n];
         out.path_length.push(
             (0..items - 1).map(|i| q(i).iter().zip(q(i + 1)).map(|(a, b)| (b - a).powi(2)).sum::<f32>().sqrt()).sum(),
@@ -220,9 +237,13 @@ fn ik_and_plan(device: &Device, worlds: &Worlds, problems: &[Problem], o: &PlanO
 fn main() -> Result<()> {
     let args = args()?;
     // Goals are poses of the hand frame.
-    let options = RobotOptions { ee_link: Some("panda_hand".into()), ..common::panda_options() };
+    let mut options = RobotOptions { ee_link: Some("panda_hand".into()), ..common::panda_options() };
+    if args.fitted {
+        options.collision_model = None;
+    }
     let robot = Robot::load(common::asset("franka/franka_panda.urdf"), &options)?;
     let cpu = Device::cpu(&robot)?;
+    let meshes = args.meshes.then(|| MeshModel::new(&robot)).transpose()?;
     let mut devices = vec![];
     if args.device != "cpu" {
         devices.push(Device::gpu(&robot)?);
@@ -258,6 +279,7 @@ fn main() -> Result<()> {
             "acc",
             "jerk"
         );
+        let mut total_meshes = 0;
         let (mut total, mut total_free, mut total_plan, mut total_full, mut total_time) = (0, 0, 0, 0, 0.0);
         let mut all_latency = vec![];
         solve_ik(
@@ -284,14 +306,14 @@ fn main() -> Result<()> {
             let planned = plan(device, &device.upload(&scene)?, &to_ik, &args.plan)?;
             let plan_only = Outcome {
                 seconds: t.elapsed().as_secs_f64(),
-                ..score(&robot, &cpu, &on_cpu, problems, &planned, &args.plan)?
+                ..score(&robot, &cpu, &on_cpu, None, problems, &planned, &args.plan)?
             };
 
             let t = Instant::now();
             let full_result = ik_and_plan(device, &device.upload(&scene)?, problems, &args.plan)?;
             let full = Outcome {
                 seconds: t.elapsed().as_secs_f64(),
-                ..score(&robot, &cpu, &on_cpu, problems, &full_result, &args.plan)?
+                ..score(&robot, &cpu, &on_cpu, meshes.as_ref(), problems, &full_result, &args.plan)?
             };
 
             // Problems whose start and given IK goal are collision-free under this robot model.
@@ -331,6 +353,16 @@ fn main() -> Result<()> {
             total_plan += plan_only.success;
             total_full += full.success;
             total_time += full.seconds;
+            if meshes.is_some() {
+                println!(
+                    "{:<28} meshes ok {:>5.1}% ({} of {} successes)",
+                    "",
+                    100.0 * full.on_meshes as f64 / n as f64,
+                    full.on_meshes,
+                    full.success
+                );
+                total_meshes += full.on_meshes;
+            }
         }
         let mean = all_latency.iter().sum::<f64>() / all_latency.len() as f64;
         println!(
@@ -345,6 +377,9 @@ fn main() -> Result<()> {
             percentile(&mut all_latency, 0.75),
             percentile(&mut all_latency, 0.98),
         );
+        if meshes.is_some() {
+            println!("{:<28} meshes ok {:>5.1}%\n", "all", 100.0 * total_meshes as f64 / total as f64);
+        }
     }
     Ok(())
 }

@@ -239,9 +239,10 @@ fn collision(
     w += "    }\n";
     w += "    // An obstacle farther from a link's bounding sphere than the margin cannot add cost through\n";
     w += "    // the link's spheres; the gap bounds their clearance from below. Distance grids are\n";
-    w += "    // interpolated, not exact, so their spheres are always checked.\n";
+    w += "    // interpolated, not exact, so their spheres are always checked. Links no joint moves are not\n";
+    w += "    // checked against the world (see `collision` in cpu.rs).\n";
     w += "    let world_gate = max(margin, 0.0);\n";
-    for i in (0..links.len()).filter(|&i| robot.sphere_ranges[i][1] > 0) {
+    for i in (0..links.len()).filter(|&i| robot.sphere_ranges[i][1] > 0 && !robot.links[i].chain.is_empty()) {
         let _ = write!(
             w,
             r"    {{

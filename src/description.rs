@@ -222,7 +222,7 @@ pub(crate) struct TriMesh {
 }
 
 impl TriMesh {
-    fn append(&mut self, other: TriMesh) {
+    pub(crate) fn append(&mut self, other: TriMesh) {
         let base = self.vertices.len() as u32;
         self.vertices.extend(other.vertices);
         self.triangles.extend(other.triangles.iter().map(|t| t.map(|i| i + base)));

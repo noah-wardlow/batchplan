@@ -10,10 +10,10 @@ batchplan is a Rust library for batched, collision-aware robot motion generation
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 84 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 91 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
-cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
+cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, meshes, rrt, attach, threads)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot,usd | --no-default-features]   # zero warnings everywhere; CI denies them (lints in Cargo.toml)
 cargo build --release --lib --target aarch64-unknown-linux-gnu --no-default-features     # the CPU-only robot build CI checks
@@ -82,6 +82,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - There are no fixed size limits on robots.
   - The CPU kernels keep per-configuration state in `Scratch` (`cpu.rs`: FK frames, sphere centres, wrenches, IK buffers). It is sized to the robot and reused per thread (`for_each_init`, or one per path), so hot loops neither allocate nor clear more than the robot needs. Inline small vectors were tried first and cost 5–27% of CPU throughput.
   - The GPU kernels are written per robot. Self-collision is unrolled per link pair up to `UNROLLED_LINK_PAIRS` (64); beyond that, a run-time loop over frames copied into arrays keeps the generated code growing with links, not pairs.
+- Links no joint moves (`Link.chain` empty: the base and what is fixed to it) are not checked against the world on either device, nor by `MeshModel`: their contact with the scene does not depend on the configuration, and a mounted robot's base rests on its table. They still self-collide.
 - World collision is gated per link: an obstacle farther from a link's bounding sphere (`link_bounds`, `GpuLink.bound`) than `max(margin, 0)` skips the link's spheres (`Robot::sphere_ranges`), and the gap stands in for their clearance. Distance grids are never gated: their interpolated distance is not 1-Lipschitz.
 - Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with one `(first, count)` entry per link pair, followed by the sphere pairs.
 
@@ -142,6 +143,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - `Robot::load` → `description::load_robot` (by extension) → if the description has loops, `loops::close_loops` on the open tree (each loop's passive joints become quartic mimics of its one actuated joint: the least spring energy that closes the loop within their limits, by projected Levenberg-Marquardt over the driver's range; `tests/mjcf.rs` holds MuJoCo's settled 2F-85 as the reference) → `kinematics` (planar, ball and floating joints expanded into one-axis joints on massless links by `expand_compound_joints`, so nothing downstream sees them; breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a `Curve` (a polynomial of degree ≤ 4, composed along mimic chains; `Fk` records each nonlinear joint's slope, which gradients and Jacobians use in place of the multiplier), locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
 - Continuous joints (`Robot::continuous`) are unbounded reals whose values wrap every 2π; `lower`/`upper` give them only the turn that seeds and samples come from. Clamp and check with `Robot::bounds`/`Robot::within`, never with `lower`/`upper` directly; the GPU limits buffer holds ±∞ for them.
 - IK Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order (`robot_wgsl` unrolls it).
+- Each `Link` keeps its collision shapes (`Link.shapes`, from the description or an attached object). `MeshModel` (`meshes.rs`) loads them as parry3d meshes and convex hulls and measures exact mesh clearances by branch and bound; it is a CPU post-check, not part of either device.
 - `assets/franka/panda_collision.json` holds cuRobo's hand-tuned Panda spheres (Apache-2.0, credited in the README and `assets/README.md`); keep that credit when touching assets. `examples/common/mod.rs` has the Panda's options (locked fingers, `ee_link`, default pose).
 
 ## Working rules
