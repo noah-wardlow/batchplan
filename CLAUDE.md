@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 70 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 71 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -92,6 +92,11 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - Why: Mesa's RADV moves any private array indexed at run time and larger than 256 bytes into scratch memory. With per-link and per-sphere arrays, every collision kernel spilled 3–5 KB per invocation. Writing the code per robot removed that and made GPU planning 4.8× faster on the Radeon and 2.7× on the M4 Pro. Never add a run-time-indexed private array larger than that to a collision kernel. To check on RADV, `MESA_SHADER_CACHE_DISABLE=true RADV_DEBUG=shaderstats cargo run --release --example bench -- 8` prints each pipeline's VGPRs and scratch size.
 - Collision gradients accumulate a wrench per link (force, and moment about the world origin). One reverse pass, leaves first, adds each link's wrench into its parent and gives each joint `a·(M − o×F)` (revolute) or `a·F` (prismatic). `cpu.rs` does the same.
 - `GpuBackend` compiles kernels per robot shape and caches them by generated source, shared by every backend `with_robot` derives.
+- **Lanes.** The collision kernels (`evaluate_main`, `clearance_main`, `ik_main`, `traj_costs`, `traj_samples`) give each configuration `LANES` consecutive invocations. `LANES` is a WGSL `override`, and each kernel is built twice:
+  - with 1 lane for large batches, where the lane code folds away;
+  - with `SHARED_LANES` (8) for batches whose configurations times 8 fit within `LANE_TARGET` threads.
+
+  Lanes split the inner sphere loops of `collision()`. Every lane runs every block, so a wave stays converged; splitting whole blocks across lanes diverged and was slower. `group_collision` and `group_grad` combine the lanes. These kernels have no early returns, because lanes meet at barriers. `evaluation_does_not_depend_on_the_batch` checks that both builds agree. Pipelines skip workgroup zero-initialization: every kernel writes its workgroup memory before reading it.
 
 **GPU details.**
 - Bind group 0 has 12 storage buffers. `unmet_limits` skips adapters that can't provide them, and the error names each rejected adapter and what it lacks.

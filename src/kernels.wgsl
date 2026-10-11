@@ -221,7 +221,7 @@ fn target_rot(item: u32) -> mat3x3<f32> {
     return mat3x3<f32>(targets[item * 4u + 1u].xyz, targets[item * 4u + 2u].xyz, targets[item * 4u + 3u].xyz);
 }
 
-fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
+fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>, lid: u32, lane: u32) {
     let n = P.n_dof;
     fk();
     let ep = tp - ee_pos();
@@ -255,7 +255,8 @@ fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
         for (var j = 0u; j < n; j++) {
             grad[j] = 0.0;
         }
-        collision(world, P.w_world, P.w_self, P.margin, P.self_margin, true);
+        collision(world, P.w_world, P.w_self, P.margin, P.self_margin, true, lane);
+        group_grad(lid);
         var jg: array<f32, 6>;
         for (var r = 0u; r < 6u; r++) {
             var s = 0.0;
@@ -287,54 +288,129 @@ fn ik_step(world: u32, tp: vec3<f32>, tr: mat3x3<f32>) {
     }
 }
 
-// One invocation per configuration: out = [world clearance, self clearance, cost, grad...].
-@compute @workgroup_size(64)
-fn evaluate_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let item = item_index(gid, nwg);
-    if (item >= P.n_items) {
+// Collision kernels give each configuration LANES consecutive invocations, which split its
+// collision work (see collision()). gpu.rs builds them twice: with one lane, where the lane code
+// folds away, for large batches, and with several for batches too small to fill the GPU. They have
+// no early returns, because the lanes meet at barriers: invocations past the end work on the last
+// configuration and write nothing.
+override LANES: u32 = 1u;
+var<workgroup> grads: array<f32, WORKGROUP * MAX_DOF>;
+
+// The configuration and lane of invocation `thread` among `configurations`, and whether it has
+// work of its own.
+fn lane_of(thread: u32, configurations: u32) -> vec3<u32> {
+    let config = thread >> countTrailingZeros(LANES);
+    return vec3<u32>(min(config, configurations - 1u), thread & (LANES - 1u), u32(config < configurations));
+}
+
+// Combines the lanes' collision() results: costs add, clearances take the minimum. Every lane gets
+// the total.
+fn group_collision(lid: u32, c: vec3<f32>) -> vec3<f32> {
+    let lanes = LANES;
+    if (lanes == 1u) {
+        return c;
+    }
+    workgroupBarrier();
+    partial[lid] = vec4<f32>(c, 0.0);
+    workgroupBarrier();
+    for (var stride = lanes / 2u; stride > 0u; stride >>= 1u) {
+        if ((lid & (lanes - 1u)) < stride) {
+            let o = partial[lid + stride];
+            let m = partial[lid];
+            partial[lid] = vec4<f32>(m.x + o.x, min(m.y, o.y), min(m.z, o.z), 0.0);
+        }
+        workgroupBarrier();
+    }
+    return partial[lid & ~(lanes - 1u)].xyz;
+}
+
+// Sums the lanes' partial gradients in `grad`; every lane gets the total.
+fn group_grad(lid: u32) {
+    let lanes = LANES;
+    let n = P.n_dof;
+    if (lanes == 1u) {
         return;
     }
+    workgroupBarrier();
+    for (var j = 0u; j < n; j++) {
+        grads[lid * MAX_DOF + j] = grad[j];
+    }
+    workgroupBarrier();
+    for (var stride = lanes / 2u; stride > 0u; stride >>= 1u) {
+        if ((lid & (lanes - 1u)) < stride) {
+            for (var j = 0u; j < n; j++) {
+                grads[lid * MAX_DOF + j] += grads[(lid + stride) * MAX_DOF + j];
+            }
+        }
+        workgroupBarrier();
+    }
+    let first = (lid & ~(lanes - 1u)) * MAX_DOF;
+    for (var j = 0u; j < n; j++) {
+        grad[j] = grads[first + j];
+    }
+}
+
+// One configuration per lane group: out = [world clearance, self clearance, cost, grad...].
+@compute @workgroup_size(WORKGROUP)
+fn evaluate_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let at = lane_of(item_index(gid, nwg), P.n_items);
+    let item = at.x;
     let n = P.n_dof;
     for (var j = 0u; j < n; j++) {
         q[j] = qbuf[item * n + j];
         grad[j] = 0.0;
     }
     fk();
-    let c = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true);
-    let base = item * (3u + n);
-    outbuf[base] = c.y;
-    outbuf[base + 1u] = c.z;
-    outbuf[base + 2u] = c.x;
-    for (var j = 0u; j < n; j++) {
-        outbuf[base + 3u + j] = grad[j];
+    let part = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true, at.y);
+    let c = group_collision(lid, part);
+    group_grad(lid);
+    if (at.z == 1u && at.y == 0u) {
+        let base = item * (3u + n);
+        outbuf[base] = c.y;
+        outbuf[base + 1u] = c.z;
+        outbuf[base + 2u] = c.x;
+        for (var j = 0u; j < n; j++) {
+            outbuf[base + 3u + j] = grad[j];
+        }
     }
 }
 
-// One invocation per configuration: out = [world clearance, self clearance], without cost or
+// One configuration per lane group: out = [world clearance, self clearance], without cost or
 // gradient.
-@compute @workgroup_size(64)
-fn clearance_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let item = item_index(gid, nwg);
-    if (item >= P.n_items) {
-        return;
-    }
+@compute @workgroup_size(WORKGROUP)
+fn clearance_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let at = lane_of(item_index(gid, nwg), P.n_items);
+    let item = at.x;
     let n = P.n_dof;
     for (var j = 0u; j < n; j++) {
         q[j] = qbuf[item * n + j];
     }
     fk();
-    let c = collision(item_world[item], 0.0, 0.0, 0.0, 0.0, false);
-    outbuf[item * 2u] = c.y;
-    outbuf[item * 2u + 1u] = c.z;
+    let c = group_collision(lid, collision(item_world[item], 0.0, 0.0, 0.0, 0.0, false, at.y));
+    if (at.z == 1u && at.y == 0u) {
+        outbuf[item * 2u] = c.y;
+        outbuf[item * 2u + 1u] = c.z;
+    }
 }
 
-// One invocation per IK seed; runs P.iterations steps, writes q back and [pos err, rot err].
-@compute @workgroup_size(64)
-fn ik_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let item = item_index(gid, nwg);
-    if (item >= P.n_items) {
-        return;
-    }
+// One IK seed per lane group; runs P.iterations steps, writes q back and [pos err, rot err]. The
+// lanes split each step's collision gradient and otherwise do the same work.
+@compute @workgroup_size(WORKGROUP)
+fn ik_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let at = lane_of(item_index(gid, nwg), P.n_items);
+    let item = at.x;
     let n = P.n_dof;
     for (var j = 0u; j < n; j++) {
         q[j] = qbuf[item * n + j];
@@ -343,14 +419,16 @@ fn ik_main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
     let tp = target_pos(item);
     let tr = target_rot(item);
     for (var it = 0u; it < P.iterations; it++) {
-        ik_step(world, tp, tr);
+        ik_step(world, tp, tr, lid, at.y);
     }
-    for (var j = 0u; j < n; j++) {
-        qbuf[item * n + j] = q[j];
+    if (at.z == 1u && at.y == 0u) {
+        for (var j = 0u; j < n; j++) {
+            qbuf[item * n + j] = q[j];
+        }
+        fk();
+        outbuf[item * 2u] = length(tp - ee_pos());
+        outbuf[item * 2u + 1u] = rot_log(tr * transpose(ee_rot())).w;
     }
-    fk();
-    outbuf[item * 2u] = length(tp - ee_pos());
-    outbuf[item * 2u + 1u] = rot_log(tr * transpose(ee_rot())).w;
 }
 
 // Uniform cubic B-spline weights of a span's four control points at u in [0, 1]. Mirrors spline.rs.
@@ -425,15 +503,17 @@ fn candidate(item: u32, t: u32, j: u32, alpha: f32) -> f32 {
     return clamp(x + alpha * aux[dir_at(item) + i], lim.x, lim.y);
 }
 
-// One invocation per line-search step and collision sample: the collision cost at that point of
+// One lane group per line-search step and collision sample: the collision cost at that point of
 // the candidate path.
-@compute @workgroup_size(64)
-fn traj_costs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let idx = item_index(gid, nwg);
+@compute @workgroup_size(WORKGROUP)
+fn traj_costs(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
     let per_item = path_samples();
-    if (idx >= P.n_items * LINE_STEPS * per_item) {
-        return;
-    }
+    let at = lane_of(item_index(gid, nwg), P.n_items * LINE_STEPS * per_item);
+    let idx = at.x;
     let item = idx / (LINE_STEPS * per_item);
     let c = idx / per_item % LINE_STEPS;
     let sample = idx % per_item;
@@ -445,8 +525,11 @@ fn traj_costs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
             + w.z * candidate(item, span + 2u, j, alpha) + w.w * candidate(item, span + 3u, j, alpha);
     }
     fk();
-    let c3 = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, false);
-    aux[costs_at(item) + c * per_item + sample] = c3.x;
+    let part = collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, false, at.y);
+    let c3 = group_collision(lid, part);
+    if (at.z == 1u && at.y == 0u) {
+        aux[costs_at(item) + c * per_item + sample] = c3.x;
+    }
 }
 
 // Per-path kernels run one workgroup per path, each invocation owning every WORKGROUP-th element,
@@ -676,14 +759,16 @@ fn lbfgs_direction(
     }
 }
 
-// One invocation per collision sample: writes d(collision cost)/dq at that point of the curve.
-@compute @workgroup_size(64)
-fn traj_samples(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    let idx = item_index(gid, nwg);
+// One lane group per collision sample: writes d(collision cost)/dq at that point of the curve.
+@compute @workgroup_size(WORKGROUP)
+fn traj_samples(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
     let per_item = (P.points - 3u) * P.samples;
-    if (idx >= P.n_items * per_item) {
-        return;
-    }
+    let at = lane_of(item_index(gid, nwg), P.n_items * per_item);
+    let idx = at.x;
     let item = idx / per_item;
     let span = (idx % per_item) / P.samples;
     let w = basis(sample_u(idx % P.samples));
@@ -694,10 +779,13 @@ fn traj_samples(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
         grad[j] = 0.0;
     }
     fk();
-    collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true);
-    let sample = idx % per_item;
-    for (var j = 0u; j < n; j++) {
-        aux[item * lbfgs_stride() + sample * n + j] = grad[j];
+    collision(item_world[item], P.w_world, P.w_self, P.margin, P.self_margin, true, at.y);
+    group_grad(lid);
+    if (at.z == 1u && at.y == 0u) {
+        let sample = idx % per_item;
+        for (var j = 0u; j < n; j++) {
+            aux[item * lbfgs_stride() + sample * n + j] = grad[j];
+        }
     }
 }
 

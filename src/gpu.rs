@@ -21,6 +21,17 @@ use crate::world::{Obstacle, World};
 const WORKGROUP: u32 = 64;
 // traj_search prices the line-search steps in the components of one vec4.
 const _: () = assert!(LINE_SEARCH.len() <= 4);
+/// Lanes per configuration in the collision kernels built for small batches (`LANES` in
+/// kernels.wgsl).
+const SHARED_LANES: u32 = 8;
+/// Invocations a collision dispatch should reach: batches that reach it with one lane per
+/// configuration use the single-lane kernels.
+const LANE_TARGET: usize = 1 << 15;
+
+/// Lanes per configuration for a dispatch of `configurations`.
+fn lanes_for(configurations: usize) -> u32 {
+    if configurations * (SHARED_LANES as usize) <= LANE_TARGET { SHARED_LANES } else { 1 }
+}
 /// Storage buffers in bind group 0: bindings 1..=9 are read-only, 10..=12 read-write (see kernels.wgsl).
 const READ_ONLY_STORAGE: u32 = 9;
 const READ_WRITE_STORAGE: u32 = 3;
@@ -163,8 +174,19 @@ fn robot_wgsl(robot: &Robot) -> String {
     w += r"
 // Collision cost of the configuration last passed to fk(); with `gradient`, adds d(cost)/dq into
 // `grad`. Returns (cost, world clearance, self clearance). Callers pass `gradient` as a constant,
-// so the compiler drops the gradient work from cost-only kernels.
-fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f32, gradient: bool) -> vec3<f32> {
+// so the compiler drops the gradient work from cost-only kernels. Lane `lane` of LANES takes every
+// LANES-th sphere of a link and every LANES-th sphere pair of a pair of links: all lanes run the
+// same code on different spheres. Each returns its part; group_collision and group_grad combine
+// the lanes.
+fn collision(
+    world: u32,
+    w_world: f32,
+    w_self: f32,
+    margin: f32,
+    self_margin: f32,
+    gradient: bool,
+    lane: u32,
+) -> vec3<f32> {
     var cost = 0.0;
     var wmin = FAR;
     var smin = FAR;
@@ -195,7 +217,8 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
                     continue;
                 }}
             }}
-            for (var s = links[{i}u].first_sphere; s < links[{i}u].first_sphere + links[{i}u].n_spheres; s++) {{
+            let first = links[{i}u].first_sphere;
+            for (var s = first + lane; s < first + links[{i}u].n_spheres; s += LANES) {{
                 let sp = spheres[s];
                 let c = rot_{i} * sp.c.xyz + pos_{i};
                 let dg = obstacle_distance(o, c);
@@ -231,7 +254,7 @@ fn collision(world: u32, w_world: f32, w_self: f32, margin: f32, self_margin: f3
             smin = min(smin, gap);
         }} else {{
             let span = pairs[{l}u];
-            for (var k = span.x; k < span.x + span.y; k++) {{
+            for (var k = span.x + lane; k < span.x + span.y; k += LANES) {{
                 let pr = pairs[k];
                 let sa = spheres[pr.x];
                 let sb = spheres[pr.y];
@@ -305,14 +328,29 @@ pub(crate) struct GpuBackend {
 /// The compiled kernels for one robot shape.
 struct Kernels {
     layout0: wgpu::BindGroupLayout,
+    /// One lane per configuration, for large batches.
+    single: CollisionKernels,
+    /// SHARED_LANES per configuration, for batches too small to fill the GPU with one.
+    shared: CollisionKernels,
+    traj_search: wgpu::ComputePipeline,
+    traj_grad: wgpu::ComputePipeline,
+    lbfgs_direction: wgpu::ComputePipeline,
+}
+
+/// The kernels that check collision, built for one number of lanes per configuration.
+struct CollisionKernels {
     evaluate: wgpu::ComputePipeline,
     clearance: wgpu::ComputePipeline,
     ik: wgpu::ComputePipeline,
     traj_costs: wgpu::ComputePipeline,
-    traj_search: wgpu::ComputePipeline,
     traj_samples: wgpu::ComputePipeline,
-    traj_grad: wgpu::ComputePipeline,
-    lbfgs_direction: wgpu::ComputePipeline,
+}
+
+impl Kernels {
+    /// The collision kernels for `lanes` (from `lanes_for`).
+    fn collision(&self, lanes: u32) -> &CollisionKernels {
+        if lanes == 1 { &self.single } else { &self.shared }
+    }
 }
 
 /// The robot as the kernels read it.
@@ -436,29 +474,40 @@ fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: 
         bind_group_layouts: &[Some(&layout0)],
         immediate_size: 0,
     });
-    let pipeline = |entry: &str| {
+    let pipeline = |entry: &str, lanes: u32| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: Some(&pl_main),
             module: &module,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("LANES", f64::from(lanes))],
+                // Every kernel writes its workgroup memory before reading it.
+                zero_initialize_workgroup_memory: false,
+            },
             cache: None,
         })
     };
-    let evaluate = pipeline("evaluate_main");
-    let clearance = pipeline("clearance_main");
-    let ik = pipeline("ik_main");
-    let traj_costs = pipeline("traj_costs");
-    let traj_search = pipeline("traj_search");
-    let traj_samples = pipeline("traj_samples");
-    let traj_grad = pipeline("traj_grad");
-    let lbfgs_direction = pipeline("lbfgs_direction");
+    let collision = |lanes: u32| CollisionKernels {
+        evaluate: pipeline("evaluate_main", lanes),
+        clearance: pipeline("clearance_main", lanes),
+        ik: pipeline("ik_main", lanes),
+        traj_costs: pipeline("traj_costs", lanes),
+        traj_samples: pipeline("traj_samples", lanes),
+    };
+    // Drivers compile each pipeline on the calling thread; the two sets compile side by side.
+    let (single, shared) = std::thread::scope(|s| {
+        let shared = s.spawn(|| collision(SHARED_LANES));
+        (collision(1), shared.join().expect("pipeline creation does not panic"))
+    });
+    let traj_search = pipeline("traj_search", 1);
+    let traj_grad = pipeline("traj_grad", 1);
+    let lbfgs_direction = pipeline("lbfgs_direction", 1);
     if let Some(e) = pollster::block_on(scope.pop()) {
         return Err(Error::Gpu(format!("{} ({:?}) cannot build the kernels: {e}", info.name, info.backend)));
     }
 
-    Ok(Kernels { layout0, evaluate, clearance, ik, traj_costs, traj_search, traj_samples, traj_grad, lbfgs_direction })
+    Ok(Kernels { layout0, single, shared, traj_search, traj_grad, lbfgs_direction })
 }
 
 /// Worlds in device memory: every world's obstacles, each world's `[first, count]` range of them,
@@ -690,10 +739,11 @@ impl GpuBackend {
         Ok(out)
     }
 
-    /// Runs `pipeline` once per configuration, which writes `stride` floats each.
+    /// Runs the `kernel` of the collision kernels once per configuration, which writes `stride`
+    /// floats each.
     fn per_configuration(
         &self,
-        pipeline: &wgpu::ComputePipeline,
+        kernel: fn(&CollisionKernels) -> &wgpu::ComputePipeline,
         stride: usize,
         worlds: &GpuWorlds,
         item_world: &[u32],
@@ -717,9 +767,10 @@ impl GpuBackend {
             out: &out,
         });
         self.submit_pass(|pass| {
-            pass.set_pipeline(pipeline);
+            let lanes = lanes_for(items);
+            pass.set_pipeline(kernel(self.kernels.collision(lanes)));
             pass.set_bind_group(0, &bg, &[]);
-            dispatch(pass, items);
+            dispatch(pass, items * lanes as usize);
         });
         self.read(&out, items * stride)
     }
@@ -750,7 +801,7 @@ impl Backend for GpuBackend {
         let stride = 3 + n;
         let mut out = Evaluation::default();
         for (chunk_world, chunk_q) in item_world.chunks(EVAL_CHUNK).zip(q.chunks(EVAL_CHUNK * n)) {
-            let raw = self.per_configuration(&self.kernels.evaluate, stride, worlds, chunk_world, chunk_q, w)?;
+            let raw = self.per_configuration(|k| &k.evaluate, stride, worlds, chunk_world, chunk_q, w)?;
             for row in raw.chunks(stride) {
                 out.world_clearance.push(row[0]);
                 out.self_clearance.push(row[1]);
@@ -766,14 +817,8 @@ impl Backend for GpuBackend {
         let n = self.robot.dof();
         let mut out = Vec::with_capacity(item_world.len());
         for (chunk_world, chunk_q) in item_world.chunks(EVAL_CHUNK).zip(q.chunks(EVAL_CHUNK * n)) {
-            let raw = self.per_configuration(
-                &self.kernels.clearance,
-                2,
-                worlds,
-                chunk_world,
-                chunk_q,
-                &CollisionWeights::NONE,
-            )?;
+            let raw =
+                self.per_configuration(|k| &k.clearance, 2, worlds, chunk_world, chunk_q, &CollisionWeights::NONE)?;
             out.extend(raw.chunks(2).map(|c| [c[0], c[1]]));
         }
         Ok(out)
@@ -846,6 +891,7 @@ impl GpuBackend {
         if items == 0 {
             return Ok(vec![]);
         }
+        let lanes = lanes_for(items);
         let mut params = self.params(items, &o.collision);
         params.damping = o.damping;
         params.rot_weight = o.rot_weight;
@@ -878,9 +924,9 @@ impl GpuBackend {
             params.iterations = IK_ITERS_PER_SUBMIT.min(o.iterations - done);
             self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
             self.submit_pass(|pass| {
-                pass.set_pipeline(&self.kernels.ik);
+                pass.set_pipeline(&self.kernels.collision(lanes).ik);
                 pass.set_bind_group(0, &bg, &[]);
-                dispatch(pass, items);
+                dispatch(pass, items * lanes as usize);
             });
             done += params.iterations;
         }
@@ -888,9 +934,9 @@ impl GpuBackend {
             params.iterations = 0;
             self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
             self.submit_pass(|pass| {
-                pass.set_pipeline(&self.kernels.ik);
+                pass.set_pipeline(&self.kernels.collision(lanes).ik);
                 pass.set_bind_group(0, &bg, &[]);
-                dispatch(pass, items);
+                dispatch(pass, items * lanes as usize);
             });
         }
         q.copy_from_slice(&self.read(&q_buf, q.len())?);
@@ -907,6 +953,7 @@ impl GpuBackend {
         deadline: Option<Instant>,
     ) -> Result<()> {
         let items = item_world.len();
+        let samples = items * (points - 3) * o.samples_per_span;
         let mut params = self.params(items, &o.collision);
         params.points = points as u32;
         params.samples = o.samples_per_span as u32;
@@ -914,6 +961,8 @@ impl GpuBackend {
         params.w_vel = o.w_vel;
         params.initial_step = o.initial_step;
         params.history = o.history as u32;
+        let lanes = lanes_for(samples);
+        let collision = self.kernels.collision(lanes);
         let params_buf = self.uniform(&params);
         let world_buf = storage(&self.device, "item world", item_world);
         let dummy = storage::<f32>(&self.device, "unused", &[]);
@@ -929,7 +978,6 @@ impl GpuBackend {
             aux: &aux,
             out: &out,
         });
-        let samples = items * (points - 3) * o.samples_per_span;
         // The first round only prices the seeds: their directions are still zero.
         let rounds = o.iterations + 1;
         let mut k = 0;
@@ -938,15 +986,15 @@ impl GpuBackend {
             self.submit_pass(|pass| {
                 pass.set_bind_group(0, &bg, &[]);
                 for round in k..end {
-                    pass.set_pipeline(&self.kernels.traj_costs);
-                    dispatch(pass, samples * LINE_SEARCH.len());
+                    pass.set_pipeline(&collision.traj_costs);
+                    dispatch(pass, samples * LINE_SEARCH.len() * lanes as usize);
                     pass.set_pipeline(&self.kernels.traj_search);
                     dispatch_groups(pass, items);
                     if round + 1 == rounds {
                         break;
                     }
-                    pass.set_pipeline(&self.kernels.traj_samples);
-                    dispatch(pass, samples);
+                    pass.set_pipeline(&collision.traj_samples);
+                    dispatch(pass, samples * lanes as usize);
                     pass.set_pipeline(&self.kernels.traj_grad);
                     dispatch(pass, items * (points - 6));
                     pass.set_pipeline(&self.kernels.lbfgs_direction);

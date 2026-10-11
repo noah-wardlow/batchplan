@@ -120,6 +120,30 @@ fn ik_reports_the_clearances_evaluate_finds() {
 }
 
 #[test]
+fn evaluation_does_not_depend_on_the_batch() {
+    // Small batches split each configuration's collision work across several GPU invocations,
+    // large ones give it one; the results must agree.
+    let robot = panda();
+    let n = robot.dof();
+    let mut rng = batchplan::rng::Rng::new(13);
+    let q: Vec<f32> = (0..40_000 * n).map(|i| rng.range(robot.lower()[i % n], robot.upper()[i % n])).collect();
+    let scene = [common::tabletop(&mut batchplan::rng::Rng::new(4))];
+    let w = CollisionWeights { world: 1.0, self_collision: 1.0, margin: 0.05, self_margin: 0.02 };
+    let few = 64;
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let alone = d.evaluate(&worlds, &vec![0; few], &q[..few * n], &w).unwrap();
+        let batched = d.evaluate(&worlds, &vec![0; q.len() / n], &q, &w).unwrap();
+        assert!(alone.cost.iter().filter(|&&c| c > 0.0).count() > 10, "too few configurations carry cost");
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4 * x.abs().max(1.0));
+        assert!(close(&alone.world_clearance, &batched.world_clearance[..few]), "{}: world clearance", d.name());
+        assert!(close(&alone.self_clearance, &batched.self_clearance[..few]), "{}: self clearance", d.name());
+        assert!(close(&alone.cost, &batched.cost[..few]), "{}: cost", d.name());
+        assert!(close(&alone.grad, &batched.grad[..few * n]), "{}: gradient", d.name());
+    }
+}
+
+#[test]
 fn obstacle_free_worlds_work_on_every_device() {
     let robot = panda();
     let start = robot.default_q().to_vec();
