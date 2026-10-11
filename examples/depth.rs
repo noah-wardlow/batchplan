@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     let t = Instant::now();
     let image = DepthImage { depth: &depth, width: WIDTH, intrinsics: k, camera };
-    let grid = SdfGrid::from_depth(&image, None, Occlusion::Occupied, &SdfOptions::default())?;
+    let grid = SdfGrid::from_depth(&device, &image, None, Occlusion::Occupied, &SdfOptions::default())?;
     let [nx, ny, nz] = grid.dims();
     println!("grid {nx}x{ny}x{nz} at {} m in {:.0} ms", grid.voxel(), t.elapsed().as_secs_f64() * 1e3);
     let observed =
@@ -105,7 +105,9 @@ fn main() -> Result<()> {
         samples.extend(trajectory.sample(32.0 / trajectory.knot_interval)?.positions);
     }
     let items = samples.len() / robot.dof();
-    let eval = cpu.evaluate(&truth, &vec![0; items], &samples, &CollisionWeights::NONE)?;
+    // Clearances are exact up to the margin.
+    let exact = CollisionWeights { margin: 1.0, ..CollisionWeights::NONE };
+    let eval = cpu.evaluate(&truth, &vec![0; items], &samples, &exact)?;
     for i in 0..items {
         worst = worst.min(eval.world_clearance[i]);
     }

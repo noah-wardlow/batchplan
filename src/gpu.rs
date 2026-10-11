@@ -2,18 +2,19 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat3;
+use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
 use crate::robot::{JointKind, Robot};
-use crate::sdf::SdfGrid;
+use crate::sdf::{DepthImage, FAR, Layout, Occlusion, Occupancy, SdfGrid, finishing_table, one_kind};
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
 use crate::types::{JointPaths, Pose};
 use crate::world::{Obstacle, World};
@@ -95,6 +96,22 @@ shader_struct! {
 shader_struct! {
     /// Collision sphere: center xyz and radius in `c`.
     GpuSphere => Sphere { c: Vec4, self_buf: f32, pad0: u32, pad1: u32, pad2: u32 }
+}
+
+shader_struct! {
+    /// One step of building a grid (`G` in grids.wgsl). The grid: `origin` (w: the voxel size) and
+    /// `nx * ny * nz = points` points. A depth image: the camera's position, the rows of its
+    /// rotation's inverse (`to_camera*`) and its columns (`from_camera*`), the intrinsics (fx, fy,
+    /// cx, cy), its size, whether robot depths are given and whether hidden space is occupied.
+    /// `map` marks a map update. A transform pass runs along the `lines` of `axis`.
+    GpuGridParams => GridParams {
+        origin: Vec4, camera: Vec4, intrinsics: Vec4,
+        to_camera0: Vec4, to_camera1: Vec4, to_camera2: Vec4,
+        from_camera0: Vec4, from_camera1: Vec4, from_camera2: Vec4,
+        nx: u32, ny: u32, nz: u32, points: u32,
+        axis: u32, lines: u32, width: u32, height: u32,
+        has_robot: u32, behind_occupied: u32, map: u32, pad0: u32,
+    }
 }
 
 /// Obstacle kinds as stored in `GpuObstacle::center.w`.
@@ -376,6 +393,108 @@ pub(crate) struct GpuBackend {
     /// `with_robot` shares it, so attaching and detaching objects compiles each robot shape once.
     built: Arc<Mutex<HashMap<String, Arc<Kernels>>>>,
     buffers: RobotBuffers,
+    /// The grid kernels, built on first use and shared like `built`.
+    grids: Arc<OnceLock<GridKernels>>,
+    grid_buffers: Arc<Mutex<GridBuffers>>,
+}
+
+/// Building distance grids (grids.wgsl), which needs no robot.
+struct GridKernels {
+    layout: wgpu::BindGroupLayout,
+    depth_occupancy: wgpu::ComputePipeline,
+    depth_hits: wgpu::ComputePipeline,
+    map_update: wgpu::ComputePipeline,
+    edt_pass: wgpu::ComputePipeline,
+    finish: wgpu::ComputePipeline,
+}
+
+impl GridKernels {
+    fn new(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> Result<Self> {
+        use crate::sdf::{CLAMP, HIT, MISS, UNOBSERVED};
+        let source = [
+            "alias Vec4 = vec4<f32>;\n",
+            &format!("const WORKGROUP: u32 = {WORKGROUP}u;\n"),
+            &format!("const HIT: i32 = {HIT};\nconst MISS: i32 = {MISS};\nconst UNOBSERVED: i32 = {UNOBSERVED};\n"),
+            &format!("const CLAMP_LO: i32 = {};\nconst CLAMP_HI: i32 = {};\n", CLAMP.0, CLAMP.1),
+            GpuGridParams::WGSL,
+            include_str!("grids.wgsl"),
+        ]
+        .concat();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grids"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let mut entries = vec![entry(0, wgpu::BufferBindingType::Uniform)];
+        entries.extend((1..=2).map(|b| entry(b, wgpu::BufferBindingType::Storage { read_only: true })));
+        entries.extend((3..=9).map(|b| entry(b, wgpu::BufferBindingType::Storage { read_only: false })));
+        entries.push(entry(10, wgpu::BufferBindingType::Storage { read_only: true }));
+        let layout = device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("grids"), entries: &entries });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let kernels = Self {
+            depth_occupancy: pipeline("depth_occupancy"),
+            depth_hits: pipeline("depth_hits"),
+            map_update: pipeline("map_update"),
+            edt_pass: pipeline("edt_pass"),
+            finish: pipeline("finish"),
+            layout,
+        };
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(Error::Gpu(format!("{} ({:?}) cannot build the grid kernels: {e}", info.name, info.backend)));
+        }
+        Ok(kernels)
+    }
+}
+
+/// Buffers for building grids, kept for the next build: wgpu zero-fills new buffers, which took
+/// longer than the distance transform itself. Each grows to the largest size asked for.
+#[derive(Default)]
+struct GridBuffers(HashMap<&'static str, wgpu::Buffer>);
+
+impl GridBuffers {
+    /// Bindings 1 to 10 of grids.wgsl, for grids of `points` points, images of `pixels` pixels and
+    /// finishing tables of `table` entries.
+    fn bindings(&mut self, device: &wgpu::Device, points: usize, pixels: usize, table: usize) -> [&wgpu::Buffer; 10] {
+        let words = [
+            ("depth", pixels),
+            ("robot depth", pixels),
+            ("bits", points.div_ceil(32)),
+            ("to solid", points),
+            ("to free", points),
+            ("next solid", points),
+            ("next free", points),
+            ("envelope", points),
+            ("log-odds", points.div_ceil(4)),
+            ("finishing table", table),
+        ];
+        for (name, len) in words {
+            if self.0.get(name).is_none_or(|b| b.size() < (len.max(4) * 4) as u64) {
+                self.0.insert(name, storage_zeroed(device, name, len));
+            }
+        }
+        words.map(|(name, _)| &self.0[name])
+    }
 }
 
 /// The compiled kernels for one robot shape.
@@ -406,7 +525,7 @@ impl Kernels {
     }
 }
 
-/// The robot as the kernels read it.
+/// The robot as the kernels read it./// The robot as the kernels read it.
 #[derive(Clone)]
 struct RobotBuffers {
     links: wgpu::Buffer,
@@ -637,7 +756,8 @@ impl GpuBackend {
         let built = Arc::new(Mutex::new(HashMap::new()));
         let kernels = kernels_for(&device, &info, &built, robot)?;
         let buffers = RobotBuffers::new(&device, robot);
-        Ok(Self { robot: robot.clone(), info, device, queue, kernels, built, buffers })
+        let (grids, grid_buffers) = Default::default();
+        Ok(Self { robot: robot.clone(), info, device, queue, kernels, built, buffers, grids, grid_buffers })
     }
 
     fn params(&self, n_items: usize, w: &CollisionWeights) -> GpuParams {
@@ -771,8 +891,8 @@ impl GpuBackend {
         self.device.poll(wgpu::PollType::wait_indefinitely()).map(|_| ()).map_err(|e| Error::Gpu(e.to_string()))
     }
 
-    fn read(&self, buf: &wgpu::Buffer, floats: usize) -> Result<Vec<f32>> {
-        let size = (floats * 4) as u64;
+    fn read<T: Pod>(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
+        let size = (len * std::mem::size_of::<T>()) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
@@ -926,6 +1046,171 @@ impl Backend for GpuBackend {
         }
         Ok(())
     }
+
+    fn grid_values(&self, grid: &Layout, occupancy: Occupancy) -> Result<Vec<u16>> {
+        let kernels = self.grid_kernels()?;
+        let mut buffers = self.grid_buffers.lock().expect("no thread panics while holding the grid buffers");
+        let points = grid.points();
+        let pixels = if let Occupancy::Seen { image, .. } = occupancy { image.depth.len() } else { 0 };
+        let bindings = buffers.bindings(&self.device, points, pixels, grid.diagonal() as usize + 1);
+        let (params, mut steps) = match occupancy {
+            Occupancy::Given(occupied) => {
+                let bits: Vec<u32> = occupied
+                    .par_chunks(32)
+                    .map(|word| word.iter().enumerate().fold(0, |w, (b, &o)| w | u32::from(o) << b))
+                    .collect();
+                self.queue.write_buffer(bindings[2], 0, bytemuck::cast_slice(&bits));
+                (grid_params(grid, None, None, Occlusion::Free), vec![])
+            }
+            Occupancy::Seen { image, robot, behind } => {
+                self.upload_image(&bindings, image, robot);
+                let params = grid_params(grid, Some(image), robot, behind);
+                (
+                    params,
+                    vec![
+                        (&kernels.depth_occupancy, params, points.div_ceil(32)),
+                        (&kernels.depth_hits, params, pixels),
+                    ],
+                )
+            }
+        };
+        steps.extend(transform_steps(kernels, grid, &params));
+        self.run_grid(kernels, &bindings, &steps);
+        // The table is built while the transform runs.
+        let table = finishing_table(grid.voxel, grid.diagonal());
+        self.queue.write_buffer(bindings[9], 0, bytemuck::cast_slice(&table));
+        self.run_grid(kernels, &bindings, &[(&kernels.finish, params, points.div_ceil(2))]);
+        let words: Vec<u32> = self.read(bindings[4], points.div_ceil(2))?;
+        if self.read::<u32>(bindings[3], 1)?[0] == FAR {
+            return Err(one_kind(self.read::<u32>(bindings[2], 1)?[0] & 1 == 1));
+        }
+        Ok(bytemuck::cast_slice::<u32, u16>(&words)[..points].to_vec())
+    }
+
+    fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
+        let kernels = self.grid_kernels()?;
+        let mut buffers = self.grid_buffers.lock().expect("no thread panics while holding the grid buffers");
+        let bindings = buffers.bindings(&self.device, grid.points(), image.depth.len(), 0);
+        self.upload_image(&bindings, image, robot);
+        let mut words = bytemuck::cast_slice::<i8, u8>(log_odds).to_vec();
+        words.resize(log_odds.len().next_multiple_of(4), 0);
+        self.queue.write_buffer(bindings[8], 0, &words);
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(bindings[2], 0, None);
+        self.queue.submit([enc.finish()]);
+        let params = GpuGridParams { map: 1, ..grid_params(grid, Some(image), robot, Occlusion::Free) };
+        let steps = [
+            (&kernels.depth_hits, params, image.depth.len()),
+            (&kernels.map_update, params, grid.points().div_ceil(4)),
+        ];
+        self.run_grid(kernels, &bindings, &steps);
+        let words: Vec<u32> = self.read(bindings[8], grid.points().div_ceil(4))?;
+        log_odds.copy_from_slice(&bytemuck::cast_slice::<u32, i8>(&words)[..log_odds.len()]);
+        Ok(())
+    }
+}
+
+impl GpuBackend {
+    fn grid_kernels(&self) -> Result<&GridKernels> {
+        if let Some(kernels) = self.grids.get() {
+            return Ok(kernels);
+        }
+        let kernels = GridKernels::new(&self.device, &self.info)?;
+        Ok(self.grids.get_or_init(|| kernels))
+    }
+
+    /// Uploads an image's readings (0 for pixels without one) and robot depths (huge where the
+    /// robot is not seen).
+    fn upload_image(&self, bindings: &[&wgpu::Buffer; 10], image: &DepthImage, robot: Option<&[f32]>) {
+        let readings: Vec<f32> =
+            image.depth.par_iter().map(|&z| if z.is_finite() && z > 0.0 { z } else { 0.0 }).collect();
+        self.queue.write_buffer(bindings[0], 0, bytemuck::cast_slice(&readings));
+        if let Some(robot) = robot {
+            let robot: Vec<f32> = robot.par_iter().map(|&r| r.min(f32::MAX)).collect();
+            self.queue.write_buffer(bindings[1], 0, bytemuck::cast_slice(&robot));
+        }
+    }
+
+    /// Runs each `(kernel, params, invocations)` step in order, then waits.
+    fn run_grid(
+        &self,
+        kernels: &GridKernels,
+        bindings: &[&wgpu::Buffer; 10],
+        steps: &[(&wgpu::ComputePipeline, GpuGridParams, usize)],
+    ) {
+        let groups: Vec<_> = steps
+            .iter()
+            .map(|(_, params, _)| {
+                let params = self.uniform_of(params);
+                let entries: Vec<_> = std::iter::once(&params)
+                    .chain(bindings.iter().copied())
+                    .enumerate()
+                    .map(|(i, buf)| wgpu::BindGroupEntry { binding: i as u32, resource: buf.as_entire_binding() })
+                    .collect();
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &kernels.layout,
+                    entries: &entries,
+                })
+            })
+            .collect();
+        self.submit_pass(|pass| {
+            for ((kernel, _, invocations), group) in steps.iter().zip(&groups) {
+                pass.set_pipeline(kernel);
+                pass.set_bind_group(0, group, &[]);
+                dispatch(pass, *invocations);
+            }
+        });
+    }
+
+    fn uniform_of<T: Pod>(&self, value: &T) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grid params"),
+            contents: bytemuck::bytes_of(value),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    }
+}
+
+/// The grid kernels' parameters for `grid`, and for an image seen with `robot` depths.
+fn grid_params(grid: &Layout, image: Option<&DepthImage>, robot: Option<&[f32]>, behind: Occlusion) -> GpuGridParams {
+    let [nx, ny, nz] = grid.dims.to_array();
+    let mut params = GpuGridParams {
+        origin: v4(grid.origin, grid.voxel),
+        nx,
+        ny,
+        nz,
+        points: grid.points() as u32,
+        has_robot: u32::from(robot.is_some()),
+        behind_occupied: u32::from(behind == Occlusion::Occupied),
+        ..Default::default()
+    };
+    if let Some(image) = image {
+        let from_camera = Mat3::from_quat(image.camera.rotation);
+        let to_camera = from_camera.transpose();
+        let k = image.intrinsics;
+        params.camera = v4(image.camera.position, 0.0);
+        params.intrinsics = [k.fx, k.fy, k.cx, k.cy];
+        [params.to_camera0, params.to_camera1, params.to_camera2] = [0, 1, 2].map(|i| v4(to_camera.row(i), 0.0));
+        [params.from_camera0, params.from_camera1, params.from_camera2] =
+            [0, 1, 2].map(|i| v4(from_camera.col(i), 0.0));
+        params.width = image.width as u32;
+        params.height = (image.depth.len() / image.width) as u32;
+    }
+    params
+}
+
+/// The three passes of the distance transform, one per axis.
+fn transform_steps<'a>(
+    kernels: &'a GridKernels,
+    grid: &Layout,
+    params: &GpuGridParams,
+) -> [(&'a wgpu::ComputePipeline, GpuGridParams, usize); 3] {
+    let dims = grid.dims.to_array();
+    [0, 1, 2].map(|axis| {
+        let lines = grid.points() / dims[axis] as usize;
+        (&kernels.edt_pass, GpuGridParams { axis: axis as u32, lines: lines as u32, ..*params }, lines)
+    })
 }
 
 /// Floats of L-BFGS state per path; must match `lbfgs_stride` in kernels.wgsl.
@@ -996,7 +1281,7 @@ impl GpuBackend {
             });
         }
         q.copy_from_slice(&self.read(&q_buf, q.len())?);
-        Ok(self.read(&out, items * 2)?.chunks(2).map(|e| [e[0], e[1]]).collect())
+        Ok(self.read::<f32>(&out, items * 2)?.chunks(2).map(|e| [e[0], e[1]]).collect())
     }
 
     fn trajopt_chunk(

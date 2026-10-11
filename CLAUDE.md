@@ -4,20 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-batchplan is a Rust library for batched, collision-aware robot motion generation: IK and trajectory optimization over thousands of seeds, problems and worlds at once. It runs on any GPU wgpu supports (Vulkan, Metal, DX12) without CUDA or ROCm, and has a CPU implementation that produces the same numbers. Its main purpose is generating robot-learning training data: nominal demonstrations plus *recoveries* from perturbed states, exported as `.npy` arrays or LeRobot v3.0 datasets.
-
-It is an MVP. It has been verified on an AMD Radeon 8060S (Mesa RADV), an Apple M4 Pro (Metal) and an NVIDIA T4 (Vulkan).
-
-Deliberate scope decisions:
-- No Python bindings. Python appears only in validation scripts.
-- Browser WebGPU is deferred. The kernels need 12 storage buffers per stage; browsers allow 8–10.
-- The main open gap for VLA training is camera images: data is state-only.
+batchplan is a Rust library for batched, collision-aware robot motion generation: IK and trajectory optimization over thousands of seeds, problems and worlds at once. It runs on any GPU wgpu supports (Vulkan, Metal, DX12) without CUDA or ROCm, and has a CPU implementation that produces the same numbers. One of its primary purposes is generating robot-learning training data: nominal demonstrations plus *recoveries* from perturbed states, exported as `.npy` arrays or LeRobot v3.0 datasets.
 
 ## Commands
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 82 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 84 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -72,6 +65,11 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - The GPU kernels (`src/kernels.wgsl` plus the per-robot code `robot_wgsl` writes in `gpu.rs`) and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_costs`/`traj_cost`, `traj_search`, `traj_samples`/`traj_sample_grad`, `traj_grad`, `lbfgs_direction`). `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
 - `cpu.rs` keeps index loops on purpose so the two read side by side.
 - Any change to the math lands in both files in the same change. The parity tests in `tests/gpu.rs` and `tests/device.rs` catch drift.
+- Grid building has its own twin: `src/grids.wgsl` mirrors `sdf.rs`'s `DepthImage::classify`, `depth_occupancy`, `integrate`, `squared_edt`/`Line`/`meet` and `finish`. Builders (`SdfGrid::from_points`/`from_depth`, `OccupancyMap::integrate`/`grid`) take a `Device` and go through `Backend::grid_values` and `Backend::integrate`.
+  - The distance transform is integer arithmetic, so both devices build identical grids from the same occupancy (`every_device_builds_the_same_grids_from_occupancy`).
+  - Each value is finished by a table the host builds (`finishing_table`, sized by the grid's squared diagonal, hence `MAX_DIAGONAL`), so the GPU never needs `sqrt` to match the CPU.
+  - Classification projects voxel centres in floating point and may differ at rounding ties. The internal test `every_device_classifies_depth_images_alike` bounds that at 0.05% of voxels; the behavioural tests in `tests/sdf.rs` run on every device.
+  - The GPU keeps its grid buffers (`GridBuffers`) between builds, because wgpu zero-fills new buffers.
 
 **Host/shader structs.**
 - Each struct the GPU reads is declared once with `shader_struct!` in `gpu.rs`: `GpuParams`, `GpuLink`, `GpuSphere` and `GpuObstacle`. So are the constants (`MAX_HISTORY`, the line-search steps `LINE_SEARCH`, obstacle kinds).

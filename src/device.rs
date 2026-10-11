@@ -18,6 +18,7 @@ use crate::cpu::CpuBackend;
 use crate::gpu::GpuBackend;
 use crate::ik::IkOptions;
 use crate::robot::Robot;
+use crate::sdf::{DepthImage, Layout, Occupancy};
 use crate::trajopt::PlanOptions;
 use crate::types::{JointPaths, Pose};
 use crate::world::World;
@@ -176,6 +177,32 @@ impl Device {
         self.backend.clearance(worlds, item_world, q)
     }
 
+    /// The stored values of the distance grid over `grid` whose occupancy is given, or seen in a
+    /// checked depth image.
+    pub(crate) fn grid_values(&self, grid: &Layout, occupancy: Occupancy) -> Result<Vec<u16>> {
+        if let Occupancy::Given(occupied) = occupancy {
+            ensure_input!(
+                occupied.len() == grid.points(),
+                "{} occupancies for {} points",
+                occupied.len(),
+                grid.points()
+            );
+        }
+        self.backend.grid_values(grid, occupancy)
+    }
+
+    /// Fuses a checked `image` into a map's log-odds, one per point of `grid`.
+    pub(crate) fn integrate(
+        &self,
+        grid: &Layout,
+        log_odds: &mut [i8],
+        image: &DepthImage,
+        robot: Option<&[f32]>,
+    ) -> Result<()> {
+        ensure_input!(log_odds.len() == grid.points(), "{} log-odds for {} points", log_odds.len(), grid.points());
+        self.backend.integrate(grid, log_odds, image, robot)
+    }
+
     pub(crate) fn ik(
         &self,
         worlds: &Worlds,
@@ -257,4 +284,9 @@ pub(crate) trait Backend: Send + Sync {
         o: &PlanOptions,
         deadline: Option<Instant>,
     ) -> Result<()>;
+    /// The stored values of a distance grid over `grid` (`sdf::depth_occupancy` for images, then
+    /// `sdf::squared_edt` and `sdf::finish`).
+    fn grid_values(&self, grid: &Layout, occupancy: Occupancy) -> Result<Vec<u16>>;
+    /// Fuses `image` into a map's log-odds (`sdf::integrate`).
+    fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()>;
 }

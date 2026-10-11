@@ -7,6 +7,9 @@
 //! interpolation can overestimate by. A built grid therefore never reads farther from an obstacle
 //! than its geometry, and walls thinner than a voxel still block. The price is that obstacles grow,
 //! by up to a voxel diagonal for meshes and about three voxels for points and depth images.
+//!
+//! Point clouds, depth images and occupancy maps become grids through an exact distance transform
+//! of their solid voxels, which runs on the [`Device`] the builder is given.
 
 use crate::error::{Error, Result, ensure_input, input};
 use glam::{UVec3, Vec3};
@@ -17,11 +20,14 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::description::TriMesh;
+use crate::device::Device;
 use crate::robot::Robot;
 use crate::types::Pose;
 
 /// Grids with more points are refused; 2^26 half floats take 128 MiB.
 const MAX_POINTS: u64 = 1 << 26;
+/// Grids whose diagonal reaches 4,096 voxels are refused.
+const MAX_DIAGONAL: f64 = (1 << 24) as f64;
 
 /// How builders lay out a grid.
 #[derive(Clone, Copy, Debug)]
@@ -106,14 +112,41 @@ impl DepthImage<'_> {
             .then(|| (v as usize * self.width + u as usize, c.z))
     }
 
-    /// Each reading as a world point.
-    fn points(&self) -> impl Iterator<Item = (usize, Vec3)> + '_ {
+    /// Pixel `i`'s reading as a world point, unless it reads the robot: at or beyond the robot's
+    /// depth there, within `voxel`.
+    fn point(&self, i: usize, robot: Option<&[f32]>, voxel: f32) -> Option<Vec3> {
         let Intrinsics { fx, fy, cx, cy } = self.intrinsics;
-        (0..self.depth.len()).filter_map(move |i| {
-            let z = self.reading(i)?;
-            let (u, v) = ((i % self.width) as f32, (i / self.width) as f32);
-            Some((i, self.camera.rotation * Vec3::new((u - cx) / fx * z, (v - cy) / fy * z, z) + self.camera.position))
-        })
+        let z = self.reading(i).filter(|&z| z < robot.map_or(f32::INFINITY, |r| r[i]) - voxel)?;
+        let (u, v) = ((i % self.width) as f32, (i / self.width) as f32);
+        Some(self.camera.rotation * Vec3::new((u - cx) / fx * z, (v - cy) / fy * z, z) + self.camera.position)
+    }
+
+    /// What the image says about the point `p` of a grid with `voxel` spacing; `robot` holds each
+    /// pixel's depth to the robot. `classify` in grids.wgsl mirrors it.
+    fn classify(&self, robot: Option<&[f32]>, p: Vec3, voxel: f32) -> Seen {
+        let half = 0.5 * voxel;
+        let Some((i, z_voxel)) = self.project(p) else { return Seen::Unseen };
+        let Some(z) = self.reading(i) else { return Seen::Unseen };
+        let robot_at = robot.map_or(f32::INFINITY, |r| r[i]);
+        if z >= robot_at - voxel {
+            // The pixel sees the robot.
+            if z_voxel < robot_at - half { Seen::Free } else { Seen::Hidden }
+        } else if z_voxel < z - half {
+            Seen::Free
+        } else if z_voxel <= z + half {
+            Seen::Surface
+        } else {
+            Seen::Hidden
+        }
+    }
+
+    /// Why the image, with these robot depths, cannot be used, if it cannot.
+    fn check_with(&self, robot: Option<&[f32]>) -> Result<()> {
+        self.check()?;
+        if let Some(r) = robot {
+            ensure_input!(r.len() == self.depth.len(), "{} robot depths for {} pixels", r.len(), self.depth.len());
+        }
+        Ok(())
     }
 
     /// Each pixel's depth to `robot` at configuration `q`, its collision spheres grown by
@@ -127,43 +160,191 @@ impl DepthImage<'_> {
         let (width, height) = (self.width, self.height());
         let fk = robot.fk(q);
         let to_camera = self.camera.rotation.inverse();
-        let mut out = vec![f32::INFINITY; self.depth.len()];
-        for sphere in &robot.spheres {
-            let center = to_camera * (fk.rot[sphere.link] * sphere.center + fk.pos[sphere.link] - self.camera.position);
-            let r = sphere.radius + padding;
-            if center.z + r <= 0.0 {
-                continue;
-            }
-            // The pixels the sphere can cover: the projections of its bounding box's sides at its
-            // near and far depths. The whole image when the camera is inside or next to it.
-            let (near, far) = (center.z - r, center.z + r);
-            let span = |c: f32, f: f32, k: f32, n: usize| {
-                if near <= 1e-3 {
-                    return (0, n);
+        // Each sphere in the camera's frame, and the pixels it can cover: the projections of its
+        // bounding box's sides at its near and far depths. The whole image when the camera is
+        // inside or next to it.
+        let spheres: Vec<_> = robot
+            .spheres
+            .iter()
+            .filter_map(|sphere| {
+                let center =
+                    to_camera * (fk.rot[sphere.link] * sphere.center + fk.pos[sphere.link] - self.camera.position);
+                let r = sphere.radius + padding;
+                let (near, far) = (center.z - r, center.z + r);
+                if far <= 0.0 {
+                    return None;
                 }
-                let ends = [(c - r) / near, (c - r) / far, (c + r) / near, (c + r) / far].map(|x| f * x + k);
-                let lo = ends.iter().fold(f32::INFINITY, |m, &e| m.min(e)).floor().max(0.0);
-                let hi = ends.iter().fold(f32::NEG_INFINITY, |m, &e| m.max(e)).ceil() + 1.0;
-                (lo.min(n as f32) as usize, hi.clamp(0.0, n as f32) as usize)
-            };
-            let ((u0, u1), (v0, v1)) = (span(center.x, fx, cx, width), span(center.y, fy, cy, height));
-            for v in v0..v1 {
-                for u in u0..u1 {
+                let span = |c: f32, f: f32, k: f32, n: usize| {
+                    if near <= 1e-3 {
+                        return 0..n;
+                    }
+                    let ends = [(c - r) / near, (c - r) / far, (c + r) / near, (c + r) / far].map(|x| f * x + k);
+                    let lo = ends.iter().fold(f32::INFINITY, |m, &e| m.min(e)).floor().max(0.0);
+                    let hi = ends.iter().fold(f32::NEG_INFINITY, |m, &e| m.max(e)).ceil() + 1.0;
+                    lo.min(n as f32) as usize..hi.clamp(0.0, n as f32) as usize
+                };
+                Some((center, r, span(center.x, fx, cx, width), span(center.y, fy, cy, height)))
+            })
+            .collect();
+        let mut out = vec![f32::INFINITY; self.depth.len()];
+        out.par_chunks_mut(width).enumerate().for_each(|(v, row)| {
+            for (center, r, us, vs) in &spheres {
+                if !vs.contains(&v) {
+                    continue;
+                }
+                for u in us.clone() {
                     // Points t * ray along the pixel; their depth is t.
                     let ray = Vec3::new((u as f32 - cx) / fx, (v as f32 - cy) / fy, 1.0);
-                    let (a, b, c) = (ray.length_squared(), ray.dot(center), center.length_squared() - r * r);
+                    let (a, b, c) = (ray.length_squared(), ray.dot(*center), center.length_squared() - r * r);
                     let disc = b * b - a * c;
                     if disc < 0.0 {
                         continue;
                     }
                     let t = ((b - disc.sqrt()) / a).max(0.0);
-                    let o = &mut out[v * width + u];
-                    *o = o.min(t);
+                    row[u] = row[u].min(t);
                 }
             }
-        }
+        });
         Ok(out)
     }
+}
+
+/// What a depth image says about a point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// Outside the image, or along a pixel without a reading.
+    Unseen,
+    /// In front of a reading, or in front of the robot along a pixel that sees it.
+    Free,
+    /// At a reading, within half a voxel.
+    Surface,
+    /// Behind a reading, or at or behind the robot.
+    Hidden,
+}
+
+/// The points of a grid: `dims` per axis, `voxel` apart, from `origin`, x fastest.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout {
+    pub(crate) dims: UVec3,
+    pub(crate) origin: Vec3,
+    pub(crate) voxel: f32,
+}
+
+impl Layout {
+    pub(crate) fn points(&self) -> usize {
+        self.dims.element_product() as usize
+    }
+
+    /// The squared diagonal, in voxels: the largest squared distance between two points.
+    pub(crate) fn diagonal(&self) -> u32 {
+        (self.dims - 1).length_squared()
+    }
+
+    fn point(&self, n: usize) -> Vec3 {
+        point(self.dims, self.origin, self.voxel, n as u32)
+    }
+
+    fn nearest(&self, p: Vec3) -> usize {
+        nearest(self.dims, self.origin, self.voxel, p)
+    }
+
+    /// Whether `p` lies within half a voxel of the points.
+    fn contains(&self, p: Vec3) -> bool {
+        let half = 0.5 * self.voxel;
+        p.cmpge(self.origin - half).all() && p.cmplt(self.origin + (self.dims - 1).as_vec3() * self.voxel + half).all()
+    }
+}
+
+/// Where a grid's occupancy comes from.
+pub(crate) enum Occupancy<'a> {
+    /// One flag per point.
+    Given(&'a [bool]),
+    /// A depth image, as [`SdfGrid::from_depth`] reads it.
+    Seen { image: &'a DepthImage<'a>, robot: Option<&'a [f32]>, behind: Occlusion },
+}
+
+/// The stored value of a point `n` squared voxels from the nearest point of the other kind, for
+/// every `n` up to `max`: a free point's in the low half of each word, an occupied point's in the
+/// high half. Free points are at least `sqrt(n) - sqrt(3) / 2` voxels from the nearest occupied
+/// cube; occupied points at most `sqrt(n) - 1 / 2` deep. Both bounds are then lowered by half a
+/// voxel diagonal and rounded down to half floats (see the module documentation).
+pub(crate) fn finishing_table(voxel: f32, max: u32) -> Vec<u32> {
+    let (half_diagonal, shift) = (3f64.sqrt() / 2.0, voxel * 3f32.sqrt() / 2.0);
+    (0..=max)
+        .into_par_iter()
+        .map(|n| {
+            let d = f64::from(n).sqrt();
+            let free = at_most(voxel * (d - half_diagonal) as f32 - shift).to_bits();
+            let occupied = at_most(voxel * (0.5 - d) as f32 - shift).to_bits();
+            u32::from(free) | u32::from(occupied) << 16
+        })
+        .collect()
+}
+
+/// Why a grid whose points are all of one kind, as its first, has no distances.
+pub(crate) fn one_kind(first_occupied: bool) -> Error {
+    match first_occupied {
+        true => input!("every voxel is occupied; increase the padding"),
+        false => input!("no voxel is occupied"),
+    }
+}
+
+/// Each point's stored value from its occupancy and squared distance (`finish` in grids.wgsl).
+pub(crate) fn finish(grid: &Layout, occupied: &[bool], squared: &[u32]) -> Result<Vec<u16>> {
+    if squared[0] == FAR {
+        return Err(one_kind(occupied[0]));
+    }
+    let table = finishing_table(grid.voxel, grid.diagonal());
+    Ok(occupied.par_iter().zip(squared).map(|(&o, &n)| (table[n as usize] >> (16 * u32::from(o))) as u16).collect())
+}
+
+/// Each point's occupancy as [`SdfGrid::from_depth`] decides it. `depth_occupancy` and
+/// `depth_hits` in grids.wgsl mirror it.
+pub(crate) fn depth_occupancy(
+    grid: &Layout,
+    image: &DepthImage,
+    robot: Option<&[f32]>,
+    behind: Occlusion,
+) -> Vec<bool> {
+    let mut occupied: Vec<bool> = (0..grid.points())
+        .into_par_iter()
+        .map(|n| match image.classify(robot, grid.point(n), grid.voxel) {
+            Seen::Surface => true,
+            Seen::Hidden => behind == Occlusion::Occupied,
+            Seen::Free | Seen::Unseen => false,
+        })
+        .collect();
+    // Dense images resolve surfaces finer than voxels project; their points are solid too.
+    for n in hits(grid, image, robot, |_| true) {
+        occupied[n] = true;
+    }
+    occupied
+}
+
+/// The grid point holding each reading off the robot that `keep` accepts.
+fn hits(grid: &Layout, image: &DepthImage, robot: Option<&[f32]>, keep: impl Fn(Vec3) -> bool + Sync) -> Vec<usize> {
+    (0..image.depth.len())
+        .into_par_iter()
+        .filter_map(|i| image.point(i, robot, grid.voxel).filter(|&p| keep(p)).map(|p| grid.nearest(p)))
+        .collect()
+}
+
+/// Fuses one image into a map's log-odds as [`OccupancyMap::integrate`] describes. `depth_hits`
+/// and `map_update` in grids.wgsl mirror it.
+pub(crate) fn integrate(grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) {
+    let mut hit = vec![false; grid.points()];
+    for n in hits(grid, image, robot, |p| grid.contains(p)) {
+        hit[n] = true;
+    }
+    log_odds.par_iter_mut().zip(hit).enumerate().for_each(|(n, (l, hit))| {
+        let step = match image.classify(robot, grid.point(n), grid.voxel) {
+            _ if hit => HIT,
+            Seen::Surface => HIT,
+            Seen::Free => MISS,
+            Seen::Hidden | Seen::Unseen => return,
+        };
+        *l = (if *l == UNOBSERVED { 0 } else { *l } + step).clamp(CLAMP.0, CLAMP.1);
+    });
 }
 
 /// Signed distances (meters, negative inside) on a regular grid in its own frame: `dims` points
@@ -249,7 +430,7 @@ impl SdfGrid {
         let open = topology.half_edges.iter().filter(|h| h.twin == u32::MAX).count();
         ensure_input!(open == 0, "the mesh is not closed ({open} edges border a single triangle), so it has no inside");
         let (lo, hi) = bounds(&mesh.vertices);
-        let (dims, origin) = layout(lo, hi, o)?;
+        let Layout { dims, origin, .. } = layout(lo, hi, o)?;
         let distances = (0..dims.element_product())
             .into_par_iter()
             .map(|n| {
@@ -264,16 +445,16 @@ impl SdfGrid {
 
     /// The distance field of surface points, such as a point cloud. Voxels holding a point are
     /// solid; the inside of a closed surface reads as free beyond its shell of voxels.
-    pub fn from_points(points: &[Vec3], o: &SdfOptions) -> Result<Self> {
+    pub fn from_points(device: &Device, points: &[Vec3], o: &SdfOptions) -> Result<Self> {
         ensure_input!(!points.is_empty(), "no points");
         ensure_input!(points.iter().all(|p| p.is_finite()), "points must be finite");
         let (lo, hi) = bounds(points);
-        let (dims, origin) = layout(lo, hi, o)?;
-        let mut occupied = vec![false; dims.element_product() as usize];
+        let grid = layout(lo, hi, o)?;
+        let mut occupied = vec![false; grid.points()];
         for &p in points {
-            occupied[nearest(dims, origin, o.voxel, p)] = true;
+            occupied[grid.nearest(p)] = true;
         }
-        Self::from_occupancy(dims, origin, o.voxel, &occupied)
+        Self::from_occupancy(device, &grid, &occupied)
     }
 
     /// The distance field seen in one depth image. The grid spans the observed points plus the
@@ -285,36 +466,23 @@ impl SdfGrid {
     /// time-of-flight arrays give solid surfaces, not scattered points. With `robot`, each pixel's
     /// depth to the robot ([`DepthImage::robot_depth`]), readings on or behind the robot are not
     /// obstacles: space in front of it is free and space behind it is what `behind` says.
-    pub fn from_depth(image: &DepthImage, robot: Option<&[f32]>, behind: Occlusion, o: &SdfOptions) -> Result<Self> {
-        image.check()?;
-        if let Some(r) = robot {
-            ensure_input!(r.len() == image.depth.len(), "{} robot depths for {} pixels", r.len(), image.depth.len());
-        }
-        // A reading at or beyond the robot (within a voxel) sees the robot.
-        let robot_at = |i: usize| robot.map_or(f32::INFINITY, |r| r[i]);
-        let on_robot = |i: usize, z: f32| z >= robot_at(i) - o.voxel;
-        let points: Vec<Vec3> = image.points().filter(|&(i, _)| !on_robot(i, image.depth[i])).map(|(_, p)| p).collect();
-        ensure_input!(!points.is_empty(), "the depth image has no valid pixels off the robot");
-        let (lo, hi) = bounds(&points);
-        let (dims, origin) = layout(lo, hi, o)?;
-        let half = 0.5 * o.voxel;
-        let mut occupied: Vec<bool> = (0..dims.element_product())
+    pub fn from_depth(
+        device: &Device,
+        image: &DepthImage,
+        robot: Option<&[f32]>,
+        behind: Occlusion,
+        o: &SdfOptions,
+    ) -> Result<Self> {
+        image.check_with(robot)?;
+        let (lo, hi) = (0..image.depth.len())
             .into_par_iter()
-            .map(|n| {
-                let Some((i, z_voxel)) = image.project(point(dims, origin, o.voxel, n)) else { return false };
-                match image.reading(i) {
-                    Some(z) if on_robot(i, z) => z_voxel >= robot_at(i) - half && behind == Occlusion::Occupied,
-                    Some(z) if z_voxel > z + half => behind == Occlusion::Occupied,
-                    Some(z) => z_voxel >= z - half,
-                    None => false,
-                }
-            })
-            .collect();
-        // Dense images resolve surfaces finer than voxels project; their points are solid too.
-        for &p in &points {
-            occupied[nearest(dims, origin, o.voxel, p)] = true;
-        }
-        Self::from_occupancy(dims, origin, o.voxel, &occupied)
+            .filter_map(|i| image.point(i, robot, o.voxel))
+            .fold(|| (Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), p| (lo.min(p), hi.max(p)))
+            .reduce(|| (Vec3::INFINITY, Vec3::NEG_INFINITY), |(a, b), (c, d)| (a.min(c), b.max(d)));
+        ensure_input!(lo.cmple(hi).all(), "the depth image has no valid pixels off the robot");
+        let grid = layout(lo, hi, o)?;
+        let values = device.grid_values(&grid, Occupancy::Seen { image, robot, behind })?;
+        Self::from_values(&grid, values)
     }
 
     pub fn dims(&self) -> [u32; 3] {
@@ -354,18 +522,14 @@ impl SdfGrid {
     /// A free point is at least `d - sqrt(3) / 2` voxels from the nearest cube when its center is
     /// `d` away; an occupied point is at most `d - 1 / 2` deep when the nearest free center is `d`
     /// away. Both bounds keep each value at or below the true distance.
-    fn from_occupancy(dims: UVec3, origin: Vec3, voxel: f32, occupied: &[bool]) -> Result<Self> {
-        ensure_input!(!occupied.iter().all(|&o| o), "every voxel is occupied; increase the padding");
-        let dims = dims.to_array().map(|d| d as usize);
-        let (to_solid, to_free) = (squared_edt(occupied, true, dims), squared_edt(occupied, false, dims));
-        let half_diagonal = 3f64.sqrt() / 2.0;
-        let distances = (0..occupied.len())
-            .map(|i| {
-                let d = if occupied[i] { 0.5 - to_free[i].sqrt() } else { to_solid[i].sqrt() - half_diagonal };
-                voxel * d as f32
-            })
-            .collect();
-        Self::conservative(UVec3::from(dims.map(|d| d as u32)), voxel, origin, distances)
+    fn from_occupancy(device: &Device, grid: &Layout, occupied: &[bool]) -> Result<Self> {
+        Self::from_values(grid, device.grid_values(grid, Occupancy::Given(occupied))?)
+    }
+
+    fn from_values(grid: &Layout, values: Vec<u16>) -> Result<Self> {
+        let grid = Self { dims: grid.dims.into(), voxel: grid.voxel, origin: grid.origin, values };
+        grid.check()?;
+        Ok(grid)
     }
 }
 
@@ -425,15 +589,18 @@ fn bounds(points: &[Vec3]) -> (Vec3, Vec3) {
     points.iter().fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &p| (lo.min(p), hi.max(p)))
 }
 
-/// Grid dimensions and origin covering `lo..=hi` plus the padding.
-fn layout(lo: Vec3, hi: Vec3, o: &SdfOptions) -> Result<(UVec3, Vec3)> {
+/// A grid covering `lo..=hi` plus the padding.
+fn layout(lo: Vec3, hi: Vec3, o: &SdfOptions) -> Result<Layout> {
     ensure_input!(o.voxel.is_finite() && o.voxel > 0.0, "the voxel size must be positive, got {}", o.voxel);
     ensure_input!(o.padding.is_finite() && o.padding >= 0.0, "the padding must not be negative, got {}", o.padding);
     let origin = lo - o.padding;
     let dims = ((hi + o.padding - origin) / o.voxel).ceil().max(Vec3::ONE) + 1.0;
     let points = dims.as_dvec3().element_product();
     ensure_input!(points <= MAX_POINTS as f64, "a grid of {} m voxels over {} m is too large", o.voxel, hi - lo);
-    Ok((dims.as_uvec3(), origin))
+    // Squared distances, in voxels, index the table that finishes each value.
+    let diagonal = (dims.as_dvec3() - 1.0).length_squared();
+    ensure_input!(diagonal < MAX_DIAGONAL, "a grid of {} m voxels over {} m is too long", o.voxel, hi - lo);
+    Ok(Layout { dims: dims.as_uvec3(), origin, voxel: o.voxel })
 }
 
 fn point(dims: UVec3, origin: Vec3, voxel: f32, n: u32) -> Vec3 {
@@ -446,86 +613,106 @@ fn nearest(dims: UVec3, origin: Vec3, voxel: f32, p: Vec3) -> usize {
     (i.x + dims.x * (i.y + dims.y * i.z)) as usize
 }
 
-/// Squared distance, in voxels, from every voxel to the nearest one where `sites[i] == target`:
-/// Felzenszwalb and Huttenlocher's separable transform, one axis after another.
-fn squared_edt(sites: &[bool], target: bool, [nx, ny, nz]: [usize; 3]) -> Vec<f64> {
-    let mut d: Vec<f64> = sites.iter().map(|&s| if s == target { 0.0 } else { f64::INFINITY }).collect();
-    d.par_chunks_mut(nx * ny).for_each(|slab| {
-        let mut line = Line::default();
-        for row in slab.chunks_mut(nx) {
-            line.transform(row.iter().copied());
-            row.copy_from_slice(&line.out);
-        }
-        for x in 0..nx {
-            line.transform((0..ny).map(|y| slab[x + nx * y]));
-            (0..ny).for_each(|y| slab[x + nx * y] = line.out[y]);
+/// Squared distance, in voxels, from every voxel to the nearest voxel of the other kind: from
+/// each occupied voxel to the nearest free one and from each free voxel to the nearest occupied
+/// one. Felzenszwalb and Huttenlocher's separable transform, one axis after another, in exact
+/// integers; `layout` keeps every value below 2^24. grids.wgsl mirrors it.
+pub(crate) fn squared_edt(occupied: &[bool], [nx, ny, nz]: [usize; 3]) -> Vec<u32> {
+    let slab = nx * ny;
+    // Per kind of site, the x and y passes, one z slab at a time.
+    let planes = [true, false].map(|site| {
+        let mut d: Vec<u32> = occupied.iter().map(|&o| if o == site { 0 } else { FAR }).collect();
+        d.par_chunks_mut(slab).for_each_init(Line::default, |line, s| {
+            for row in s.chunks_mut(nx) {
+                line.transform(row.iter().copied());
+                row.copy_from_slice(&line.out);
+            }
+            for x in 0..nx {
+                line.transform((0..ny).map(|y| s[x + nx * y]));
+                (0..ny).for_each(|y| s[x + nx * y] = line.out[y]);
+            }
+        });
+        d
+    });
+    // The z pass, column by column, keeping each voxel's distance to the other kind.
+    let mut columns = vec![0; occupied.len()];
+    columns.par_chunks_mut(nz).enumerate().for_each_init(Line::default, |line, (c, column)| {
+        for (site, plane) in [true, false].into_iter().zip(&planes) {
+            line.transform((0..nz).map(|z| plane[c + slab * z]));
+            (0..nz).filter(|&z| occupied[c + slab * z] != site).for_each(|z| column[z] = line.out[z]);
         }
     });
-    let columns: Vec<Vec<f64>> = (0..nx * ny)
-        .into_par_iter()
-        .map_init(Line::default, |line, c| {
-            line.transform((0..nz).map(|z| d[c + nx * ny * z]));
-            line.out.clone()
-        })
-        .collect();
-    for (c, column) in columns.iter().enumerate() {
-        (0..nz).for_each(|z| d[c + nx * ny * z] = column[z]);
-    }
-    d
+    let [mut out, _] = planes;
+    out.par_chunks_mut(slab).enumerate().for_each(|(z, s)| (0..slab).for_each(|c| s[c] = columns[c * nz + z]));
+    out
 }
 
+/// No site along the line.
+pub(crate) const FAR: u32 = u32::MAX;
+
 /// One-dimensional squared distance transform: the lower envelope of parabolas rooted at the
-/// finite input values.
+/// values below `FAR`.
 #[derive(Default)]
 struct Line {
-    f: Vec<f64>,
+    f: Vec<u32>,
     roots: Vec<usize>,
-    starts: Vec<f64>,
-    out: Vec<f64>,
+    /// The first position at which each root's parabola is at most the previous root's, within
+    /// `0..=len`: outside the line, where a root starts does not matter.
+    starts: Vec<u32>,
+    out: Vec<u32>,
 }
 
 impl Line {
-    fn transform(&mut self, f: impl Iterator<Item = f64>) {
+    fn transform(&mut self, f: impl Iterator<Item = u32>) {
         self.f.clear();
         self.f.extend(f);
         let (f, roots, starts) = (&self.f, &mut self.roots, &mut self.starts);
         roots.clear();
         starts.clear();
-        let meet = |p: usize, q: usize| ((f[q] + (q * q) as f64) - (f[p] + (p * p) as f64)) / (2 * (q - p)) as f64;
-        for q in (0..f.len()).filter(|&q| f[q].is_finite()) {
-            let mut s = f64::NEG_INFINITY;
+        for q in (0..f.len()).filter(|&q| f[q] != FAR) {
+            let mut s = 0;
             while let Some(&p) = roots.last() {
-                s = meet(p, q);
+                s = meet(p, f[p], q, f[q]).clamp(0, f.len() as i32) as u32;
                 if s > *starts.last().expect("one start per root") {
                     break;
                 }
                 roots.pop();
                 starts.pop();
-                s = f64::NEG_INFINITY;
+                s = 0;
             }
             roots.push(q);
             starts.push(s);
         }
         self.out.clear();
         if roots.is_empty() {
-            self.out.resize(f.len(), f64::INFINITY);
+            self.out.resize(f.len(), FAR);
             return;
         }
         let mut k = 0;
-        for q in 0..f.len() {
-            while k + 1 < roots.len() && starts[k + 1] < q as f64 {
+        for x in 0..f.len() {
+            while k + 1 < roots.len() && starts[k + 1] <= x as u32 {
                 k += 1;
             }
-            let d = q as f64 - roots[k] as f64;
+            let d = x.abs_diff(roots[k]) as u32;
             self.out.push(d * d + f[roots[k]]);
         }
     }
 }
 
-/// Log-odds a hit adds, a miss adds, and their clamps: OctoMap's.
-const HIT: f32 = 0.85;
-const MISS: f32 = -0.4;
-const CLAMP: (f32, f32) = (-2.0, 3.5);
+/// The first position at which the parabola rooted at `q` is at most the one rooted at `p < q`:
+/// where they meet, rounded up.
+fn meet(p: usize, fp: u32, q: usize, fq: u32) -> i32 {
+    let num = (fq + (q * q) as u32) as i32 - (fp + (p * p) as u32) as i32;
+    let den = 2 * (q - p) as i32;
+    num / den + i32::from(num % den > 0)
+}
+
+/// Log-odds in twentieths: a hit adds 0.85, a miss -0.4, clamped to [-2, 3.5], as in OctoMap.
+pub(crate) const HIT: i8 = 17;
+pub(crate) const MISS: i8 = -8;
+pub(crate) const CLAMP: (i8, i8) = (-40, 70);
+/// The log-odds of a voxel no image has updated.
+pub(crate) const UNOBSERVED: i8 = i8::MIN;
 
 /// Occupancy fused from depth images over time, on a fixed grid in the world frame: per voxel, the
 /// log-odds that it is occupied, updated as OctoMap updates them (a hit adds 0.85, a miss -0.4,
@@ -533,86 +720,116 @@ const CLAMP: (f32, f32) = (-2.0, 3.5);
 /// through three times is free again. Build distance grids from it with [`OccupancyMap::grid`].
 #[derive(Clone, Debug)]
 pub struct OccupancyMap {
-    dims: UVec3,
-    origin: Vec3,
-    voxel: f32,
-    log_odds: Vec<f32>,
-    observed: Vec<bool>,
+    grid: Layout,
+    log_odds: Vec<i8>,
 }
 
 impl OccupancyMap {
     /// An unobserved map with `voxel` spacing whose points cover `lo..=hi`.
     pub fn new(lo: Vec3, hi: Vec3, voxel: f32) -> Result<Self> {
         ensure_input!(lo.is_finite() && hi.is_finite() && lo.cmplt(hi).all(), "a map needs lo < hi, got {lo} and {hi}");
-        let (dims, origin) = layout(lo, hi, &SdfOptions { voxel, padding: 0.0 })?;
-        let n = dims.element_product() as usize;
-        Ok(Self { dims, origin, voxel, log_odds: vec![0.0; n], observed: vec![false; n] })
+        let grid = layout(lo, hi, &SdfOptions { voxel, padding: 0.0 })?;
+        Ok(Self { grid, log_odds: vec![UNOBSERVED; grid.points()] })
     }
 
-    /// Fuses one depth image. Each voxel is projected into it: voxels in front of a reading are
-    /// misses, voxels at it (within half a voxel) and those holding a reading's point are hits, and
-    /// voxels behind readings, outside the image or along pixels without a reading are not updated.
-    /// With `robot`, each pixel's depth to the robot ([`DepthImage::robot_depth`]), pixels that see
-    /// the robot only clear the space in front of it.
-    pub fn integrate(&mut self, image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
-        image.check()?;
-        if let Some(r) = robot {
-            ensure_input!(r.len() == image.depth.len(), "{} robot depths for {} pixels", r.len(), image.depth.len());
-        }
-        let (dims, origin, voxel) = (self.dims, self.origin, self.voxel);
-        let half = 0.5 * voxel;
-        let robot_at = |i: usize| robot.map_or(f32::INFINITY, |r| r[i]);
-        let on_robot = |i: usize, z: f32| z >= robot_at(i) - voxel;
-        // This frame's update of each voxel: -1 a miss, 1 a hit.
-        let mut update: Vec<i8> = (0..dims.element_product())
-            .into_par_iter()
-            .map(|n| {
-                let Some((i, z_voxel)) = image.project(point(dims, origin, voxel, n)) else { return 0 };
-                match image.reading(i) {
-                    Some(z) if on_robot(i, z) => -i8::from(z_voxel < robot_at(i) - half),
-                    Some(z) if z_voxel < z - half => -1,
-                    Some(z) if z_voxel <= z + half => 1,
-                    _ => 0,
-                }
-            })
-            .collect();
-        let (lo, hi) = (origin - half, origin + (dims - 1).as_vec3() * voxel + half);
-        for (i, p) in image.points() {
-            if !on_robot(i, image.depth[i]) && p.cmpge(lo).all() && p.cmplt(hi).all() {
-                update[nearest(dims, origin, voxel, p)] = 1;
-            }
-        }
-        self.log_odds.par_iter_mut().zip(self.observed.par_iter_mut()).zip(update).for_each(|((l, seen), u)| {
-            if u != 0 {
-                *seen = true;
-                *l = (*l + if u > 0 { HIT } else { MISS }).clamp(CLAMP.0, CLAMP.1);
-            }
-        });
-        Ok(())
+    /// Fuses one depth image on `device`. Each voxel is projected into it: voxels in front of a
+    /// reading are misses, voxels at it (within half a voxel) and those holding a reading's point
+    /// are hits, and voxels behind readings, outside the image or along pixels without a reading
+    /// are not updated. With `robot`, each pixel's depth to the robot
+    /// ([`DepthImage::robot_depth`]), pixels that see the robot only clear the space in front of it.
+    pub fn integrate(&mut self, device: &Device, image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
+        image.check_with(robot)?;
+        device.integrate(&self.grid, &mut self.log_odds, image, robot)
     }
 
     /// The probability that the voxel holding `p` is occupied; `None` if it was never observed or
     /// lies outside the map.
     pub fn occupancy(&self, p: Vec3) -> Option<f32> {
-        let half = 0.5 * self.voxel;
-        let (lo, hi) = (self.origin - half, self.origin + (self.dims - 1).as_vec3() * self.voxel + half);
-        if !(p.cmpge(lo).all() && p.cmplt(hi).all()) {
-            return None;
-        }
-        let i = nearest(self.dims, self.origin, self.voxel, p);
-        self.observed[i].then(|| 1.0 / (1.0 + (-self.log_odds[i]).exp()))
+        let l = self.log_odds[self.grid.nearest(p)];
+        (self.grid.contains(p) && l != UNOBSERVED).then(|| 1.0 / (1.0 + (-f32::from(l) / 20.0).exp()))
     }
 
     /// The distance grid of the map: voxels more likely occupied than not are solid, and voxels
     /// never observed are solid or free as `unknown` says. Errors if nothing is solid.
-    pub fn grid(&self, unknown: Occlusion) -> Result<SdfGrid> {
+    pub fn grid(&self, device: &Device, unknown: Occlusion) -> Result<SdfGrid> {
         let occupied: Vec<bool> = self
             .log_odds
-            .iter()
-            .zip(&self.observed)
-            .map(|(&l, &seen)| if seen { l > 0.0 } else { unknown == Occlusion::Occupied })
+            .par_iter()
+            .map(|&l| if l == UNOBSERVED { unknown == Occlusion::Occupied } else { l > 0 })
             .collect();
         ensure_input!(occupied.iter().any(|&o| o), "the map holds nothing occupied");
-        SdfGrid::from_occupancy(self.dims, self.origin, self.voxel, &occupied)
+        SdfGrid::from_occupancy(device, &self.grid, &occupied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CollisionModel, RobotOptions};
+    use glam::Quat;
+    use std::collections::HashMap;
+
+    /// The Panda as the examples hold it.
+    fn panda() -> Robot {
+        let fingers = [("panda_finger_joint1".to_string(), 0.04), ("panda_finger_joint2".to_string(), 0.04)];
+        let options = RobotOptions {
+            lock_joints: HashMap::from(fingers),
+            default_q: Some(vec![0.0, -1.3, 0.0, -2.5, 0.0, 1.5, 0.8]),
+            collision_model: Some(CollisionModel::load("assets/franka/panda_collision.json").unwrap()),
+            ..Default::default()
+        };
+        Robot::load("assets/franka/franka_panda.urdf", &options).unwrap()
+    }
+
+    /// A 640x480 depth image of a table at z = 0 with a ball on it, from 1 m above the robot.
+    fn table_image() -> (Vec<f32>, Intrinsics, Pose) {
+        let camera = Pose { position: Vec3::new(0.0, 0.0, 1.0), rotation: Quat::from_rotation_x(std::f32::consts::PI) };
+        let k = Intrinsics { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5 };
+        let (c, r) = (Vec3::new(0.05, 0.1, 0.1), 0.1);
+        let depth = (0..640 * 480)
+            .map(|i| {
+                let ray = camera.rotation
+                    * Vec3::new(((i % 640) as f32 - k.cx) / k.fx, ((i / 640) as f32 - k.cy) / k.fy, 1.0);
+                let (b, cc) = (ray.dot(camera.position - c), (camera.position - c).length_squared() - r * r);
+                let disc = b * b - ray.length_squared() * cc;
+                let ball = if disc >= 0.0 { (-b - disc.sqrt()) / ray.length_squared() } else { f32::INFINITY };
+                ball.min(-camera.position.z / ray.z)
+            })
+            .collect();
+        (depth, k, camera)
+    }
+
+    /// Classification projects points in floating point, so a point within rounding of a pixel's
+    /// edge or of a depth may land either way on different devices; in a dense image, a handful.
+    /// Maps show it directly: grids spread each such point over its neighbours' distances.
+    #[test]
+    fn every_device_classifies_depth_images_alike() {
+        let robot = panda();
+        let gpu = match Device::gpu(&robot) {
+            Ok(gpu) => gpu,
+            Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => return eprintln!("skipping GPU: {e}"),
+            Err(e) => panic!("no GPU: {e}"),
+        };
+        let cpu = Device::cpu(&robot).unwrap();
+        let (depth, intrinsics, camera) = table_image();
+        let image = DepthImage { depth: &depth, width: 640, intrinsics, camera };
+        let mask = image.robot_depth(&robot, robot.default_q(), 0.02).unwrap();
+        assert!(mask.iter().filter(|d| d.is_finite()).count() > 10_000, "the camera should see the arm");
+        let grid =
+            layout(Vec3::new(-0.6, -0.6, -0.1), Vec3::new(0.6, 0.6, 1.0), &SdfOptions { voxel: 0.01, padding: 0.0 })
+                .unwrap();
+        let fused = |device: &Device| {
+            let mut log_odds = vec![UNOBSERVED; grid.points()];
+            device.integrate(&grid, &mut log_odds, &image, None).unwrap();
+            device.integrate(&grid, &mut log_odds, &image, Some(&mask)).unwrap();
+            log_odds
+        };
+        let (a, b) = (fused(&cpu), fused(&gpu));
+        let count = |l: i8| a.iter().filter(|&&x| x == l).count();
+        assert!(count(HIT + HIT) > 2_000, "the table should be hit twice");
+        assert!(count(HIT) > 2_000, "the arm should hide part of the table the second time");
+        assert!(count(MISS + MISS) > 100_000, "the space in front of the table should be cleared twice");
+        let differ = a.iter().zip(&b).filter(|(a, b)| a != b).count();
+        assert!(differ * 2000 <= a.len(), "{differ} of {} log-odds differ", a.len());
     }
 }

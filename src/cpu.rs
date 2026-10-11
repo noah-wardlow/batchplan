@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
 use crate::robot::{Fk, JointKind, Robot};
-use crate::sdf::SdfGrid;
+use crate::sdf::{self, DepthImage, Layout, Occupancy, SdfGrid};
 use crate::spline;
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
 use crate::types::{JointPaths, Pose};
@@ -790,6 +790,26 @@ impl Backend for CpuBackend {
             }
         };
         self.pool.install(|| paths.positions.par_chunks_mut(t_count * n).zip(item_world.par_iter()).for_each(optimize));
+        Ok(())
+    }
+
+    fn grid_values(&self, grid: &Layout, occupancy: Occupancy) -> Result<Vec<u16>> {
+        self.pool.install(|| {
+            let seen;
+            let occupied = match occupancy {
+                Occupancy::Given(occupied) => occupied,
+                Occupancy::Seen { image, robot, behind } => {
+                    seen = sdf::depth_occupancy(grid, image, robot, behind);
+                    &seen
+                }
+            };
+            let squared = sdf::squared_edt(occupied, grid.dims.to_array().map(|d| d as usize));
+            sdf::finish(grid, occupied, &squared)
+        })
+    }
+
+    fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
+        self.pool.install(|| sdf::integrate(grid, log_odds, image, robot));
         Ok(())
     }
 }

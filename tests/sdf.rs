@@ -7,11 +7,31 @@ mod common;
 
 use std::f32::consts::PI;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use batchplan::rng::Rng;
 use batchplan::*;
 use glam::{Quat, Vec3};
+
+/// A CPU device for the builders' distance transform, which needs no particular robot.
+fn cpu() -> &'static Device {
+    &devices()[0]
+}
+
+/// The CPU device, then the GPU's if there is one.
+fn devices() -> &'static [Device] {
+    static DEVICES: OnceLock<Vec<Device>> = OnceLock::new();
+    DEVICES.get_or_init(|| {
+        let robot = common::panda().unwrap();
+        let mut devices = vec![Device::cpu(&robot).unwrap()];
+        match Device::gpu(&robot) {
+            Ok(gpu) => devices.push(gpu),
+            Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => eprintln!("skipping GPU: {e}"),
+            Err(e) => panic!("no GPU: {e}"),
+        }
+        devices
+    })
+}
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("batchplan-sdf-{name}-{}", std::process::id()));
@@ -224,7 +244,7 @@ fn point_clouds_become_solid_shells() {
         })
         .collect();
     let o = SdfOptions { voxel: 0.01, padding: 0.1 };
-    let grid = SdfGrid::from_points(&points, &o).unwrap();
+    let grid = SdfGrid::from_points(cpu(), &points, &o).unwrap();
     for &p in points.iter().step_by(97) {
         assert!(grid.distance(p).0 <= 0.0, "a surface point reads {}", grid.distance(p).0);
     }
@@ -248,7 +268,7 @@ fn point_grids_never_read_beyond_their_solid_voxels() {
     for _ in 0..40 {
         let points: Vec<Vec3> =
             (0..3).map(|_| Vec3::new(rng.range(0.0, 0.03), rng.range(0.0, 0.03), rng.range(0.0, 0.03))).collect();
-        let grid = SdfGrid::from_points(&points, &o).unwrap();
+        let grid = SdfGrid::from_points(cpu(), &points, &o).unwrap();
         let (origin, hi) = grid.bounds();
         let cubes: Vec<Vec3> = points.iter().map(|&p| origin + ((p - origin) / o.voxel).round() * o.voxel).collect();
         for _ in 0..2000 {
@@ -324,6 +344,12 @@ fn check_table(grid: &SdfGrid, behind: Occlusion, o: &SdfOptions, rng: &mut Rng)
 
 #[test]
 fn depth_images_of_any_resolution_become_grids() {
+    for d in devices() {
+        depth_images_become_grids_on(d);
+    }
+}
+
+fn depth_images_become_grids_on(device: &Device) {
     let scene = TableScene::new();
     let o = SdfOptions { voxel: 0.01, padding: 0.15 };
     let mut rng = Rng::new(4);
@@ -336,7 +362,7 @@ fn depth_images_of_any_resolution_become_grids() {
     for (width, height, k) in [(8, 8, tof), (640, 480, vga)] {
         let depth = scene.render(width, height, k, false);
         for behind in [Occlusion::Occupied, Occlusion::Free] {
-            let grid = SdfGrid::from_depth(&scene.image(&depth, width, k), None, behind, &o).unwrap();
+            let grid = SdfGrid::from_depth(device, &scene.image(&depth, width, k), None, behind, &o).unwrap();
             check_table(&grid, behind, &o, &mut rng);
         }
     }
@@ -344,7 +370,7 @@ fn depth_images_of_any_resolution_become_grids() {
     let depth = scene.render(640, 480, vga, true);
     let (c, r) = scene.ball;
     for (behind, inside) in [(Occlusion::Occupied, -0.05), (Occlusion::Free, 0.05)] {
-        let grid = SdfGrid::from_depth(&scene.image(&depth, 640, vga), None, behind, &o).unwrap();
+        let grid = SdfGrid::from_depth(device, &scene.image(&depth, 640, vga), None, behind, &o).unwrap();
         let above = grid.distance(c + Vec3::new(0.0, 0.0, r + 0.05)).0;
         assert!(above <= 0.05 + 2e-3 && above > 0.05 - occupancy_slack(o.voxel), "{above} above the ball");
         let center = grid.distance(c).0;
@@ -355,12 +381,12 @@ fn depth_images_of_any_resolution_become_grids() {
     // along the world's -y).
     let mut holes = scene.render(8, 8, tof, false);
     holes.iter_mut().step_by(2).for_each(|z| *z = 0.0);
-    let grid = SdfGrid::from_depth(&scene.image(&holes, 8, tof), None, Occlusion::Occupied, &o).unwrap();
+    let grid = SdfGrid::from_depth(device, &scene.image(&holes, 8, tof), None, Occlusion::Occupied, &o).unwrap();
     assert!(grid.distance(Vec3::new(0.054, -0.054, -0.05)).0 > 0.0, "below a pixel without a reading");
     assert!(grid.distance(Vec3::new(0.163, -0.054, -0.05)).0 < 0.0, "below a pixel with one");
     let all_holes = vec![f32::NAN; 64];
-    assert!(SdfGrid::from_depth(&scene.image(&all_holes, 8, tof), None, Occlusion::Free, &o).is_err());
-    assert!(SdfGrid::from_depth(&scene.image(&depth, 7, vga), None, Occlusion::Free, &o).is_err(), "rows of 7");
+    assert!(SdfGrid::from_depth(device, &scene.image(&all_holes, 8, tof), None, Occlusion::Free, &o).is_err());
+    assert!(SdfGrid::from_depth(device, &scene.image(&depth, 7, vga), None, Occlusion::Free, &o).is_err(), "rows of 7");
 }
 
 /// An L-shaped prism 10 cm tall whose convex hull also fills the notch at x, y in (0.1, 0.2).
@@ -528,6 +554,12 @@ fn deserialized_grids_are_checked_like_built_ones() {
 
 #[test]
 fn fused_maps_keep_what_stays_and_clear_what_leaves() {
+    for d in devices() {
+        fused_maps_on(d);
+    }
+}
+
+fn fused_maps_on(device: &Device) {
     let scene = TableScene::new();
     let vga = Intrinsics { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5 };
     let (with, without) = (scene.render(640, 480, vga, true), scene.render(640, 480, vga, false));
@@ -535,26 +567,26 @@ fn fused_maps_keep_what_stays_and_clear_what_leaves() {
     let (c, r) = scene.ball;
     let top = c + Vec3::new(0.0, 0.0, r);
     let above = top + Vec3::new(0.0, 0.0, 0.05);
-    map.integrate(&scene.image(&with, 640, vga), None).unwrap();
+    map.integrate(device, &scene.image(&with, 640, vga), None).unwrap();
     assert!(map.occupancy(top).unwrap() > 0.5, "the ball's top is seen");
-    assert!(map.grid(Occlusion::Free).unwrap().distance(above).0 < 0.06, "the ball is in the grid");
+    assert!(map.grid(device, Occlusion::Free).unwrap().distance(above).0 < 0.06, "the ball is in the grid");
     // Seen through twice, the ball's top still holds (0.85 - 2 x 0.4); a third time clears it.
     for frame in 1..=3 {
-        map.integrate(&scene.image(&without, 640, vga), None).unwrap();
+        map.integrate(device, &scene.image(&without, 640, vga), None).unwrap();
         assert_eq!(map.occupancy(top).unwrap() > 0.5, frame < 3, "after {frame} frames without the ball");
     }
-    let grid = map.grid(Occlusion::Free).unwrap();
+    let grid = map.grid(device, Occlusion::Free).unwrap();
     assert!(grid.distance(above).0 > 0.2, "the ball is gone: {}", grid.distance(above).0);
     // The table stays; below it nothing was observed, which the grid treats as told.
     assert!(map.occupancy(Vec3::new(0.1, 0.1, 0.0)).unwrap() > 0.5, "the table");
     let below = Vec3::new(0.1, 0.1, -0.05);
     assert_eq!(map.occupancy(below), None);
-    assert!(map.grid(Occlusion::Occupied).unwrap().distance(below).0 < 0.0);
-    assert!(map.grid(Occlusion::Free).unwrap().distance(below).0 > 0.0);
+    assert!(map.grid(device, Occlusion::Occupied).unwrap().distance(below).0 < 0.0);
+    assert!(map.grid(device, Occlusion::Free).unwrap().distance(below).0 > 0.0);
     // A map ending inside the ball (its last voxels at x = 0) takes no hits from the readings
     // beyond its edge.
     let mut part = OccupancyMap::new(Vec3::new(-0.3, -0.3, -0.1), Vec3::new(-0.005, 0.3, 0.3), 0.01).unwrap();
-    part.integrate(&scene.image(&with, 640, vga), None).unwrap();
+    part.integrate(device, &scene.image(&with, 640, vga), None).unwrap();
     assert!(part.occupancy(Vec3::new(0.0, 0.1, 0.2)).unwrap() < 0.5, "the map's edge");
 }
 
@@ -568,6 +600,12 @@ fn look_at(eye: Vec3, target: Vec3) -> Pose {
 
 #[test]
 fn robot_masking_drops_the_arm_and_keeps_what_is_in_front_of_it() {
+    for d in devices() {
+        robot_masking_on(d);
+    }
+}
+
+fn robot_masking_on(device: &Device) {
     let robot = common::panda().unwrap();
     let q = robot.default_q().to_vec();
     // The robot's spheres in the world, from its link poses.
@@ -612,22 +650,53 @@ fn robot_masking_drops_the_arm_and_keeps_what_is_in_front_of_it() {
     let o = SdfOptions { voxel: 0.01, padding: 0.15 };
     let face = box_center + Vec3::new(box_half.x, 0.0, 0.0);
     // Unmasked, the arm is an obstacle.
-    let raw = SdfGrid::from_depth(&image, None, Occlusion::Free, &o).unwrap();
+    let raw = SdfGrid::from_depth(device, &image, None, Occlusion::Free, &o).unwrap();
     assert!(spheres.iter().any(|&(c, r)| raw.distance(c).0 < r), "the arm should read as an obstacle");
     // Masked, its space is free while the box in front of it stays.
     let mask = image.robot_depth(&robot, &q, 0.02).unwrap();
     let hidden = (0..depth.len()).filter(|&i| depth[i] > 0.0 && depth[i] < mask[i] - 0.1).count();
     assert!(hidden > 1000, "the box should hide part of the arm: {hidden} pixels");
-    let masked = SdfGrid::from_depth(&image, Some(&mask), Occlusion::Free, &o).unwrap();
+    let masked = SdfGrid::from_depth(device, &image, Some(&mask), Occlusion::Free, &o).unwrap();
     for &(c, r) in &spheres {
         assert!(masked.distance(c).0 > r, "an obstacle at the arm: {} at {c}", masked.distance(c).0);
     }
     assert!(masked.distance(face).0 <= 0.0, "the box in front of the arm is lost: {}", masked.distance(face).0);
     // A fused map clears space in front of the arm and adds nothing at it.
     let mut map = OccupancyMap::new(Vec3::new(-0.2, -0.6, 0.0), Vec3::new(1.2, 0.6, 1.2), 0.02).unwrap();
-    map.integrate(&image, Some(&mask)).unwrap();
+    map.integrate(device, &image, Some(&mask)).unwrap();
     for &(c, _) in &spheres {
         assert!(map.occupancy(c).is_none_or(|p| p < 0.5), "the map holds the arm at {c}");
     }
     assert!(map.occupancy(face).unwrap() > 0.5, "the map lost the box");
+}
+
+/// The distance transform is exact on every device. (Classifying a depth image's points is
+/// checked where it happens, in `sdf.rs`, and the tests above run every builder on every device.)
+#[test]
+fn every_device_builds_the_same_grids_from_occupancy() {
+    let robot = common::panda().unwrap();
+    let scene = TableScene::new();
+    let vga = Intrinsics { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5 };
+    let depth = scene.render(640, 480, vga, true);
+    let image = scene.image(&depth, 640, vga);
+    let mask = image.robot_depth(&robot, robot.default_q(), 0.02).unwrap();
+    let mut map = OccupancyMap::new(Vec3::new(-0.3, -0.3, -0.1), Vec3::new(0.3, 0.3, 0.3), 0.01).unwrap();
+    map.integrate(cpu(), &image, Some(&mask)).unwrap();
+    let mut rng = Rng::new(5);
+    let points: Vec<Vec3> =
+        (0..2000).map(|_| Vec3::new(rng.range(-0.4, 0.4), rng.range(-0.1, 0.1), rng.range(0.0, 0.3))).collect();
+    let o = SdfOptions { voxel: 0.01, padding: 0.15 };
+    let grids = |d: &Device| {
+        [
+            ("points", SdfGrid::from_points(d, &points, &o).unwrap()),
+            ("map, unknown free", map.grid(d, Occlusion::Free).unwrap()),
+            ("map, unknown occupied", map.grid(d, Occlusion::Occupied).unwrap()),
+        ]
+    };
+    let reference = grids(cpu());
+    for d in &devices()[1..] {
+        for ((name, a), (_, b)) in reference.iter().zip(grids(d)) {
+            assert!(*a == b, "{name}: {} and {} build different grids", cpu().name(), d.name());
+        }
+    }
 }
