@@ -30,6 +30,19 @@ episode_files = sorted((root / "meta/episodes").glob("*/*.parquet"))
 print(f"{len(episode_files)} episode metadata file(s), {len(meta.tasks)} task(s)")
 print("sample:", {k: tuple(v.shape) if isinstance(v, torch.Tensor) else v for k, v in sorted(item.items())})
 
+# Camera images decode to channel-first tensors: colour in [0, 1], depth in millimetres.
+for key in meta.camera_keys:
+    height, width, channels = info["features"][key]["shape"]
+    image = item[key]
+    assert image.shape == (channels, height, width), (key, image.shape)
+    if key in meta.depth_keys:
+        assert channels == 1 and image.min() >= 0 and image.max() > 100, (key, image.min(), image.max())
+    else:
+        assert channels == 3 and 0 <= image.min() and image.max() <= 1, (key, image.min(), image.max())
+    assert np.asarray(meta.stats[key]["mean"]).shape == (channels, 1, 1), key
+if meta.camera_keys:
+    print(f"camera images load: {meta.camera_keys} (depth: {meta.depth_keys})")
+
 # Every episode is contiguous, correctly bounded, and its action is the next frame's state.
 frames = ds.hf_dataset.with_format("numpy")
 state = np.stack(frames["observation.state"])

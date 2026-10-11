@@ -205,7 +205,7 @@ fn the_fallback_keeps_the_time_budget() {
     // the search long enough to cut.
     let robot = Robot::load(common::asset(UR5E), &RobotOptions::default()).unwrap();
     let cpu = Device::cpu(&robot).unwrap();
-    let (scene, problems) = far_reaches(&robot, &cpu, 24, false);
+    let (scene, problems) = far_reaches(&robot, &cpu, 48, false);
     let rrt = RrtOptions { step: 0.02, ..Default::default() };
     let slow = PlanOptions {
         seeds: 1,

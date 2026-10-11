@@ -13,6 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
+use crate::render::{Camera, Images, View};
 use crate::robot::{JointKind, Robot};
 use crate::sdf::{DepthImage, FAR, Layout, Occlusion, Occupancy, SdfGrid, finishing_table, one_kind};
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
@@ -111,6 +112,22 @@ shader_struct! {
         nx: u32, ny: u32, nz: u32, points: u32,
         axis: u32, lines: u32, width: u32, height: u32,
         has_robot: u32, behind_occupied: u32, map: u32, pad0: u32,
+    }
+}
+
+shader_struct! {
+    /// One call of the renderer (`R` in render.wgsl): the image size, how many views and how many
+    /// robot spheres per view, and the intrinsics.
+    GpuRenderParams => RenderParams { width: u32, height: u32, views: u32, spheres: u32, fx: f32, fy: f32, cx: f32, cy: f32 }
+}
+
+shader_struct! {
+    /// One view: the camera's rotation columns (`eye0..2`) and position (`eye`), its world, and
+    /// the obstacle `moved` (`u32::MAX` for none) at the centre and rotation columns given.
+    GpuRenderView => RenderView {
+        eye0: Vec4, eye1: Vec4, eye2: Vec4, eye: Vec4,
+        moved_center: Vec4, moved_r0: Vec4, moved_r1: Vec4, moved_r2: Vec4,
+        world: u32, moved: u32, pad0: u32, pad1: u32,
     }
 }
 
@@ -396,7 +413,72 @@ pub(crate) struct GpuBackend {
     buffers: RobotBuffers,
     /// The grid kernels, built on first use and shared like `built`.
     grids: Arc<OnceLock<GridKernels>>,
+    /// The renderer, built on first use and shared like `built`.
+    renderer: Arc<OnceLock<Renderer>>,
     grid_buffers: Arc<Mutex<GridBuffers>>,
+}
+
+/// Camera images (render.wgsl), which need no robot kernels.
+struct Renderer {
+    layout: wgpu::BindGroupLayout,
+    pass: wgpu::ComputePipeline,
+}
+
+impl Renderer {
+    fn new(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> Result<Self> {
+        use crate::render::{BACKGROUND, GRID_HIT, GRID_STEPS, PALETTE, ROBOT};
+        let color = |c: [f32; 3]| format!("vec3<f32>({:?}, {:?}, {:?})", c[0], c[1], c[2]);
+        let source = [
+            "alias Vec4 = vec4<f32>;\n",
+            &format!("const WORKGROUP: u32 = {WORKGROUP}u;\nconst FAR: f32 = 1e30;\n"),
+            &format!("const CUBOID: u32 = {CUBOID}u;\nconst SPHERE: u32 = {SPHERE}u;\n"),
+            &format!(
+                "const CYLINDER: u32 = {CYLINDER}u;\nconst CAPSULE: u32 = {CAPSULE}u;\nconst SDF: u32 = {SDF}u;\n"
+            ),
+            &format!("const PALETTE = array<vec3<f32>, {}>({});\n", PALETTE.len(), PALETTE.map(color).join(", ")),
+            &format!("const ROBOT = {};\nconst BACKGROUND = {};\n", color(ROBOT), color(BACKGROUND)),
+            &format!("const GRID_HIT: f32 = {GRID_HIT:?};\nconst GRID_STEPS: u32 = {GRID_STEPS}u;\n"),
+            GpuRenderParams::WGSL,
+            GpuRenderView::WGSL,
+            GpuObstacle::WGSL,
+            include_str!("render.wgsl"),
+            include_str!("grid.wgsl"),
+        ]
+        .concat();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("render"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let mut entries = vec![entry(0, wgpu::BufferBindingType::Uniform)];
+        entries.extend((1..=5).map(|b| entry(b, wgpu::BufferBindingType::Storage { read_only: true })));
+        entries.extend((6..=7).map(|b| entry(b, wgpu::BufferBindingType::Storage { read_only: false })));
+        let layout = device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("render"), entries: &entries });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pass = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("render_main"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("render_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(Error::Gpu(format!("{} ({:?}) cannot build the renderer: {e}", info.name, info.backend)));
+        }
+        Ok(Self { layout, pass })
+    }
 }
 
 /// Building distance grids (grids.wgsl), which needs no robot.
@@ -624,6 +706,7 @@ fn build_kernels(device: &wgpu::Device, info: &wgpu::AdapterInfo, robot_source: 
         GpuObstacle::WGSL,
         robot_source,
         include_str!("kernels.wgsl"),
+        include_str!("grid.wgsl"),
     ]
     .concat();
     // Turn shader and pipeline validation failures into errors instead of panics.
@@ -757,8 +840,8 @@ impl GpuBackend {
         let built = Arc::new(Mutex::new(HashMap::new()));
         let kernels = kernels_for(&device, &info, &built, robot)?;
         let buffers = RobotBuffers::new(&device, robot);
-        let (grids, grid_buffers) = Default::default();
-        Ok(Self { robot: robot.clone(), info, device, queue, kernels, built, buffers, grids, grid_buffers })
+        let (grids, grid_buffers, renderer) = Default::default();
+        Ok(Self { robot: robot.clone(), info, device, queue, kernels, built, buffers, grids, grid_buffers, renderer })
     }
 
     fn params(&self, n_items: usize, w: &CollisionWeights) -> GpuParams {
@@ -1088,6 +1171,87 @@ impl Backend for GpuBackend {
         Ok(bytemuck::cast_slice::<u32, u16>(&words)[..points].to_vec())
     }
 
+    fn render(&self, worlds: &Worlds, camera: &Camera, views: &[View]) -> Result<Images> {
+        let renderer = self.renderer()?;
+        let gpu_worlds: &GpuWorlds = worlds.prepared();
+        let (width, height) = (camera.width, camera.height);
+        let per_view = (width * height) as usize;
+        let spheres = self.robot.spheres.len();
+        let mut images = Images { width, height, rgb: Vec::with_capacity(views.len() * per_view * 3), depth: vec![] };
+        // At most 4M pixels per submission.
+        for chunk in views.chunks(((1 << 22) / per_view).max(1)) {
+            let gpu_views: Vec<GpuRenderView> = chunk
+                .iter()
+                .map(|v| {
+                    let eye = Mat3::from_quat(v.eye.rotation);
+                    let identity = crate::types::Pose { position: glam::Vec3::ZERO, rotation: glam::Quat::IDENTITY };
+                    let (moved, pose) = v.moved.map_or((u32::MAX, identity), |(k, p)| (k as u32, p));
+                    let r = Mat3::from_quat(pose.rotation);
+                    GpuRenderView {
+                        eye0: v4(eye.x_axis, 0.0),
+                        eye1: v4(eye.y_axis, 0.0),
+                        eye2: v4(eye.z_axis, 0.0),
+                        eye: v4(v.eye.position, 0.0),
+                        moved_center: v4(pose.position, 0.0),
+                        moved_r0: v4(r.x_axis, 0.0),
+                        moved_r1: v4(r.y_axis, 0.0),
+                        moved_r2: v4(r.z_axis, 0.0),
+                        world: v.world,
+                        moved,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let centres: Vec<[f32; 4]> = chunk.iter().flat_map(|v| v.spheres.iter().copied()).collect();
+            let k = camera.intrinsics;
+            let params = GpuRenderParams {
+                width,
+                height,
+                views: chunk.len() as u32,
+                spheres: spheres as u32,
+                fx: k.fx,
+                fy: k.fy,
+                cx: k.cx,
+                cy: k.cy,
+            };
+            let params = self.uniform_of(&params);
+            let views_buf = storage(&self.device, "views", &gpu_views);
+            let spheres_buf = storage(&self.device, "robot spheres", &centres);
+            let pixels = chunk.len() * per_view;
+            let colors = storage_zeroed(&self.device, "colors", pixels);
+            let depths = storage_zeroed(&self.device, "depths", pixels);
+            let buffers = [
+                &params,
+                &gpu_worlds.obstacles,
+                &gpu_worlds.ranges,
+                &gpu_worlds.grids,
+                &views_buf,
+                &spheres_buf,
+                &colors,
+                &depths,
+            ];
+            let entries: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(i, buf)| wgpu::BindGroupEntry { binding: i as u32, resource: buf.as_entire_binding() })
+                .collect();
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &renderer.layout,
+                entries: &entries,
+            });
+            self.submit_pass(|pass| {
+                pass.set_pipeline(&renderer.pass);
+                pass.set_bind_group(0, &bind, &[]);
+                dispatch(pass, pixels);
+            });
+            let packed: Vec<u32> = self.read(&colors, pixels)?;
+            images.rgb.extend(packed.iter().flat_map(|c| [*c as u8, (c >> 8) as u8, (c >> 16) as u8]));
+            images.depth.extend(self.read::<f32>(&depths, pixels)?);
+        }
+        Ok(images)
+    }
+
     fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
         let kernels = self.grid_kernels()?;
         let mut buffers = self.grid_buffers.lock().expect("no thread panics while holding the grid buffers");
@@ -1112,6 +1276,14 @@ impl Backend for GpuBackend {
 }
 
 impl GpuBackend {
+    fn renderer(&self) -> Result<&Renderer> {
+        if let Some(r) = self.renderer.get() {
+            return Ok(r);
+        }
+        let r = Renderer::new(&self.device, &self.info)?;
+        Ok(self.renderer.get_or_init(|| r))
+    }
+
     fn grid_kernels(&self) -> Result<&GridKernels> {
         if let Some(kernels) = self.grids.get() {
             return Ok(kernels);

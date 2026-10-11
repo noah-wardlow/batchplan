@@ -17,6 +17,7 @@ use crate::cpu::CpuBackend;
 #[cfg(feature = "gpu")]
 use crate::gpu::GpuBackend;
 use crate::ik::IkOptions;
+use crate::render::{Camera, Images, View};
 use crate::robot::Robot;
 use crate::sdf::{DepthImage, Layout, Occupancy};
 use crate::trajopt::PlanOptions;
@@ -203,6 +204,21 @@ impl Device {
         self.backend.integrate(grid, log_odds, image, robot)
     }
 
+    /// What `camera` sees of each configuration (`[items, dof]`) in its world, with an obstacle
+    /// moved to a pose per item where `moved` (empty, or one per item) says so.
+    pub fn render(
+        &self,
+        worlds: &Worlds,
+        camera: &Camera,
+        item_world: &[u32],
+        q: &[f32],
+        moved: &[Option<(usize, Pose)>],
+    ) -> Result<Images> {
+        self.check_batch(worlds, item_world, q.len(), self.robot().dof())?;
+        let views = camera.views(self.robot(), worlds.as_slice(), item_world, q, moved)?;
+        self.backend.render(worlds, camera, &views)
+    }
+
     pub(crate) fn ik(
         &self,
         worlds: &Worlds,
@@ -289,4 +305,6 @@ pub(crate) trait Backend: Send + Sync {
     fn grid_values(&self, grid: &Layout, occupancy: Occupancy) -> Result<Vec<u16>>;
     /// Fuses `image` into a map's log-odds (`sdf::integrate`).
     fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()>;
+    /// Draws `views` of `worlds` with `camera` (`render::render`).
+    fn render(&self, worlds: &Worlds, camera: &Camera, views: &[View]) -> Result<Images>;
 }

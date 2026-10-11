@@ -10,6 +10,11 @@
 //!   center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid,
 //!   1 sphere, 2 cylinder, 3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of
 //!   a grid's box, else (radius, radius, half height or half length).
+//! - `observation.images.<camera>` for each of [`ExportOptions::cameras`]: the colour image
+//!   `[height, width, 3]` as a PNG `image` feature, rendered on the device; with
+//!   [`ExportOptions::depth_images`], also `observation.images.<camera>_depth`, the depth along
+//!   the camera's axis in millimetres `[height, width, 1]` (16-bit, flagged `is_depth_map`, 0
+//!   where nothing is hit).
 //! - `is_recovery`, `parent_episode_index` (-1 for nominal episodes) and `world_index`: extra
 //!   columns that LeRobot policies ignore.
 //!
@@ -23,14 +28,19 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result, ensure_input};
 use arrow_array::builder::{Float64Builder, Int64Builder, ListBuilder, StringBuilder};
-use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{
+    ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 use crate::datagen::{Demonstration, Origin, check_demos};
+use crate::device::{Device, Worlds};
+use crate::render::{Camera, Images};
 use crate::robot::Robot;
 use crate::types::Pose;
 use crate::world::{Obstacle, World, worlds_json};
@@ -52,19 +62,32 @@ pub struct ExportOptions {
     /// Frame data and episode metadata start a new file past this size, as LeRobot's own
     /// `data_files_size_in_mb`.
     pub data_files_size_in_mb: usize,
+    /// Cameras whose images every frame records; none by default.
+    pub cameras: Vec<Camera>,
+    /// Whether each camera also records depth images. LeRobot 0.6's stock image policies (ACT,
+    /// diffusion) read every camera feature as colour, so this is off by default.
+    pub depth_images: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { robot_type: None, data_files_size_in_mb: 100 }
+        Self { robot_type: None, data_files_size_in_mb: 100, cameras: vec![], depth_images: false }
     }
 }
 
-/// Writes `demos` as a LeRobot v3.0 dataset under `root`, which must not already hold one.
-/// All demonstrations must share a sample period that is a whole number of frames per second.
-/// Frames and episodes are written as they are converted, so the dataset can exceed memory.
-pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
+/// Writes `demos` of `device`'s robot in `worlds` (uploaded to `device`, which renders the
+/// cameras' images) as a LeRobot v3.0 dataset under `root`, which must not already hold one. All
+/// demonstrations must share a sample period that is a whole number of frames per second. Frames
+/// and episodes are written as they are converted, so the dataset can exceed memory.
+pub fn export(root: &Path, device: &Device, worlds: &Worlds, demos: &[Demonstration], o: &ExportOptions) -> Result<()> {
+    let robot = device.robot();
+    let uploaded = worlds;
+    let worlds = worlds.as_slice();
     let dt = check_demos(robot, worlds, demos)?;
+    for (i, camera) in o.cameras.iter().enumerate() {
+        camera.check(robot)?;
+        ensure_input!(o.cameras[..i].iter().all(|c| c.name != camera.name), "two cameras are named '{}'", camera.name);
+    }
     ensure_input!(!root.join("meta/info.json").exists(), "{} already holds a LeRobot dataset", root.display());
     ensure_input!(o.data_files_size_in_mb > 0, "data files need a positive size limit");
     let fps = (1.0 / dt).round();
@@ -93,7 +116,13 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
     let mut index = 0usize;
     for (e, demo) in demos.iter().enumerate() {
         let world = &worlds[demo.world as usize];
-        let columns = episode_columns(robot, world, demo, e, index, fps, max_obstacles, task_index[demo.task.as_str()]);
+        let mut columns =
+            episode_columns(robot, world, demo, e, index, fps, max_obstacles, task_index[demo.task.as_str()]);
+        for camera in &o.cameras {
+            let [colour, depth] = image_columns(device, uploaded, camera, demo)?;
+            columns.push(colour);
+            columns.extend(o.depth_images.then_some(depth));
+        }
         let batch = record_batch(&columns)?;
         let (chunk, file) = data.place(batch.get_array_memory_size())?;
         data.write(&batch)?;
@@ -167,6 +196,13 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
 enum Data {
     F32(Vec<f32>),
     I64(Vec<i64>),
+    /// One PNG per frame, with the pixels' statistics per channel.
+    Image {
+        png: Vec<Vec<u8>>,
+        height: u32,
+        depth_map: bool,
+        stats: Box<Stats>,
+    },
 }
 
 /// One per-frame feature: `width` values per frame (1 = scalar).
@@ -190,6 +226,16 @@ impl Column {
         let dtype = match self.data {
             Data::F32(_) => "float32",
             Data::I64(_) => "int64",
+            Data::Image { height, depth_map, .. } => {
+                let info = depth_map.then(|| json!({"is_depth_map": true, "depth_unit": "mm"}));
+                let channels = if depth_map { 1 } else { 3 };
+                return json!({
+                    "dtype": "image",
+                    "shape": [height, self.width, channels],
+                    "names": ["height", "width", "channel"],
+                    "info": info,
+                });
+            }
         };
         json!({"dtype": dtype, "shape": [self.width], "names": self.names})
     }
@@ -198,6 +244,7 @@ impl Column {
         match &self.data {
             Data::F32(v) => v.iter().map(|&x| x as f64).collect(),
             Data::I64(v) => v.iter().map(|&x| x as f64).collect(),
+            Data::Image { .. } => unreachable!("image statistics come from their histograms"),
         }
     }
 
@@ -213,11 +260,25 @@ impl Column {
                     FixedSizeListArray::new(item.clone(), w as i32, Arc::new(Float32Array::from(v.clone())), None);
                 (Field::new(&self.name, DataType::FixedSizeList(item, w as i32), true), Arc::new(array))
             }
+            // The Hugging Face `Image` feature: PNG bytes and no path.
+            (Data::Image { png, .. }, _) => {
+                let fields = Fields::from(vec![
+                    Field::new("bytes", DataType::Binary, true),
+                    Field::new("path", DataType::Utf8, true),
+                ]);
+                let bytes: ArrayRef = Arc::new(BinaryArray::from_iter_values(png.iter()));
+                let paths: ArrayRef = Arc::new(StringArray::new_null(png.len()));
+                let array = StructArray::new(fields.clone(), vec![bytes, paths], None);
+                (Field::new(&self.name, DataType::Struct(fields), true), Arc::new(array))
+            }
         }
     }
 
     /// Per-dimension statistics over all frames, as LeRobot computes them.
     fn stats(&self) -> Stats {
+        if let Data::Image { stats, .. } = &self.data {
+            return stats.as_ref().clone();
+        }
         let values = self.values();
         let frames = values.len() / self.width;
         let mut s = Stats { count: frames, ..Default::default() };
@@ -246,6 +307,7 @@ impl Column {
 #[derive(Default)]
 struct Aggregate {
     count: f64,
+    image: bool,
     min: Vec<f64>,
     max: Vec<f64>,
     /// Count-weighted sums of the means, of the second moments and of each quantile.
@@ -264,6 +326,7 @@ impl Aggregate {
             self.quantiles = std::array::from_fn(|_| zeros.clone());
         }
         self.count += c;
+        self.image = s.image;
         for d in 0..s.mean.len() {
             self.min[d] = self.min[d].min(s.min[d]);
             self.max[d] = self.max[d].max(s.max[d]);
@@ -285,11 +348,12 @@ impl Aggregate {
             std,
             count: self.count as usize,
             quantiles: self.quantiles.clone().map(|q| q.iter().map(|v| v / self.count).collect()),
+            image: self.image,
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Stats {
     min: Vec<f64>,
     max: Vec<f64>,
@@ -297,6 +361,8 @@ struct Stats {
     std: Vec<f64>,
     count: usize,
     quantiles: [Vec<f64>; 5],
+    /// An image's statistics, one per channel, which LeRobot nests as `[channels][1][1]`.
+    image: bool,
 }
 
 impl Stats {
@@ -309,7 +375,8 @@ impl Stats {
     }
 
     fn to_json(&self) -> Value {
-        let mut m: Map<String, Value> = self.vectors().into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let shape = |v: &[f64]| if self.image { json!(v.iter().map(|x| [[x]]).collect::<Vec<_>>()) } else { json!(v) };
+        let mut m: Map<String, Value> = self.vectors().into_iter().map(|(k, v)| (k.to_string(), shape(v))).collect();
         m.insert("count".into(), json!([self.count]));
         Value::Object(m)
     }
@@ -357,6 +424,92 @@ fn episode_columns(
         Column::i64("index", (first_index as i64..(first_index + frames) as i64).collect()),
         Column::i64("task_index", per_frame(task as i64)),
     ]
+}
+
+/// The colour and depth images `camera` sees at every frame of `demo`.
+fn image_columns(device: &Device, worlds: &Worlds, camera: &Camera, demo: &Demonstration) -> Result<[Column; 2]> {
+    let frames = demo.trajectory.len();
+    let moved: Vec<Option<(usize, Pose)>> =
+        (0..frames).map(|f| demo.carried.as_ref().map(|c| (c.obstacle, c.poses[f]))).collect();
+    let Images { width, height, rgb, depth } =
+        device.render(worlds, camera, &vec![demo.world; frames], &demo.trajectory.positions, &moved)?;
+    let pixels = (width * height) as usize;
+    let millimetres: Vec<u16> = depth.iter().map(|&m| (m * 1000.0).round().clamp(0.0, 65535.0) as u16).collect();
+    let encode = |color: png::ColorType, bit_depth: png::BitDepth, data: &[u8]| -> Result<Vec<u8>> {
+        let mut out = vec![];
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(bit_depth);
+        let mut writer = encoder.write_header().map_err(|e| Error::Write(e.to_string()))?;
+        writer.write_image_data(data).map_err(|e| Error::Write(e.to_string()))?;
+        writer.finish().map_err(|e| Error::Write(e.to_string()))?;
+        Ok(out)
+    };
+    let colour: Vec<Vec<u8>> = rgb
+        .par_chunks(pixels * 3)
+        .map(|frame| encode(png::ColorType::Rgb, png::BitDepth::Eight, frame))
+        .collect::<Result<_>>()?;
+    let depth_png: Vec<Vec<u8>> = millimetres
+        .par_chunks(pixels)
+        .map(|frame| {
+            let big_endian: Vec<u8> = frame.iter().flat_map(|v| v.to_be_bytes()).collect();
+            encode(png::ColorType::Grayscale, png::BitDepth::Sixteen, &big_endian)
+        })
+        .collect::<Result<_>>()?;
+    let name = format!("observation.images.{}", camera.name);
+    let image = |name: String, png, depth_map, stats| Column {
+        name,
+        width: width as usize,
+        names: None,
+        data: Data::Image { png, height, depth_map, stats: Box::new(stats) },
+    };
+    let rgb_stats = image_stats(frames, 3, 255.0, |c| rgb.iter().skip(c).step_by(3).map(|&v| v as usize));
+    let depth_stats = image_stats(frames, 1, 1.0, |_| millimetres.iter().map(|&v| v as usize));
+    Ok([image(name.clone(), colour, false, rgb_stats), image(format!("{name}_depth"), depth_png, true, depth_stats)])
+}
+
+/// Per-channel statistics of image pixels (`values(channel)`, integers), divided by `scale`, over
+/// `frames` frames: exact quantiles (linear between order statistics) from a histogram.
+fn image_stats<I: Iterator<Item = usize>>(
+    frames: usize,
+    channels: usize,
+    scale: f64,
+    values: impl Fn(usize) -> I,
+) -> Stats {
+    let mut s = Stats { count: frames, image: true, ..Default::default() };
+    for c in 0..channels {
+        let mut histogram = vec![0u64; 1 << 16];
+        for v in values(c) {
+            histogram[v] += 1;
+        }
+        let total: u64 = histogram.iter().sum();
+        let (mut sum, mut squares) = (0.0, 0.0);
+        for (v, &k) in histogram.iter().enumerate() {
+            sum += k as f64 * v as f64;
+            squares += k as f64 * (v as f64).powi(2);
+        }
+        let mean = sum / total as f64;
+        let nth = |rank: u64| {
+            let mut seen = 0;
+            histogram
+                .iter()
+                .position(|&k| {
+                    seen += k;
+                    seen > rank
+                })
+                .unwrap_or(0) as f64
+        };
+        s.min.push(nth(0) / scale);
+        s.max.push(nth(total - 1) / scale);
+        s.mean.push(mean / scale);
+        s.std.push((squares / total as f64 - mean * mean).max(0.0).sqrt() / scale);
+        for (q, (level, _)) in s.quantiles.iter_mut().zip(QUANTILES) {
+            let pos = level * (total - 1) as f64;
+            let (lo, hi) = (nth(pos.floor() as u64), nth(pos.ceil() as u64));
+            q.push((lo + (pos - pos.floor()) * (hi - lo)) / scale);
+        }
+    }
+    s
 }
 
 /// The goal, then every obstacle of `world`, `carried` (an obstacle's index and pose) where it
@@ -453,12 +606,27 @@ fn episodes_batch(
     for (f, feature) in features.iter().enumerate() {
         let names: Vec<&str> = episodes[0].stats[f].vectors().iter().map(|(n, _)| *n).collect();
         for (s, stat) in names.iter().enumerate() {
-            let mut b = ListBuilder::new(Float64Builder::new());
-            for e in episodes {
-                b.values().append_slice(e.stats[f].vectors()[s].1);
-                b.append(true);
-            }
-            columns.push((format!("stats/{feature}/{stat}"), Arc::new(b.finish())));
+            let array: ArrayRef = if episodes[0].stats[f].image {
+                // `[channels][1][1]`, as LeRobot writes image statistics.
+                let mut b = ListBuilder::new(ListBuilder::new(ListBuilder::new(Float64Builder::new())));
+                for e in episodes {
+                    for &v in e.stats[f].vectors()[s].1 {
+                        b.values().values().values().append_value(v);
+                        b.values().values().append(true);
+                        b.values().append(true);
+                    }
+                    b.append(true);
+                }
+                Arc::new(b.finish())
+            } else {
+                let mut b = ListBuilder::new(Float64Builder::new());
+                for e in episodes {
+                    b.values().append_slice(e.stats[f].vectors()[s].1);
+                    b.append(true);
+                }
+                Arc::new(b.finish())
+            };
+            columns.push((format!("stats/{feature}/{stat}"), array));
         }
         let mut count = ListBuilder::new(Int64Builder::new());
         for e in episodes {

@@ -31,6 +31,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
 | `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `robot.attach(&AttachedObject)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
+| `render` | `Camera { name, width, height, intrinsics, mount }`, `device.render(&worlds, &camera, &item_world, &q, &moved)` | Colour and depth images of worlds and the robot from fixed or link-mounted cameras, batched on the device. See [Camera images](#camera-images). |
 | `meshes` | `MeshModel::new(&robot)`, `meshes.clearance(&worlds, &item_world, &q)` | Clearances measured on the links' meshes rather than their spheres, on the CPU, for checking finished trajectories. See [Checking against meshes](#checking-against-meshes). |
 | `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `OccupancyMap`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
 
@@ -265,7 +266,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 94 tests; `--features lerobot` adds 5 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 86 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 98 tests; `--features lerobot` adds 6 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 90 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -310,6 +311,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
   - Collision-model files round-trip, SRDF pairs stop being checked, and `package://` paths resolve.
   - The UR5e, SO-101 and Panda (with fitted spheres) each plan 12 of 12 tabletop motions on the CPU and the GPU.
   - A Panda with fitted spheres, whose base spheres reach into the table it stands on, is collision-free on it and plans on every device, while a pin through its elbow still collides. Planting the base back into either device's world check fails the test.
+- **Camera images:** on every device, a camera looking straight down sees each obstacle kind's top at its depth (within 0.1 mm; a grid within its slack), a lying cylinder and capsule apart from upright ones, and each top shaded as lit from above; a sphere's silhouette ends where projection says. The robot's depths match an independent ray caster within 0.5 mm with identical silhouettes, a wrist camera follows forward kinematics, and moved obstacles move. GPU and CPU differ in under 0.5% of pixels of a cluttered scene. Exported PNGs decode to exactly the rendered colours and millimetres, with a carried box where it is. Planting cylinder caps facing the wrong way, an ignored moved obstacle, capsule ends at the centre, flat grid normals, a dropped camera rotation, missing robot spheres, little-endian depth, unscaled colour statistics, unrendered carried boxes, or depth in metres fails a test.
 - **Mesh clearances:**
   - Distances to every obstacle kind match closed forms to 0.1 mm, follow the joints, stay exact among several obstacles in any order, and read zero across a surface. Self clearance between links matches too, and a concave link is measured on its surface, not its hull.
   - Against a grid of a cube, clearance stays within the grid's documented slack. Held objects are checked as part of the robot, and the Panda's meshes load and read clear of its own table.
@@ -353,6 +355,10 @@ Short moves keep the arm on one IK branch: IK for the grasp and the place pose s
 
 Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, task, goal pose, timed trajectory, the gripper's opening per sample (1 open, 0 closed; reaches hold it open), and any obstacle it carries with its pose per sample. Two exporters write them, `npy::export` and `lerobot::export`. `examples/datagen.rs` uses one or the other. Generated from the same worlds, the two formats hold identical trajectories, labels, worlds and goals.
 
+### Camera images
+
+`device.render(&worlds, &camera, &item_world, &q, &moved)` draws a batch of views: the robot at each configuration in its world, with an obstacle moved to a pose per view where `moved` says so (a carried box). A `Camera` has a name, an image size, pinhole intrinsics (OpenCV axes) and a mount: fixed in the world (`Mount::World(pose)`) or on a robot link (`Mount::Link { link, offset }`, a wrist camera). Each pixel's ray meets the primitives exactly, distance grids by sphere tracing, and the robot as its collision spheres. It gets the depth along the camera's axis (0 where nothing is hit) and a colour: one per obstacle by its index in the world, grey for the robot, lit from above. The GPU (`render.wgsl`) and the CPU (`render.rs`) cast the same rays; a 128×128 view takes about 65 µs on either machine's GPU (15,500 views/s) and 165 µs on its CPU (6,000 views/s).
+
 ### Plain arrays (`npy::export`, default)
 
 | File | Contents |
@@ -370,25 +376,27 @@ Each `Demonstration` holds its origin (nominal, or recovery with its parent and 
 
 ### LeRobot v3.0 (optional bridge)
 
-Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The core library doesn't depend on them. `lerobot::export` writes a dataset that `lerobot.datasets.LeRobotDataset(repo_id, root=path)` loads directly. The layout is LeRobot's standard v3.0 set: frame data, episode metadata and tasks as parquet, plus `info.json` and normalization `stats.json`. Frame data and episode metadata are written as they are converted, each starting a new file past `ExportOptions::data_files_size_in_mb` (100 MB, LeRobot's default) and a new chunk every 1,000 files. Dataset statistics combine the episodes' as LeRobot's `aggregate_feature_stats` does, so nothing holds every frame and datasets can exceed memory. Each demonstration is one episode:
+Build with `--features lerobot`, which adds the Arrow/Parquet and PNG dependencies. The core library doesn't depend on them. `lerobot::export(root, &device, &worlds, &demos, &options)` writes a dataset that `lerobot.datasets.LeRobotDataset(repo_id, root=path)` loads directly. The layout is LeRobot's standard v3.0 set: frame data, episode metadata and tasks as parquet, plus `info.json` and normalization `stats.json`. Frame data and episode metadata are written as they are converted, each starting a new file past `ExportOptions::data_files_size_in_mb` (100 MB, LeRobot's default) and a new chunk every 1,000 files. Dataset statistics combine the episodes' as LeRobot's `aggregate_feature_stats` does, so nothing holds every frame and datasets can exceed memory. Each demonstration is one episode:
 
 | Feature | Contents |
 |---|---|
 | `observation.state` | joint positions, then the gripper's opening |
 | `action` | the next frame's state (absolute targets); the last frame repeats its own |
 | `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle where it is at that frame (so a carried box moves) as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of a grid's box, else (radius, radius, half height or half length) |
+| `observation.images.<camera>` | for each of `ExportOptions::cameras`, the colour image as an inline PNG `image` feature `[height, width, 3]`, rendered on the device with the carried box where it is |
+| `observation.images.<camera>_depth` | with `ExportOptions::depth_images`, the depth in millimetres as a 16-bit PNG `[height, width, 1]` flagged `is_depth_map`. Off by default: LeRobot 0.6's ACT and diffusion policies read every camera feature as colour |
 | `is_recovery`, `parent_episode_index`, `world_index` | extensions; LeRobot policies only read `observation.*` and `action`, so these are ignored in training |
 | `task` | the episode's task string, indexed in `meta/tasks.parquet` |
 
-`meta/batchplan.json` adds the worlds, the environment-state layout and each episode's origin. There are no camera features: the data is state-only until rendering is added.
+`meta/batchplan.json` adds the worlds, the environment-state layout, each episode's origin and the obstacle it carries. Image statistics are exact per channel (from histograms of every pixel), in [0, 1] for colour and millimetres for depth, nested `[channels][1][1]` as LeRobot nests them. `examples/datagen.rs --images [--depth]` records a front camera and a wrist camera beside the Panda's hand at 128×128.
 
-`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). Every check passed on three exports: 512 reach worlds (1,401 episodes, 65,186 frames), 2,048 reach worlds written with 1 MB files (5,693 episodes and 216,902 frames across 6 episode-metadata files), and 512 pick-and-place tasks (492 episodes, 89,753 frames, 18 tasks):
-- **Loading:** episodes, frames and task strings load as written, from every file.
+`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). Every check passed on four exports: 512 reach worlds (1,401 episodes, 65,186 frames), 2,048 reach worlds written with 1 MB files (5,693 episodes and 216,902 frames across 6 episode-metadata files), 512 pick-and-place tasks (492 episodes, 89,753 frames, 18 tasks), and 32 pick-and-place tasks with colour and depth images from two cameras:
+- **Loading:** episodes, frames and task strings load as written, from every file. Colour images load as `(3, H, W)` tensors in [0, 1], depth as `(1, H, W)` in millimetres, with statistics shaped `(C, 1, 1)`.
 - **Episodes:** boundaries are correct, and `action` is the next frame's state.
 - **Labels and stats:** recovery labels match `meta/batchplan.json`, and the normalization stats match the data.
 - **Action chunks:** chunks are padded correctly at episode ends.
 
-`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. A 50-step CPU run cut the loss from 44.2 (step 10) to 5.8 on the reach export, and from 45.4 to 5.8 on the pick-and-place one.
+`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. A 50-step CPU run cut the loss from 44.2 (step 10) to 5.8 on the reach export, and from 45.4 to 5.8 on the pick-and-place one. With the two cameras' colour images, ACT's image backbone trains on them too (loss 46.7 to 15.6 in 20 steps).
 
 ## Limits of the MVP
 
@@ -396,7 +404,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 - **Kinematics.** A closed loop must have exactly one actuated joint, and its passive joints must follow it by a quartic to within 0.5 mm of closure; other loops are rejected when loading. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
 - **Timing.** Time-optimal timing smooths a velocity- and acceleration-optimal profile, so it is not jerk-optimal. Trajectories end at rest.
 - **Kernel performance.** Small batches stay latency-bound on the GPU: one IK-and-plan query takes about 16 ms on the Radeon and 29 ms on the M4 Pro, mostly serial IK iterations. Shader modules without bounds checks would add 6–12% but need `unsafe`.
-- **Training data.** Demonstrations are state-only. Pick-and-place grasps upright boxes from above, one object size per held robot, and its episodes have no recoveries.
+- **Training data.** Images draw the robot as its collision spheres and the scene with flat colours, not photorealistic. Pick-and-place grasps upright boxes from above, one object size per held robot, and its episodes have no recoveries.
 
 ## License
 

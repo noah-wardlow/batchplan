@@ -27,13 +27,14 @@ openusd-schemas = { version = "=0.7.0", optional = true, features = ["geom"] }
 arrow-array = { version = "60", optional = true }
 arrow-schema = { version = "60", optional = true }
 parquet = { version = "60", optional = true, default-features = false, features = ["arrow", "snap"] }
+png = { version = "0.18", optional = true }
 
 [features]
 default = ["gpu"]
 # Run batches on GPUs through wgpu. Without it, only `Device::cpu` works, for boards without one.
 gpu = ["dep:wgpu", "dep:pollster"]
 # Export demonstrations as LeRobot v3.0 datasets (adds the Arrow/Parquet dependencies).
-lerobot = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+lerobot = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet", "dep:png"]
 # Load robots and scenes from OpenUSD (adds the pure-Rust openusd crates).
 usd = ["dep:openusd", "dep:openusd-schemas"]
 

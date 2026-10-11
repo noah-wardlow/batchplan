@@ -14,6 +14,7 @@ use rayon::prelude::*;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
+use crate::render::{self, Camera, Images, View};
 use crate::robot::{Fk, JointKind, Robot};
 use crate::sdf::{self, DepthImage, Layout, Occupancy, SdfGrid};
 use crate::spline;
@@ -813,6 +814,10 @@ impl Backend for CpuBackend {
     fn integrate(&self, grid: &Layout, log_odds: &mut [i8], image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
         self.pool.install(|| sdf::integrate(grid, log_odds, image, robot));
         Ok(())
+    }
+
+    fn render(&self, worlds: &Worlds, camera: &Camera, views: &[View]) -> Result<Images> {
+        Ok(self.pool.install(|| render::render(camera, worlds.as_slice(), views)))
     }
 }
 

@@ -522,7 +522,9 @@ fn lerobot_exports_describe_grids_by_their_boxes() {
     let (center, rotation) = (Vec3::new(0.5, 0.2, 0.0), Quat::from_rotation_z(0.5));
     let worlds = vec![World { obstacles: vec![Obstacle::Sdf { grid: grid.clone(), center, rotation }] }];
     let root = scratch("lerobot");
-    batchplan::lerobot::export(&root, &robot, &worlds, &[still_demo(&robot, 0)], &Default::default()).unwrap();
+    let device = Device::cpu(&robot).unwrap();
+    let uploaded = device.upload(&worlds).unwrap();
+    batchplan::lerobot::export(&root, &device, &uploaded, &[still_demo(&robot, 0)], &Default::default()).unwrap();
     let file = std::fs::File::open(root.join("data/chunk-000/file-000.parquet")).unwrap();
     let batch = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap().next().unwrap().unwrap();
     let column = batch.column_by_name("observation.environment_state").unwrap();

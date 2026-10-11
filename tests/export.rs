@@ -140,6 +140,18 @@ mod lerobot {
 
     use super::*;
 
+    /// The export on a CPU device.
+    fn write(
+        root: &Path,
+        robot: &Robot,
+        worlds: &[World],
+        demos: &[Demonstration],
+        o: &ExportOptions,
+    ) -> batchplan::error::Result<()> {
+        let device = Device::cpu(robot).unwrap();
+        export(root, &device, &device.upload(worlds).unwrap(), demos, o)
+    }
+
     /// Every row of every parquet file under `dir`, in file order, with the file's (chunk, file).
     fn read_all(dir: &Path) -> Vec<(usize, usize, RecordBatch)> {
         let mut files = vec![];
@@ -183,7 +195,7 @@ mod lerobot {
         // Enough episodes to pass 1 MB of frames and of episode metadata several times over.
         let demos: Vec<Demonstration> = fixture.iter().cycle().take(1500).cloned().collect();
         let root = scratch("lerobot-large");
-        export(&root, &robot, &worlds, &demos, &ExportOptions { data_files_size_in_mb: 1, ..Default::default() })
+        write(&root, &robot, &worlds, &demos, &ExportOptions { data_files_size_in_mb: 1, ..Default::default() })
             .unwrap();
         let episodes = read_all(&root.join("meta/episodes"));
         let data = read_all(&root.join("data"));
@@ -256,7 +268,7 @@ mod lerobot {
         });
         let start_of = |e: usize| worlds[demos[e].world as usize].obstacles[1].pose().position.z;
         let root = scratch("lerobot-tasks");
-        export(&root, &robot, &worlds, &demos, &ExportOptions::default()).unwrap();
+        write(&root, &robot, &worlds, &demos, &ExportOptions::default()).unwrap();
         let tasks = read_parquet_rows(&root.join("meta/tasks.parquet"));
         assert_eq!(tasks, 2, "two distinct tasks");
         // Frames in order, whatever batches the reader groups them in.
@@ -286,6 +298,107 @@ mod lerobot {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn camera_images_are_stored_as_rendered() {
+        let (robot, worlds, fixture) = demos(0.05);
+        let mut demos: Vec<Demonstration> = fixture.into_iter().take(2).collect();
+        // The first episode lifts its world's obstacle 1 by a centimetre a frame.
+        let start = worlds[demos[0].world as usize].obstacles[1].pose();
+        demos[0].carried = Some(Carried {
+            obstacle: 1,
+            poses: (0..demos[0].trajectory.len())
+                .map(|f| Pose { position: start.position + Vec3::Z * 0.01 * f as f32, ..start })
+                .collect(),
+        });
+        let eye = Vec3::new(1.4, 0.0, 0.8);
+        let forward = (Vec3::new(0.4, 0.0, 0.1) - eye).normalize();
+        let right = forward.cross(Vec3::Z).normalize();
+        let pose = Pose {
+            position: eye,
+            rotation: glam::Quat::from_mat3(&glam::Mat3::from_cols(right, forward.cross(right), forward)),
+        };
+        let camera = Camera {
+            name: "front".into(),
+            width: 48,
+            height: 32,
+            intrinsics: Intrinsics { fx: 40.0, fy: 40.0, cx: 23.5, cy: 15.5 },
+            mount: Mount::World(pose),
+        };
+        let root = scratch("lerobot-images");
+        let device = Device::cpu(&robot).unwrap();
+        let uploaded = device.upload(&worlds).unwrap();
+        let options = ExportOptions { cameras: vec![camera.clone()], depth_images: true, ..Default::default() };
+        export(&root, &device, &uploaded, &demos, &options).unwrap();
+        let info: serde_json::Value =
+            serde_json::from_reader(File::open(root.join("meta/info.json")).unwrap()).unwrap();
+        let feature = &info["features"]["observation.images.front"];
+        assert_eq!((feature["dtype"].as_str(), &feature["shape"]), (Some("image"), &serde_json::json!([32, 48, 3])));
+        let depth_feature = &info["features"]["observation.images.front_depth"];
+        assert_eq!(depth_feature["info"], serde_json::json!({"is_depth_map": true, "depth_unit": "mm"}));
+        // Each frame's PNGs hold what the device renders.
+        let expected: Vec<Images> = demos
+            .iter()
+            .map(|d| {
+                let moved: Vec<_> =
+                    (0..d.trajectory.len()).map(|f| d.carried.as_ref().map(|c| (c.obstacle, c.poses[f]))).collect();
+                device
+                    .render(&uploaded, &camera, &vec![d.world; d.trajectory.len()], &d.trajectory.positions, &moved)
+                    .unwrap()
+            })
+            .collect();
+        let decode = |bytes: &[u8]| {
+            let mut reader = png::Decoder::new(std::io::Cursor::new(bytes.to_vec())).read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut buf).unwrap();
+            buf.truncate(frame.buffer_size());
+            buf
+        };
+        let pixels = 48 * 32;
+        let (mut checked, mut sum) = (0, 0.0);
+        for (_, _, batch) in read_all(&root.join("data")) {
+            let (episode, frame) = (ints(&batch, "episode_index"), ints(&batch, "frame_index"));
+            let images = |name: &str| {
+                let column =
+                    batch.column_by_name(name).unwrap().as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+                let bytes = column
+                    .column_by_name("bytes")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .unwrap();
+                (0..bytes.len()).map(|r| decode(bytes.value(r))).collect::<Vec<_>>()
+            };
+            let (colour, depth) = (images("observation.images.front"), images("observation.images.front_depth"));
+            for row in 0..batch.num_rows() {
+                let (e, f) = (episode[row] as usize, frame[row] as usize);
+                let want = &expected[e];
+                assert_eq!(
+                    &colour[row][..],
+                    &want.rgb[f * pixels * 3..(f + 1) * pixels * 3],
+                    "episode {e} frame {f} colour"
+                );
+                let millimetres: Vec<u16> = depth[row].chunks(2).map(|b| u16::from_be_bytes([b[0], b[1]])).collect();
+                let want_mm: Vec<u16> =
+                    want.depth[f * pixels..(f + 1) * pixels].iter().map(|m| (m * 1000.0).round() as u16).collect();
+                assert_eq!(millimetres, want_mm, "episode {e} frame {f} depth");
+                sum += colour[row].iter().step_by(3).map(|&v| v as f64).sum::<f64>();
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, demos.iter().map(|d| d.trajectory.len()).sum::<usize>());
+        // Colour statistics are per channel, nested as LeRobot nests them, in [0, 1].
+        let stats: serde_json::Value =
+            serde_json::from_reader(File::open(root.join("meta/stats.json")).unwrap()).unwrap();
+        let red = stats["observation.images.front"]["mean"][0][0][0].as_f64().unwrap();
+        let expected_red = sum / (checked * pixels) as f64 / 255.0;
+        assert!((red - expected_red).abs() < 1e-9, "mean red {red}, not {expected_red}");
+        assert!(
+            stats["observation.images.front_depth"]["max"][0][0][0].as_f64().unwrap() > 500.0,
+            "depth in millimetres"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn read_parquet_rows(path: &Path) -> usize {
         SerializedFileReader::new(File::open(path).unwrap()).unwrap().metadata().file_metadata().num_rows() as usize
     }
@@ -294,7 +407,7 @@ mod lerobot {
     fn export_writes_a_consistent_v3_dataset() {
         let (robot, worlds, demos) = demos(0.05);
         let root = scratch("lerobot");
-        export(&root, &robot, &worlds, &demos, &ExportOptions::default()).unwrap();
+        write(&root, &robot, &worlds, &demos, &ExportOptions::default()).unwrap();
 
         let info: serde_json::Value =
             serde_json::from_reader(File::open(root.join("meta/info.json")).unwrap()).unwrap();
@@ -315,14 +428,14 @@ mod lerobot {
         assert_eq!(data.metadata().num_row_groups(), demos.len(), "one row group per episode");
 
         // Exporting over an existing dataset is refused.
-        assert!(export(&root, &robot, &worlds, &demos, &ExportOptions::default()).is_err());
+        assert!(write(&root, &robot, &worlds, &demos, &ExportOptions::default()).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn export_rejects_fractional_frame_rates() {
         let (robot, worlds, demos) = demos(0.03);
-        let err = export(&scratch("lerobot-fps"), &robot, &worlds, &demos, &ExportOptions::default()).unwrap_err();
+        let err = write(&scratch("lerobot-fps"), &robot, &worlds, &demos, &ExportOptions::default()).unwrap_err();
         assert!(err.to_string().contains("frames per second"), "{err}");
     }
 }

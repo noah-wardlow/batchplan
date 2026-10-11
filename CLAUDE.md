@@ -10,10 +10,10 @@ batchplan is a Rust library for batched, collision-aware robot motion generation
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 94 tests; without the env var, GPU tests skip silently when no adapter exists
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 5 export tests
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 98 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 6 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
-cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, pick_place, robot, trajectory, mjcf, usd, sdf, meshes, rrt, attach, threads)
+cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, pick_place, render, robot, trajectory, mjcf, usd, sdf, meshes, rrt, attach, threads)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot,usd | --no-default-features]   # zero warnings everywhere; CI denies them (lints in Cargo.toml)
 cargo build --release --lib --target aarch64-unknown-linux-gnu --no-default-features     # the CPU-only robot build CI checks
@@ -43,7 +43,7 @@ uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python "lerobot
 These decisions are settled. Keep to them unless the user decides otherwise.
 
 - **Batch-first.** Every query covers many items. Items reference worlds by index (`item_world`, `IkProblem.world`, `PlanProblem.world`), so one call spans many scenes.
-- **Worlds live on the device.** `Device::upload(&[World]) -> Worlds` prepares worlds once (GPU buffers, CPU rotation matrices); every algorithm takes `&Worlds`. Each backend's `upload` returns its own form, which `Worlds::prepared` hands back; `Device` checks that worlds were uploaded to it. Exporters take `&[World]` (`worlds.as_slice()`). `Device::with_robot` shares the device id (and the GPU context or thread pool), so worlds stay valid when the robot changes, as with `Robot::attach`; attached objects are fixed links appended after every robot link.
+- **Worlds live on the device.** `Device::upload(&[World]) -> Worlds` prepares worlds once (GPU buffers, CPU rotation matrices); every algorithm takes `&Worlds`. Each backend's `upload` returns its own form, which `Worlds::prepared` hands back; `Device` checks that worlds were uploaded to it. `npy::export` takes `&[World]` (`worlds.as_slice()`); `lerobot::export` takes the `Device` and its `Worlds`, because it renders camera images. `Device::with_robot` shares the device id (and the GPU context or thread pool), so worlds stay valid when the robot changes, as with `Robot::attach`; attached objects are fixed links appended after every robot link.
 - **One public handle, two hidden implementations.** `Device` (`device.rs`) is the only way to run batched work. `CpuBackend` and `GpuBackend` sit behind the crate-private `Backend` trait. Never make `Backend` public, and never add a way to call a backend that bypasses `Device`.
 - **`Device` validates every batch** (array shapes, world indices, the device the worlds were uploaded to) before either backend sees it, so malformed input is an `Err` on both devices. New `Device` entry points must go through `check_batch`.
 - **Algorithms are separate modules over shared types.** `ik`, `trajopt`, `timing`, `datagen`, `npy` and `lerobot` are plain functions taking `&Device`, `&Worlds` and the `types` (`Pose`, `JointPaths`, `JointTrajectory`, `Solved`). There are no planner plugins and no runtime configuration.
@@ -65,6 +65,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 - The GPU kernels (`src/kernels.wgsl` plus the per-robot code `robot_wgsl` writes in `gpu.rs`) and `src/cpu.rs` implement the same math function by function: `fk`, `collision`, `rot_log`, `chol6`, `ik_step`, the trajectory passes (`traj_costs`/`traj_cost`, `traj_search`, `traj_samples`/`traj_sample_grad`, `traj_grad`, `lbfgs_direction`). `spline.rs` holds the B-spline basis that `basis` in WGSL mirrors; `world.rs` and `sdf.rs` (`grid_distance`) hold the obstacle distances that `obstacle_distance` and `grid_distance` mirror.
 - `cpu.rs` keeps index loops on purpose so the two read side by side.
 - Any change to the math lands in both files in the same change. The parity tests in `tests/gpu.rs` and `tests/device.rs` catch drift.
+- Rendering has its own twin: `src/render.wgsl` mirrors `render.rs` (`shade`, `ray_sphere`, `intersect`, `ray_box`, `ray_cylinder`, `ray_capsule`, `ray_grid`); both kernels.wgsl and render.wgsl include `grid.wgsl` for grid sampling. The host prepares each view (`Camera::views`: the camera's pose, the robot's sphere centres, a moved obstacle), so the renderer needs no robot kernels. Colours (`PALETTE`, `ROBOT`, `BACKGROUND`) and grid-tracing constants are generated into the shader from `render.rs`.
 - Grid building has its own twin: `src/grids.wgsl` mirrors `sdf.rs`'s `DepthImage::classify`, `depth_occupancy`, `integrate`, `squared_edt`/`Line`/`meet` and `finish`. Builders (`SdfGrid::from_points`/`from_depth`, `OccupancyMap::integrate`/`grid`) take a `Device` and go through `Backend::grid_values` and `Backend::integrate`.
   - The distance transform is integer arithmetic, so both devices build identical grids from the same occupancy (`every_device_builds_the_same_grids_from_occupancy`).
   - Each value is finished by a table the host builds (`finishing_table`, sized by the grid's squared diagonal, hence `MAX_DIAGONAL`), so the GPU never needs `sqrt` to match the CPU.
