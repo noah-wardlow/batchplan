@@ -243,3 +243,75 @@ fn free_and_ball_joints_become_one_axis_joints() {
     let expected = DAffine3::from_translation(DVec3::new(0.0, 0.0, 0.7)) * DAffine3::from_rotation_z(0.4);
     assert!(difference(affine(base), expected) < 1e-6, "{base:?}");
 }
+
+#[test]
+fn nonlinear_joint_equalities_follow_their_polynomial_on_every_device() {
+    let dir = scratch("mjcf-polycoef");
+    let path = dir.join("rocker.xml");
+    std::fs::write(
+        &path,
+        r#"<mujoco model="rocker">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="crank" pos="0 0 0.3">
+      <joint name="crank" axis="0 1 0" range="-1 1"/>
+      <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.03"/>
+      <body name="rocker" pos="0.3 0 0">
+        <joint name="rocker" axis="0 1 0" range="-3 3"/>
+        <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.03"/>
+      </body>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="rocker" joint2="crank" polycoef="0.1 0.5 0.3 -0.2 0.1"/>
+  </equality>
+</mujoco>"#,
+    )
+    .unwrap();
+    let robot = Robot::load(&path, &RobotOptions { ee_link: Some("rocker".into()), ..Default::default() }).unwrap();
+    assert_eq!(robot.joint_names(), ["crank"]);
+    let curve = |x: f64| 0.1 + x * (0.5 + x * (0.3 + x * (-0.2 + x * 0.1)));
+    for k in 0..=20 {
+        let x = -1.0 + k as f64 / 10.0;
+        let rocker = affine(robot.link_pose(&[x as f32], "rocker").unwrap());
+        // Both hinges turn about y, so the rocker's angle is the crank's plus its curve.
+        let expected = DMat3::from_rotation_y(x + curve(x));
+        let off = (rocker.matrix3 - expected).to_cols_array().iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(off < 1e-5, "rocker off by {off} at {x}");
+    }
+    // The collision gradient carries the curve's slope: it matches finite differences on the CPU,
+    // and the GPU matches the CPU.
+    let scene = [World {
+        obstacles: vec![Obstacle::Cuboid {
+            center: Vec3::new(0.55, 0.0, 0.1),
+            half_extents: Vec3::new(0.2, 0.2, 0.05),
+            rotation: glam::Quat::IDENTITY,
+        }],
+    }];
+    let w = CollisionWeights { world: 1000.0, self_collision: 0.0, margin: 0.05, self_margin: 0.0 };
+    let q: Vec<f32> = (0..400).map(|k| -1.0 + 2.0 * k as f32 / 399.0).collect();
+    let cpu = Device::cpu(&robot).unwrap();
+    let reference = cpu.evaluate(&cpu.upload(&scene).unwrap(), &vec![0; 400], &q, &w).unwrap();
+    let cost = |x: f32| cpu.evaluate(&cpu.upload(&scene).unwrap(), &[0], &[x], &w).unwrap().cost[0];
+    let mut checked = 0;
+    for (i, &x) in q.iter().enumerate().filter(|&(i, _)| reference.cost[i] > 1e-3) {
+        let fd = |h: f32| (cost(x + h) - cost(x - h)) / (2.0 * h);
+        let g = reference.grad[i];
+        let err = (fd(2e-4) - g).abs().min((fd(5e-5) - g).abs()) / g.abs().max(1.0);
+        assert!(err < 2e-2, "gradient {g} against finite differences at {x}");
+        checked += 1;
+    }
+    assert!(checked > 20, "only {checked} configurations touch the box");
+    match Device::gpu(&robot) {
+        Ok(gpu) => {
+            let e = gpu.evaluate(&gpu.upload(&scene).unwrap(), &vec![0; 400], &q, &w).unwrap();
+            for (i, x) in q.iter().enumerate() {
+                let scale = reference.grad[i].abs().max(1.0);
+                assert!((e.grad[i] - reference.grad[i]).abs() / scale < 1e-3, "gradient at {x}");
+                assert!((e.cost[i] - reference.cost[i]).abs() / reference.cost[i].max(1.0) < 1e-3, "cost at {x}");
+            }
+        }
+        Err(e) if std::env::var("BATCHPLAN_REQUIRE_GPU").is_err() => eprintln!("skipping GPU: {e}"),
+        Err(e) => panic!("no GPU: {e}"),
+    }
+}

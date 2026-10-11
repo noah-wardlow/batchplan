@@ -237,10 +237,10 @@ fn collision<const GRADIENT: bool>(
     for i in (0..robot.links.len()).rev() {
         let link = &robot.links[i];
         match link.joint {
-            JointKind::Revolute { dof, multiplier, .. } => {
-                grad[dof] += multiplier * fk.axis[i].dot(moment[i] - pos[i].cross(force[i]));
+            JointKind::Revolute { dof, curve, .. } => {
+                grad[dof] += fk.rate(i, &curve) * fk.axis[i].dot(moment[i] - pos[i].cross(force[i]));
             }
-            JointKind::Prismatic { dof, multiplier, .. } => grad[dof] += multiplier * fk.axis[i].dot(force[i]),
+            JointKind::Prismatic { dof, curve, .. } => grad[dof] += fk.rate(i, &curve) * fk.axis[i].dot(force[i]),
             JointKind::Fixed => {}
         }
         if let Some(p) = link.parent {
@@ -327,7 +327,8 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     let ee = robot.ee_link;
     let jac = &mut s.jac[..];
     jac.fill(0.0);
-    for (i, dof, m) in robot.chain(ee) {
+    for (i, dof) in robot.chain(ee) {
+        let m = fk.rate(i, &robot.links[i].joint.actuation().expect("chain links have moving joints").1);
         let jp = m * fk.dpoint(i, fk.pos[ee]);
         let jo = if fk.slides[i] { Vec3::ZERO } else { m * fk.axis[i] * o.rot_weight };
         for (r, v) in [jp.x, jp.y, jp.z, jo.x, jo.y, jo.z].into_iter().enumerate() {

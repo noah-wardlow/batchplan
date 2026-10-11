@@ -81,12 +81,13 @@ shader_struct! {
 
 shader_struct! {
     /// One kinematic link: joint origin rotation columns and translation, and joint axis. A moving
-    /// joint's value is `axis.w * q[dof] + trans.w` (multiplier and offset, for mimic joints).
+    /// joint's value is its curve of `q[dof]`, `trans.w + axis.w x + curve.x x² + curve.y x³ +
+    /// curve.z x⁴` (`x` itself unless it mimics another joint).
     /// `bound` is the sphere (center in the link frame, radius) around the link's collision spheres
     /// and their self-collision buffers, which are spheres `first_sphere..first_sphere + n_spheres`.
     /// The tree itself is written into the generated kernels (`robot_wgsl`).
     GpuLink => Link {
-        c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, bound: Vec4,
+        c0: Vec4, c1: Vec4, c2: Vec4, trans: Vec4, axis: Vec4, curve: Vec4, bound: Vec4,
         first_sphere: u32, n_spheres: u32, pad0: u32, pad1: u32,
     }
 }
@@ -125,9 +126,16 @@ fn robot_wgsl(robot: &Robot) -> String {
     let links = &robot.links;
     let (dof, ee) = (robot.dof(), robot.ee_link);
     let mut w = format!("const MAX_DOF: u32 = {dof}u;\nconst JAC_LEN: u32 = {}u;\n", 6 * dof);
+    // Joint motion per unit of the actuated joint: the multiplier for a linear curve, the curve's
+    // slope at the current configuration (computed by fk) for others.
+    let nonlinear = |i: usize| links[i].joint.actuation().is_some_and(|(_, c)| !c.is_linear());
+    let rate = |i: usize| if nonlinear(i) { format!("rate_{i}") } else { format!("links[{i}u].axis.w") };
     for i in 0..links.len() {
         let _ = writeln!(w, "var<private> rot_{i}: mat3x3<f32>;\nvar<private> pos_{i}: vec3<f32>;");
         let _ = writeln!(w, "var<private> force_{i}: vec3<f32>;\nvar<private> moment_{i}: vec3<f32>;");
+        if nonlinear(i) {
+            let _ = writeln!(w, "var<private> rate_{i}: f32;");
+        }
     }
 
     w += "\n// Every link's frame, root first.\nfn fk() {\n";
@@ -137,15 +145,26 @@ fn robot_wgsl(robot: &Robot) -> String {
         let _ = writeln!(w, "    {{\n        let l = links[{i}u];");
         let _ = writeln!(w, "        let jrot = {prot}mat3x3<f32>(l.c0.xyz, l.c1.xyz, l.c2.xyz);");
         let _ = writeln!(w, "        let jpos = {prot}l.trans.xyz{ppos};");
+        if let Some((dof, _)) = l.joint.actuation() {
+            if nonlinear(i) {
+                let _ = writeln!(w, "        let x = q[{dof}u];");
+                w +=
+                    "        let v = l.trans.w + x * (l.axis.w + x * (l.curve.x + x * (l.curve.y + x * l.curve.z)));\n";
+                let _ = writeln!(
+                    w,
+                    "        rate_{i} = l.axis.w + x * (2.0 * l.curve.x + x * (3.0 * l.curve.y + x * 4.0 * l.curve.z));"
+                );
+            } else {
+                let _ = writeln!(w, "        let v = l.axis.w * q[{dof}u] + l.trans.w;");
+            }
+        }
         let _ = match l.joint {
-            JointKind::Revolute { dof, .. } => writeln!(
-                w,
-                "        rot_{i} = jrot * rodrigues(l.axis.xyz, l.axis.w * q[{dof}u] + l.trans.w);\n        pos_{i} = jpos;"
-            ),
-            JointKind::Prismatic { dof, .. } => writeln!(
-                w,
-                "        rot_{i} = jrot;\n        pos_{i} = jpos + jrot * l.axis.xyz * (l.axis.w * q[{dof}u] + l.trans.w);"
-            ),
+            JointKind::Revolute { .. } => {
+                writeln!(w, "        rot_{i} = jrot * rodrigues(l.axis.xyz, v);\n        pos_{i} = jpos;")
+            }
+            JointKind::Prismatic { .. } => {
+                writeln!(w, "        rot_{i} = jrot;\n        pos_{i} = jpos + jrot * l.axis.xyz * v;")
+            }
             JointKind::Fixed => writeln!(w, "        rot_{i} = jrot;\n        pos_{i} = jpos;"),
         };
         w += "    }\n";
@@ -157,9 +176,8 @@ fn robot_wgsl(robot: &Robot) -> String {
     w += "\n// The end effector's Jacobian into `jac` (6 x MAX_DOF, row-major; rotation rows scaled by\n";
     w += "// P.rot_weight), its moving joints root first, mimic joints adding into their leader.\n";
     w += "fn ee_jacobian() {\n    for (var k = 0u; k < JAC_LEN; k++) {\n        jac[k] = 0.0;\n    }\n";
-    for (i, d, _) in robot.chain(ee) {
-        let _ =
-            writeln!(w, "    {{\n        let m = links[{i}u].axis.w;\n        let a = rot_{i} * links[{i}u].axis.xyz;");
+    for (i, d) in robot.chain(ee) {
+        let _ = writeln!(w, "    {{\n        let m = {};\n        let a = rot_{i} * links[{i}u].axis.xyz;", rate(i));
         if matches!(links[i].joint, JointKind::Prismatic { .. }) {
             w += "        let jp = m * a;\n        let jo = vec3<f32>(0.0);\n";
         } else {
@@ -327,12 +345,12 @@ fn collision(
         let _ = match l.joint {
             JointKind::Revolute { dof, .. } => writeln!(
                 w,
-                "        grad[{dof}u] += links[{i}u].axis.w * dot(rot_{i} * links[{i}u].axis.xyz, moment_{i} - cross(pos_{i}, force_{i}));"
+                "        grad[{dof}u] += {} * dot(rot_{i} * links[{i}u].axis.xyz, moment_{i} - cross(pos_{i}, force_{i}));",
+                rate(i)
             ),
-            JointKind::Prismatic { dof, .. } => writeln!(
-                w,
-                "        grad[{dof}u] += links[{i}u].axis.w * dot(rot_{i} * links[{i}u].axis.xyz, force_{i});"
-            ),
+            JointKind::Prismatic { dof, .. } => {
+                writeln!(w, "        grad[{dof}u] += {} * dot(rot_{i} * links[{i}u].axis.xyz, force_{i});", rate(i))
+            }
             JointKind::Fixed => Ok(()),
         };
         if let Some(p) = l.parent {
@@ -404,17 +422,19 @@ impl RobotBuffers {
             .iter()
             .enumerate()
             .map(|(i, l)| {
-                let (axis, multiplier, offset) = match l.joint {
-                    JointKind::Fixed => (glam::Vec3::ZERO, 0.0, 0.0),
-                    JointKind::Revolute { axis, multiplier, offset, .. }
-                    | JointKind::Prismatic { axis, multiplier, offset, .. } => (axis, multiplier, offset),
+                let (axis, c) = match l.joint {
+                    JointKind::Fixed => (glam::Vec3::ZERO, [0.0; 5]),
+                    JointKind::Revolute { axis, curve, .. } | JointKind::Prismatic { axis, curve, .. } => {
+                        (axis, curve.0)
+                    }
                 };
                 GpuLink {
                     c0: v4(l.origin.rot.x_axis, 0.0),
                     c1: v4(l.origin.rot.y_axis, 0.0),
                     c2: v4(l.origin.rot.z_axis, 0.0),
-                    trans: v4(l.origin.trans, offset),
-                    axis: v4(axis, multiplier),
+                    trans: v4(l.origin.trans, c[0]),
+                    axis: v4(axis, c[1]),
+                    curve: [c[2], c[3], c[4], 0.0],
                     bound: robot.link_bounds[i],
                     first_sphere: robot.sphere_ranges[i][0],
                     n_spheres: robot.sphere_ranges[i][1],

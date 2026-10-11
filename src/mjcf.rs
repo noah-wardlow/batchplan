@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat3, Quat, Vec3};
 
-use crate::description::{Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape};
+use crate::description::{Curve, Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape};
 use crate::robot::Transform;
 
 /// The world body's link name.
@@ -422,13 +422,13 @@ impl Builder<'_> {
         let follower = eq.attr("joint1").context("joint equality without joint1")?;
         let leader = eq.attr("joint2").context("joint equalities fixing a joint are not supported; lock it instead")?;
         let c = Attrs(eq.attrs.clone()).floats("polycoef")?.unwrap_or(vec![0.0, 1.0, 0.0, 0.0, 0.0]);
-        ensure!(c.len() == 5 && c[2..].iter().all(|&v| v == 0.0), "only linear joint equalities are supported");
+        ensure!(c.len() == 5, "joint equality polycoef needs 5 numbers");
         let joint = self
             .joints
             .iter_mut()
             .find(|j| j.name == follower)
             .with_context(|| format!("unknown joint '{follower}'"))?;
-        joint.mimic = Some(Mimic { joint: leader.to_string(), multiplier: c[1], offset: c[0] });
+        joint.mimic = Some(Mimic { joint: leader.to_string(), curve: Curve([c[0], c[1], c[2], c[3], c[4]]) });
         Ok(())
     }
 }

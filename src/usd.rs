@@ -24,7 +24,9 @@ use openusd::sdf::Value;
 use openusd::usd::{Prim, PrimPredicate, SchemaBase, SchemaKind, Stage, TimeCode};
 use openusd_schemas::geom::{Imageable, Xformable};
 
-use crate::description::{Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape, TriMesh};
+use crate::description::{
+    Curve, Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape, TriMesh,
+};
 use crate::mjcf::WORLD;
 use crate::robot::Transform;
 
@@ -519,7 +521,7 @@ fn mimic(prim: &Prim, names: &HashMap<String, String>, kind: JointType, meters: 
         let offset = scalar(prim, "newton:mimicCoef0")?.unwrap_or(0.0);
         let offset = if kind == JointType::Prismatic { offset * meters } else { offset.to_radians() };
         let multiplier = scalar(prim, "newton:mimicCoef1")?.unwrap_or(1.0);
-        return Ok(Some(Mimic { joint, multiplier: multiplier as f32, offset: offset as f32 }));
+        return Ok(Some(Mimic { joint, curve: Curve::linear(multiplier as f32, offset as f32) }));
     }
     for api in prim.api_schemas()? {
         let Some(instance) = api.as_str().strip_prefix("PhysxMimicJointAPI:") else { continue };
@@ -528,7 +530,7 @@ fn mimic(prim: &Prim, names: &HashMap<String, String>, kind: JointType, meters: 
         };
         let gearing = scalar(prim, &format!("physxMimicJoint:{instance}:gearing"))?.unwrap_or(1.0);
         let offset = scalar(prim, &format!("physxMimicJoint:{instance}:offset"))?.unwrap_or(0.0);
-        return Ok(Some(Mimic { joint, multiplier: -gearing as f32, offset: -offset as f32 }));
+        return Ok(Some(Mimic { joint, curve: Curve::linear(-gearing as f32, -offset as f32) }));
     }
     Ok(None)
 }

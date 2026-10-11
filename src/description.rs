@@ -84,12 +84,70 @@ impl JointDesc {
     }
 }
 
-/// `value = multiplier * value(joint) + offset`.
+/// `value = curve(value(joint))`.
 #[derive(Clone, Debug)]
 pub(crate) struct Mimic {
     pub(crate) joint: String,
-    pub(crate) multiplier: f32,
-    pub(crate) offset: f32,
+    pub(crate) curve: Curve,
+}
+
+/// A polynomial of degree at most four, `c[0] + c[1] x + ... + c[4] x⁴`: how a mimic joint follows
+/// its leader (linear for URDF and USD mimics, quartic for MJCF joint equalities and closed loops).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Curve(pub(crate) [f32; 5]);
+
+impl Curve {
+    pub(crate) const IDENTITY: Curve = Curve([0.0, 1.0, 0.0, 0.0, 0.0]);
+
+    pub(crate) fn linear(multiplier: f32, offset: f32) -> Curve {
+        Curve([offset, multiplier, 0.0, 0.0, 0.0])
+    }
+
+    #[inline]
+    pub(crate) fn value(&self, x: f32) -> f32 {
+        let c = self.0;
+        c[0] + x * (c[1] + x * (c[2] + x * (c[3] + x * c[4])))
+    }
+
+    /// d value / dx.
+    #[inline]
+    pub(crate) fn slope(&self, x: f32) -> f32 {
+        let c = self.0;
+        c[1] + x * (2.0 * c[2] + x * (3.0 * c[3] + x * 4.0 * c[4]))
+    }
+
+    /// `(value(x), slope(x))`, with a shortcut for linear curves (most joints).
+    #[inline]
+    pub(crate) fn value_and_slope(&self, x: f32) -> (f32, f32) {
+        let c = self.0;
+        if c[2] == 0.0 && c[3] == 0.0 && c[4] == 0.0 { (c[1] * x + c[0], c[1]) } else { (self.value(x), self.slope(x)) }
+    }
+
+    pub(crate) fn is_linear(&self) -> bool {
+        self.0[2..] == [0.0; 3]
+    }
+
+    /// `self(inner(x))`, or `None` when that has degree above four.
+    pub(crate) fn after(&self, inner: &Curve) -> Option<Curve> {
+        let mul = |a: &[f64], b: &[f64]| {
+            let mut out = vec![0.0; a.len() + b.len() - 1];
+            for (i, x) in a.iter().enumerate() {
+                for (j, y) in b.iter().enumerate() {
+                    out[i + j] += x * y;
+                }
+            }
+            out
+        };
+        let inner: Vec<f64> = inner.0.iter().map(|&c| c as f64).collect();
+        let (mut sum, mut power) = (vec![0.0; 17], vec![1.0]);
+        for &c in &self.0 {
+            for (s, p) in sum.iter_mut().zip(&power) {
+                *s += c as f64 * p;
+            }
+            power = mul(&power, &inner);
+        }
+        sum[5..].iter().all(|&c| c == 0.0).then(|| Curve(std::array::from_fn(|i| sum[i] as f32)))
+    }
 }
 
 #[derive(Clone, Debug)]

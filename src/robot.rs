@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::description::{self, Geometry, JointDesc, JointType, LinkDesc, RobotDescription, Shape, TriMesh};
+use crate::description::{self, Curve, Geometry, JointDesc, JointType, LinkDesc, RobotDescription, Shape, TriMesh};
 use crate::error::{self, Error, ensure_input, input};
 use crate::spheres::{self, SphereGeometry, SphereOptions};
 use crate::types::Pose;
@@ -36,23 +36,21 @@ impl Transform {
 }
 
 /// How a link moves relative to its parent. A moving joint is driven by actuated joint `dof`:
-/// its value is `multiplier * q[dof] + offset` (1 and 0 unless it mimics another joint).
+/// its value is `curve(q[dof])` (`q[dof]` itself unless it mimics another joint).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum JointKind {
     Fixed,
-    Revolute { dof: usize, axis: Vec3, multiplier: f32, offset: f32 },
-    Prismatic { dof: usize, axis: Vec3, multiplier: f32, offset: f32 },
+    Revolute { dof: usize, axis: Vec3, curve: Curve },
+    Prismatic { dof: usize, axis: Vec3, curve: Curve },
 }
 
 impl JointKind {
-    /// The actuated joint that drives this one, and how strongly.
+    /// The actuated joint that drives this one, and how.
     #[inline]
-    pub(crate) fn actuation(&self) -> Option<(usize, f32)> {
+    pub(crate) fn actuation(&self) -> Option<(usize, Curve)> {
         match *self {
             JointKind::Fixed => None,
-            JointKind::Revolute { dof, multiplier, .. } | JointKind::Prismatic { dof, multiplier, .. } => {
-                Some((dof, multiplier))
-            }
+            JointKind::Revolute { dof, curve, .. } | JointKind::Prismatic { dof, curve, .. } => Some((dof, curve)),
         }
     }
 }
@@ -227,6 +225,9 @@ pub(crate) struct Fk {
     pub(crate) axis: Vec<Vec3>,
     /// Whether each link slides on a prismatic joint.
     pub(crate) slides: Vec<bool>,
+    /// Each moving link's joint motion per unit of its actuated joint: its curve's slope there.
+    /// Read through [`Fk::rate`].
+    rate: Vec<f32>,
 }
 
 impl Fk {
@@ -236,7 +237,15 @@ impl Fk {
             pos: vec![Vec3::ZERO; links],
             axis: vec![Vec3::ZERO; links],
             slides: vec![false; links],
+            rate: vec![0.0; links],
         }
+    }
+
+    /// Link `i`'s joint motion per unit of its actuated joint: the multiplier of a linear curve, the
+    /// slope at this configuration for others (only those are recorded).
+    #[inline]
+    pub(crate) fn rate(&self, i: usize, curve: &Curve) -> f32 {
+        if curve.is_linear() { curve.0[1] } else { self.rate[i] }
     }
 
     /// Derivative of a point rigidly attached downstream of link `i`'s joint, per unit of joint motion.
@@ -485,12 +494,12 @@ impl Robot {
         Pose { position: fk.pos[link], rotation: Quat::from_mat3(&fk.rot[link]) }
     }
 
-    /// The moving joints at or above `link`, root first: (link index, actuated joint, multiplier).
+    /// The moving joints at or above `link`, root first: (link index, actuated joint).
     #[inline]
-    pub(crate) fn chain(&self, link: usize) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
+    pub(crate) fn chain(&self, link: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.links[link].chain.iter().map(|&i| {
-            let (dof, m) = self.links[i].joint.actuation().expect("chain links have moving joints");
-            (i, dof, m)
+            let (dof, _) = self.links[i].joint.actuation().expect("chain links have moving joints");
+            (i, dof)
         })
     }
 
@@ -505,19 +514,22 @@ impl Robot {
     // the caller lands in (a 20% swing on the CPU benchmark otherwise).
     #[inline]
     pub(crate) fn fk_into(&self, q: &[f32], fk: &mut Fk) {
-        let (rot, pos, axes, slides) = (&mut fk.rot[..], &mut fk.pos[..], &mut fk.axis[..], &mut fk.slides[..]);
+        let (rot, pos, axes) = (&mut fk.rot[..], &mut fk.pos[..], &mut fk.axis[..]);
+        let (slides, rates) = (&mut fk.slides[..], &mut fk.rate[..]);
         for (i, link) in self.links.iter().enumerate() {
             let (prot, ppos) = link.parent.map_or((Mat3::IDENTITY, Vec3::ZERO), |p| (rot[p], pos[p]));
             let jrot = prot * link.origin.rot;
             let jpos = prot * link.origin.trans + ppos;
-            (rot[i], pos[i], axes[i], slides[i]) = match link.joint {
-                JointKind::Fixed => (jrot, jpos, Vec3::ZERO, false),
-                JointKind::Revolute { dof, axis, multiplier, offset } => {
-                    (jrot * Mat3::from_axis_angle(axis, multiplier * q[dof] + offset), jpos, jrot * axis, false)
+            (rot[i], pos[i], axes[i], slides[i], rates[i]) = match link.joint {
+                JointKind::Fixed => (jrot, jpos, Vec3::ZERO, false, 0.0),
+                JointKind::Revolute { dof, axis, curve } => {
+                    let (angle, rate) = curve.value_and_slope(q[dof]);
+                    (jrot * Mat3::from_axis_angle(axis, angle), jpos, jrot * axis, false, rate)
                 }
-                JointKind::Prismatic { dof, axis, multiplier, offset } => {
+                JointKind::Prismatic { dof, axis, curve } => {
                     let a = jrot * axis;
-                    (jrot, jpos + a * (multiplier * q[dof] + offset), a, true)
+                    let (offset, rate) = curve.value_and_slope(q[dof]);
+                    (jrot, jpos + a * offset, a, true, rate)
                 }
             };
         }
@@ -586,6 +598,38 @@ fn expand_compound_joints(desc: &RobotDescription) -> Result<RobotDescription> {
     Ok(out)
 }
 
+/// The part of `range` (a leader's) over which `curve` stays within `limits` (a mimic's): exact for
+/// linear curves; for others, the longest such stretch among 1,024 samples. `None` if there is none.
+fn within(curve: &Curve, range: (f32, f32), limits: (f32, f32)) -> Option<(f32, f32)> {
+    if curve.is_linear() {
+        let (m, off) = (curve.0[1], curve.0[0]);
+        let (a, b) = ((limits.0 - off) / m, (limits.1 - off) / m);
+        return Some((range.0.max(a.min(b)), range.1.min(a.max(b))));
+    }
+    const N: usize = 1024;
+    let at = |k: usize| range.0 + (range.1 - range.0) * k as f32 / N as f32;
+    let ok = |k: usize| (limits.0..=limits.1).contains(&curve.value(at(k)));
+    let (mut best, mut start) = (None::<(usize, usize)>, None);
+    for k in 0..=N {
+        match (ok(k), start) {
+            (true, None) => start = Some(k),
+            (false, Some(s)) => {
+                if best.is_none_or(|(a, b)| k - 1 - s > b - a) {
+                    best = Some((s, k - 1));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start
+        && best.is_none_or(|(a, b)| N - s > b - a)
+    {
+        best = Some((s, N));
+    }
+    best.map(|(a, b)| (at(a), at(b)))
+}
+
 /// The kinematic tree below the base link, with actuated joints numbered in breadth-first order.
 fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
     let expanded = expand_compound_joints(desc)?;
@@ -613,15 +657,19 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         let j = joint_index.get(name.as_str()).with_context(|| format!("cannot lock unknown joint '{name}'"))?;
         ensure!(desc.joints[*j].kind != JointType::Fixed, "cannot lock fixed joint '{name}'");
     }
-    // Each moving joint resolved to the joint that drives it: (driver, multiplier, offset).
-    let driver = |start: usize| -> Result<(usize, f32, f32)> {
-        let (mut j, mut m, mut off) = (start, 1.0, 0.0);
+    // Each moving joint resolved to the joint that drives it, and the curve from that joint's value
+    // to its own.
+    let driver = |start: usize| -> Result<(usize, Curve)> {
+        let (mut j, mut curve) = (start, Curve::IDENTITY);
         for _ in 0..desc.joints.len() {
-            let Some(mimic) = &desc.joints[j].mimic else { return Ok((j, m, off)) };
+            let Some(mimic) = &desc.joints[j].mimic else { return Ok((j, curve)) };
             let leader = *joint_index
                 .get(mimic.joint.as_str())
                 .with_context(|| format!("joint '{}' mimics unknown joint '{}'", desc.joints[j].name, mimic.joint))?;
-            (j, m, off) = (leader, m * mimic.multiplier, mimic.multiplier * off + mimic.offset);
+            curve = curve.after(&mimic.curve).with_context(|| {
+                format!("joint '{}' follows its driver by a polynomial of degree above four", desc.joints[start].name)
+            })?;
+            j = leader;
         }
         bail!("mimic joints form a cycle through '{}'", desc.joints[start].name)
     };
@@ -680,10 +728,10 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         let parent = link_index[&joint.parent];
         let mut origin = joint.origin;
         let kind = if moving(j) {
-            let (leader, multiplier, offset) = driver(j)?;
+            let (leader, curve) = driver(j)?;
             let prismatic = joint.kind == JointType::Prismatic;
             if let Some(&locked) = o.lock_joints.get(&desc.joints[leader].name) {
-                let value = multiplier * locked + offset;
+                let value = curve.value(locked);
                 let motion = if prismatic {
                     Transform { rot: Mat3::IDENTITY, trans: joint.axis * value }
                 } else {
@@ -701,20 +749,28 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
                 if leader != j {
                     // The leader's range keeps the mimic joint within its own limits too.
                     if joint.kind != JointType::Continuous {
-                        let (a, b) = ((joint.lower - offset) / multiplier, (joint.upper - offset) / multiplier);
-                        lower[dof] = lower[dof].max(a.min(b));
-                        upper[dof] = upper[dof].min(a.max(b));
+                        (lower[dof], upper[dof]) = within(&curve, (lower[dof], upper[dof]), (joint.lower, joint.upper))
+                            .with_context(|| {
+                                format!(
+                                    "joint '{}' leaves its limits for every value of '{}'",
+                                    joint.name, desc.joints[leader].name
+                                )
+                            })?;
                     }
-                    // Its derivatives scale by the multiplier too.
-                    max_velocity[dof] = max_velocity[dof].min(joint.max_velocity / multiplier.abs());
-                    max_acceleration[dof] = max_acceleration[dof].min(joint.max_acceleration / multiplier.abs());
-                    max_jerk[dof] = max_jerk[dof].min(joint.max_jerk / multiplier.abs());
+                    // Its derivatives scale by the curve's steepest slope over the leader's range
+                    // (exactly, for linear mimics; acceleration ignores the curvature term).
+                    let steepest = (0..=64)
+                        .map(|k| curve.slope(lower[dof] + (upper[dof] - lower[dof]) * k as f32 / 64.0).abs())
+                        .fold(0.0f32, f32::max);
+                    max_velocity[dof] = max_velocity[dof].min(joint.max_velocity / steepest);
+                    max_acceleration[dof] = max_acceleration[dof].min(joint.max_acceleration / steepest);
+                    max_jerk[dof] = max_jerk[dof].min(joint.max_jerk / steepest);
                 }
                 let axis = joint.axis;
                 if prismatic {
-                    JointKind::Prismatic { dof, axis, multiplier, offset }
+                    JointKind::Prismatic { dof, axis, curve }
                 } else {
-                    JointKind::Revolute { dof, axis, multiplier, offset }
+                    JointKind::Revolute { dof, axis, curve }
                 }
             }
         } else {

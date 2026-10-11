@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
 
-use crate::description::{Geometry, JointDesc, JointType, LinkDesc, Mimic, RobotDescription, Shape};
+use crate::description::{Curve, Geometry, JointDesc, JointType, LinkDesc, Mimic, RobotDescription, Shape};
 use crate::robot::Transform;
 
 pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescription> {
@@ -63,8 +63,7 @@ pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescrip
                 max_jerk: limit(j.limit.jerk),
                 mimic: j.mimic.as_ref().map(|m| Mimic {
                     joint: m.joint.clone(),
-                    multiplier: m.multiplier.unwrap_or(1.0) as f32,
-                    offset: m.offset.unwrap_or(0.0) as f32,
+                    curve: Curve::linear(m.multiplier.unwrap_or(1.0) as f32, m.offset.unwrap_or(0.0) as f32),
                 }),
             })
         })
