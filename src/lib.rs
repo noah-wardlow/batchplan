@@ -57,7 +57,7 @@ pub use error::Error;
 pub use ik::{IkOptions, IkProblem, IkResult, solve_ik};
 pub use robot::{AttachedObject, CollisionModel, Robot, RobotOptions};
 pub use rrt::{RrtOptions, RrtProblem, RrtResult};
-pub use sdf::{Intrinsics, Occlusion, SdfGrid, SdfOptions};
+pub use sdf::{DepthImage, Intrinsics, Occlusion, OccupancyMap, SdfGrid, SdfOptions};
 pub use shortcut::ShortcutOptions;
 pub use spheres::{SphereGeometry, SphereOptions};
 pub use timing::{JointState, Trajectory};

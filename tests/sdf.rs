@@ -1,5 +1,6 @@
 //! Signed distance grids: interpolation and its gradients, the conservative offset, the mesh,
-//! point-cloud and depth-image builders, and scene meshes loaded as grids.
+//! point-cloud and depth-image builders, robot masking, fused occupancy maps, and scene meshes
+//! loaded as grids.
 
 #[path = "../examples/common/mod.rs"]
 mod common;
@@ -274,6 +275,11 @@ impl TableScene {
         Self { camera, ball: (Vec3::new(0.05, 0.1, 0.1), 0.1) }
     }
 
+    /// `depth` as seen by this scene's camera.
+    fn image<'a>(&self, depth: &'a [f32], width: usize, intrinsics: Intrinsics) -> DepthImage<'a> {
+        DepthImage { depth, width, intrinsics, camera: self.camera }
+    }
+
     /// z depth per pixel; `with_ball` adds the ball.
     fn render(&self, width: usize, height: usize, k: Intrinsics, with_ball: bool) -> Vec<f32> {
         let mut depth = vec![];
@@ -330,7 +336,7 @@ fn depth_images_of_any_resolution_become_grids() {
     for (width, height, k) in [(8, 8, tof), (640, 480, vga)] {
         let depth = scene.render(width, height, k, false);
         for behind in [Occlusion::Occupied, Occlusion::Free] {
-            let grid = SdfGrid::from_depth(&depth, width, k, scene.camera, behind, &o).unwrap();
+            let grid = SdfGrid::from_depth(&scene.image(&depth, width, k), None, behind, &o).unwrap();
             check_table(&grid, behind, &o, &mut rng);
         }
     }
@@ -338,7 +344,7 @@ fn depth_images_of_any_resolution_become_grids() {
     let depth = scene.render(640, 480, vga, true);
     let (c, r) = scene.ball;
     for (behind, inside) in [(Occlusion::Occupied, -0.05), (Occlusion::Free, 0.05)] {
-        let grid = SdfGrid::from_depth(&depth, 640, vga, scene.camera, behind, &o).unwrap();
+        let grid = SdfGrid::from_depth(&scene.image(&depth, 640, vga), None, behind, &o).unwrap();
         let above = grid.distance(c + Vec3::new(0.0, 0.0, r + 0.05)).0;
         assert!(above <= 0.05 + 2e-3 && above > 0.05 - occupancy_slack(o.voxel), "{above} above the ball");
         let center = grid.distance(c).0;
@@ -349,12 +355,12 @@ fn depth_images_of_any_resolution_become_grids() {
     // along the world's -y).
     let mut holes = scene.render(8, 8, tof, false);
     holes.iter_mut().step_by(2).for_each(|z| *z = 0.0);
-    let grid = SdfGrid::from_depth(&holes, 8, tof, scene.camera, Occlusion::Occupied, &o).unwrap();
+    let grid = SdfGrid::from_depth(&scene.image(&holes, 8, tof), None, Occlusion::Occupied, &o).unwrap();
     assert!(grid.distance(Vec3::new(0.054, -0.054, -0.05)).0 > 0.0, "below a pixel without a reading");
     assert!(grid.distance(Vec3::new(0.163, -0.054, -0.05)).0 < 0.0, "below a pixel with one");
     let all_holes = vec![f32::NAN; 64];
-    assert!(SdfGrid::from_depth(&all_holes, 8, tof, scene.camera, Occlusion::Free, &o).is_err());
-    assert!(SdfGrid::from_depth(&depth, 7, vga, scene.camera, Occlusion::Free, &o).is_err(), "rows of 7");
+    assert!(SdfGrid::from_depth(&scene.image(&all_holes, 8, tof), None, Occlusion::Free, &o).is_err());
+    assert!(SdfGrid::from_depth(&scene.image(&depth, 7, vga), None, Occlusion::Free, &o).is_err(), "rows of 7");
 }
 
 /// An L-shaped prism 10 cm tall whose convex hull also fills the notch at x, y in (0.1, 0.2).
@@ -518,4 +524,110 @@ fn deserialized_grids_are_checked_like_built_ones() {
     assert!(serde_json::from_value::<SdfGrid>(json.clone()).is_err());
     json["values"].as_array_mut().unwrap().push(0x7c00.into()); // an infinite half float
     assert!(serde_json::from_value::<SdfGrid>(json).is_err());
+}
+
+#[test]
+fn fused_maps_keep_what_stays_and_clear_what_leaves() {
+    let scene = TableScene::new();
+    let vga = Intrinsics { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5 };
+    let (with, without) = (scene.render(640, 480, vga, true), scene.render(640, 480, vga, false));
+    let mut map = OccupancyMap::new(Vec3::new(-0.3, -0.3, -0.1), Vec3::new(0.3, 0.3, 0.3), 0.01).unwrap();
+    let (c, r) = scene.ball;
+    let top = c + Vec3::new(0.0, 0.0, r);
+    let above = top + Vec3::new(0.0, 0.0, 0.05);
+    map.integrate(&scene.image(&with, 640, vga), None).unwrap();
+    assert!(map.occupancy(top).unwrap() > 0.5, "the ball's top is seen");
+    assert!(map.grid(Occlusion::Free).unwrap().distance(above).0 < 0.06, "the ball is in the grid");
+    // Seen through twice, the ball's top still holds (0.85 - 2 x 0.4); a third time clears it.
+    for frame in 1..=3 {
+        map.integrate(&scene.image(&without, 640, vga), None).unwrap();
+        assert_eq!(map.occupancy(top).unwrap() > 0.5, frame < 3, "after {frame} frames without the ball");
+    }
+    let grid = map.grid(Occlusion::Free).unwrap();
+    assert!(grid.distance(above).0 > 0.2, "the ball is gone: {}", grid.distance(above).0);
+    // The table stays; below it nothing was observed, which the grid treats as told.
+    assert!(map.occupancy(Vec3::new(0.1, 0.1, 0.0)).unwrap() > 0.5, "the table");
+    let below = Vec3::new(0.1, 0.1, -0.05);
+    assert_eq!(map.occupancy(below), None);
+    assert!(map.grid(Occlusion::Occupied).unwrap().distance(below).0 < 0.0);
+    assert!(map.grid(Occlusion::Free).unwrap().distance(below).0 > 0.0);
+    // A map ending inside the ball (its last voxels at x = 0) takes no hits from the readings
+    // beyond its edge.
+    let mut part = OccupancyMap::new(Vec3::new(-0.3, -0.3, -0.1), Vec3::new(-0.005, 0.3, 0.3), 0.01).unwrap();
+    part.integrate(&scene.image(&with, 640, vga), None).unwrap();
+    assert!(part.occupancy(Vec3::new(0.0, 0.1, 0.2)).unwrap() < 0.5, "the map's edge");
+}
+
+/// A camera at `eye` looking at `target`, in OpenCV axes (x right, y down, z forward).
+fn look_at(eye: Vec3, target: Vec3) -> Pose {
+    let forward = (target - eye).normalize();
+    let right = forward.cross(Vec3::Z).normalize();
+    let down = forward.cross(right);
+    Pose { position: eye, rotation: Quat::from_mat3(&glam::Mat3::from_cols(right, down, forward)) }
+}
+
+#[test]
+fn robot_masking_drops_the_arm_and_keeps_what_is_in_front_of_it() {
+    let robot = common::panda().unwrap();
+    let q = robot.default_q().to_vec();
+    // The robot's spheres in the world, from its link poses.
+    let spheres: Vec<(Vec3, f32)> = robot
+        .collision_model()
+        .spheres
+        .iter()
+        .flat_map(|(link, s)| {
+            let pose = robot.link_pose(&q, link).unwrap();
+            s.iter().map(move |s| (pose.rotation * Vec3::new(s[0], s[1], s[2]) + pose.position, s[3]))
+        })
+        .collect();
+    // A box between the camera and the arm.
+    let (box_center, box_half) = (Vec3::new(0.9, 0.0, 0.5), Vec3::splat(0.05));
+    let camera = look_at(Vec3::new(1.6, 0.0, 0.6), Vec3::new(0.3, 0.0, 0.4));
+    let k = Intrinsics { fx: 525.0, fy: 525.0, cx: 319.5, cy: 239.5 };
+    let depth: Vec<f32> = (0..640 * 480)
+        .map(|i| {
+            let ray = Vec3::new(((i % 640) as f32 - k.cx) / k.fx, ((i / 640) as f32 - k.cy) / k.fy, 1.0);
+            let dir = camera.rotation * ray;
+            let mut t = f32::INFINITY;
+            for &(c, r) in &spheres {
+                let oc = camera.position - c;
+                let (b, cc) = (dir.dot(oc), oc.length_squared() - r * r);
+                let disc = b * b - dir.length_squared() * cc;
+                if disc >= 0.0 {
+                    t = t.min((-b - disc.sqrt()) / dir.length_squared());
+                }
+            }
+            // The box by slabs.
+            let inv = dir.recip();
+            let (t0, t1) =
+                ((box_center - box_half - camera.position) * inv, (box_center + box_half - camera.position) * inv);
+            let (near, far) = (t0.min(t1).max_element(), t0.max(t1).min_element());
+            if near <= far && near > 0.0 {
+                t = t.min(near);
+            }
+            if t.is_finite() { t } else { 0.0 }
+        })
+        .collect();
+    let image = DepthImage { depth: &depth, width: 640, intrinsics: k, camera };
+    let o = SdfOptions { voxel: 0.01, padding: 0.15 };
+    let face = box_center + Vec3::new(box_half.x, 0.0, 0.0);
+    // Unmasked, the arm is an obstacle.
+    let raw = SdfGrid::from_depth(&image, None, Occlusion::Free, &o).unwrap();
+    assert!(spheres.iter().any(|&(c, r)| raw.distance(c).0 < r), "the arm should read as an obstacle");
+    // Masked, its space is free while the box in front of it stays.
+    let mask = image.robot_depth(&robot, &q, 0.02).unwrap();
+    let hidden = (0..depth.len()).filter(|&i| depth[i] > 0.0 && depth[i] < mask[i] - 0.1).count();
+    assert!(hidden > 1000, "the box should hide part of the arm: {hidden} pixels");
+    let masked = SdfGrid::from_depth(&image, Some(&mask), Occlusion::Free, &o).unwrap();
+    for &(c, r) in &spheres {
+        assert!(masked.distance(c).0 > r, "an obstacle at the arm: {} at {c}", masked.distance(c).0);
+    }
+    assert!(masked.distance(face).0 <= 0.0, "the box in front of the arm is lost: {}", masked.distance(face).0);
+    // A fused map clears space in front of the arm and adds nothing at it.
+    let mut map = OccupancyMap::new(Vec3::new(-0.2, -0.6, 0.0), Vec3::new(1.2, 0.6, 1.2), 0.02).unwrap();
+    map.integrate(&image, Some(&mask)).unwrap();
+    for &(c, _) in &spheres {
+        assert!(map.occupancy(c).is_none_or(|p| p < 0.5), "the map holds the arm at {c}");
+    }
+    assert!(map.occupancy(face).unwrap() > 0.5, "the map lost the box");
 }

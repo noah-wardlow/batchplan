@@ -31,7 +31,7 @@ The kernels use only core features: 32-bit floats, with no subgroups, atomics or
 | `npy` | `npy::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as plain `.npy` arrays. |
 | `lerobot` (feature `lerobot`) | `lerobot::export(root, &robot, &worlds, &demos, &ExportOptions)` | Writes demonstrations as a LeRobot v3.0 dataset. |
 | `robot`, `spheres` | `Robot::load(path, &RobotOptions)`, `robot.attach(&AttachedObject)`, `CollisionModel::{load, save}` | Robots from URDF, MJCF or OpenUSD (feature `usd`), with mimic joints. Collision spheres are fitted to the links' geometry, or loaded from a committed collision-model file. See [Robots](#robots). |
-| `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
+| `world`, `sdf`, `types` | `World::load(path, &SdfOptions)`, `World`/`Obstacle`, `SdfGrid::{from_mesh, from_points, from_depth}`, `OccupancyMap`, `Pose`, `JointPaths`, `JointTrajectory`, `Solved` | Box, sphere, cylinder and capsule obstacles, and signed distance grids for anything else; static geometry from MJCF or USD scenes. See [Distance grids](#distance-grids). Shared data types with documented row-major shapes. |
 
 Design choices:
 - **Batch-first.** Every call covers many seeds, problems and worlds. Problems reference worlds by index, so one call can span thousands of different scenes.
@@ -131,16 +131,18 @@ Test robots live in `assets/` with their licences ([assets/README.md](assets/REA
 
 ## Distance grids
 
-An `Obstacle::Sdf` places a signed distance grid in a world: distances on a regular grid in its own frame, stored as half floats and interpolated trilinearly on both devices. Worlds can share a grid; a device stores it once, and exports write it once (`worlds.json` holds `{"grids", "worlds"}`, with each `sdf` obstacle naming its grid by index). Three builders make grids, laid out by `SdfOptions` (1 cm voxels and 15 cm padding by default):
+An `Obstacle::Sdf` places a signed distance grid in a world: distances on a regular grid in its own frame, stored as half floats and interpolated trilinearly on both devices. Worlds can share a grid; a device stores it once, and exports write it once (`worlds.json` holds `{"grids", "worlds"}`, with each `sdf` obstacle naming its grid by index). Three builders make grids, laid out by `SdfOptions` (1 cm voxels and 15 cm padding by default), and an occupancy map fuses depth frames into them:
 - **`SdfGrid::from_mesh`:** exact signed distances of a closed triangle mesh, with inside and outside decided by parry3d's pseudo-normals. Open or non-manifold meshes have no inside and are refused with the reason.
 - **`SdfGrid::from_points`:** voxels holding a point are solid. A closed surface's inside reads as free beyond its shell.
-- **`SdfGrid::from_depth`:** one depth image, its pinhole intrinsics and the camera pose. Each voxel is classified by projecting its center into the image, so an 8×8 time-of-flight array gives solid surfaces, not 64 points; dense images also mark the voxel of every pixel. The rule for unobserved space is explicit: space outside the image and along pixels without a reading is free, and space behind observed surfaces is free or solid as `Occlusion` says.
+- **`SdfGrid::from_depth`:** one `DepthImage` (readings, pinhole intrinsics and the camera pose). Each voxel is classified by projecting its center into the image, so an 8×8 time-of-flight array gives solid surfaces, not 64 points; dense images also mark the voxel of every pixel. The rule for unobserved space is explicit: space outside the image and along pixels without a reading is free, and space behind observed surfaces is free or solid as `Occlusion` says.
+- **Masking the robot.** A camera that sees the arm would make it an obstacle to itself. `DepthImage::robot_depth(&robot, &q, padding)` gives each pixel's depth to the robot's collision spheres at `q`, grown by `padding` (ray-sphere hits, searched only in each sphere's pixel box). Passed to `from_depth` or `OccupancyMap::integrate`, readings on the robot are not obstacles: space in front of the arm is free, space behind it follows `Occlusion`, and anything between the camera and the arm stays.
+- **`OccupancyMap`:** depth frames fused over time on a fixed world grid, as OctoMap fuses them. Each voxel holds the log-odds that it is occupied: a hit adds 0.85, a miss subtracts 0.4, clamped to [−2, 3.5]. Something seen once and then seen through three times is free again; voxels behind readings, outside the image or beyond the map are not updated. `grid(unknown)` builds a distance grid, with voxels never observed solid or free as `unknown` says.
 
 Grids err toward collision. Each grid point holds at most the true signed distance (for points and depth images, the distance to the solid voxels as cubes), lowered by half a voxel diagonal: the most trilinear interpolation can overestimate by. So a built grid never reads farther from an obstacle than its geometry, and a wall thinner than a voxel still blocks. Without the offset, interpolating exact samples across a 2 mm wall reads several millimeters of clearance inside it; a test pins both. The price is growth: up to a voxel diagonal for meshes, and about three voxels for points and depth images.
 
 Outside its box, a grid reads the value at the nearest box point plus the distance to it. That is exact for collision checking when the box reaches at least the collision margin plus the robot's largest sphere radius beyond every surface, which is what `SdfOptions::padding` is for.
 
-`examples/depth.rs` renders a 640×480 depth image of a tabletop scene, builds a grid from it (172×192×72 points in 33 ms on the M4 Pro), and plans Panda reaches with the grid as the only obstacle. IK reaches 48 of 64 grasp targets; the others lie in the camera's shadow, which `Occlusion::Occupied` treats as solid. All 48 plan, and their closest approach to the true scene is 34 mm. The arm is not in the rendered image; a real camera's pixels on the robot must be masked out first.
+`examples/depth.rs` renders a 640×480 depth image of a tabletop scene, builds a grid from it (172×192×72 points in 33 ms on the M4 Pro), and plans Panda reaches with the grid as the only obstacle. IK reaches 48 of 64 grasp targets; the others lie in the camera's shadow, which `Occlusion::Occupied` treats as solid. All 48 plan, and their closest approach to the true scene is 34 mm. The arm is not in the rendered image; with a real camera, pass `robot_depth` to mask it out.
 
 ## Executable trajectories
 
@@ -215,7 +217,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 80 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 72 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 82 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 74 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -244,8 +246,9 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
   - The GPU agrees with the CPU to 3e-7 m (Metal and RADV), including two grids in one world, one of them shared with another world and stored after a grid with an odd number of points.
   - Mesh grids never read farther than the true distance and at most a voxel diagonal nearer. Point grids never read beyond their solid voxels. Open and non-manifold meshes are refused.
   - Depth images from an 8×8 time-of-flight array and from a 640×480 camera both reproduce the table under them, follow both occlusion rules, and leave unobserved space free.
+  - A fused map keeps the table, holds a ball seen through twice and clears it the third time, leaves space never observed to the rule given, and takes no hits from readings beyond its edge. Masked out of a camera's image, the Panda's spheres read free in grids and maps alike while a box in front of the arm stays solid.
   - MJCF scene meshes collide as their convex hulls; USD ones as `physics:approximation` says. Exports write each grid once, and LeRobot's environment state describes a grid by its box.
-  - Planting a wrong grid offset or half-float order in the kernel, a wrong gradient axis, a missing conservative offset, a depth builder that only marks pixel points, or ignored hull semantics fails a test.
+  - Planting a wrong grid offset or half-float order in the kernel, a wrong gradient axis, a missing conservative offset, a depth builder that only marks pixel points, ignored hull semantics, a map that never clears, readings clamped onto a map's edge, or a mask that ignores the arm or drops what is in front of it fails a test.
 - **Trajectories:**
   - Planned trajectories stay within velocity, acceleration and jerk limits along their whole length, reach the binding limit, and start and end exactly at rest.
   - The analytic velocity and acceleration match finite differences.
@@ -323,7 +326,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 ## Limits of the MVP
 
-- **Geometry.** The robot is modeled as spheres only. Distance grids are built on the CPU, from one depth image at a time (no fusion over frames), and depth images must have the robot masked out by the caller.
+- **Geometry.** The robot is modeled as spheres only. Distance grids and occupancy maps are built on the CPU.
 - **Kinematics.** A closed loop must have exactly one actuated joint, and its passive joints must follow it by a quartic to within 0.5 mm of closure; other loops are rejected when loading. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
 - **Timing.** Time-optimal timing smooths a velocity- and acceleration-optimal profile, so it is not jerk-optimal. Trajectories end at rest.
 - **Kernel performance.** Small batches stay latency-bound on the GPU: one IK-and-plan query takes about 16 ms on the Radeon and 29 ms on the M4 Pro, mostly serial IK iterations. Shader modules without bounds checks would add 6–12% but need `unsafe`.

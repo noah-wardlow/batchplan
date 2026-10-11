@@ -4,8 +4,8 @@
 //!
 //! cargo run --release --example depth -- [--cpu]
 //!
-//! The robot is not in the rendered scene. A real camera sees the arm too, and its pixels must be
-//! masked out before building the grid.
+//! The robot is not in the rendered scene. A real camera sees the arm too: pass
+//! `DepthImage::robot_depth` to `SdfGrid::from_depth` so its pixels do not become obstacles.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -65,7 +65,8 @@ fn main() -> Result<()> {
     println!("rendered {WIDTH}x{HEIGHT} depth, {seen} pixels hit the scene");
 
     let t = Instant::now();
-    let grid = SdfGrid::from_depth(&depth, WIDTH, k, camera, Occlusion::Occupied, &SdfOptions::default())?;
+    let image = DepthImage { depth: &depth, width: WIDTH, intrinsics: k, camera };
+    let grid = SdfGrid::from_depth(&image, None, Occlusion::Occupied, &SdfOptions::default())?;
     let [nx, ny, nz] = grid.dims();
     println!("grid {nx}x{ny}x{nz} at {} m in {:.0} ms", grid.voxel(), t.elapsed().as_secs_f64() * 1e3);
     let observed =

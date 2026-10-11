@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::description::TriMesh;
+use crate::robot::Robot;
 use crate::types::Pose;
 
 /// Grids with more points are refused; 2^26 half floats take 128 MiB.
@@ -55,6 +56,114 @@ pub enum Occlusion {
     Free,
     /// Everything behind an observed surface, as seen from the camera, is solid.
     Occupied,
+}
+
+/// One depth image: z distances in meters, row by row, `width` pixels per row, with zero, negative
+/// or non-finite values for pixels without a reading. `camera` places the camera (x right, y down,
+/// z forward, as in OpenCV) in the frame grids and maps are built in.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthImage<'a> {
+    pub depth: &'a [f32],
+    pub width: usize,
+    pub intrinsics: Intrinsics,
+    pub camera: Pose,
+}
+
+impl DepthImage<'_> {
+    fn check(&self) -> Result<()> {
+        ensure_input!(
+            self.width > 0 && self.depth.len().is_multiple_of(self.width),
+            "{} depth values do not form rows of {}",
+            self.depth.len(),
+            self.width
+        );
+        let Intrinsics { fx, fy, cx, cy } = self.intrinsics;
+        ensure_input!(
+            fx > 0.0 && fy > 0.0 && cx.is_finite() && cy.is_finite(),
+            "invalid intrinsics {:?}",
+            self.intrinsics
+        );
+        Ok(())
+    }
+
+    fn height(&self) -> usize {
+        self.depth.len() / self.width
+    }
+
+    fn reading(&self, i: usize) -> Option<f32> {
+        Some(self.depth[i]).filter(|z| z.is_finite() && *z > 0.0)
+    }
+
+    /// The pixel `p` (world frame) projects to, and its depth; `None` behind or beside the camera.
+    fn project(&self, p: Vec3) -> Option<(usize, f32)> {
+        let Intrinsics { fx, fy, cx, cy } = self.intrinsics;
+        let c = self.camera.rotation.inverse() * (p - self.camera.position);
+        if c.z <= 0.0 {
+            return None;
+        }
+        let (u, v) = ((fx * c.x / c.z + cx + 0.5).floor(), (fy * c.y / c.z + cy + 0.5).floor());
+        (u >= 0.0 && v >= 0.0 && u < self.width as f32 && v < self.height() as f32)
+            .then(|| (v as usize * self.width + u as usize, c.z))
+    }
+
+    /// Each reading as a world point.
+    fn points(&self) -> impl Iterator<Item = (usize, Vec3)> + '_ {
+        let Intrinsics { fx, fy, cx, cy } = self.intrinsics;
+        (0..self.depth.len()).filter_map(move |i| {
+            let z = self.reading(i)?;
+            let (u, v) = ((i % self.width) as f32, (i / self.width) as f32);
+            Some((i, self.camera.rotation * Vec3::new((u - cx) / fx * z, (v - cy) / fy * z, z) + self.camera.position))
+        })
+    }
+
+    /// Each pixel's depth to `robot` at configuration `q`, its collision spheres grown by
+    /// `padding`; infinite where the ray misses the robot. Pass it to [`SdfGrid::from_depth`] or
+    /// [`OccupancyMap::integrate`] so readings of the robot itself do not become obstacles.
+    pub fn robot_depth(&self, robot: &Robot, q: &[f32], padding: f32) -> Result<Vec<f32>> {
+        self.check()?;
+        ensure_input!(q.len() == robot.dof(), "q has {} values, the robot {} joints", q.len(), robot.dof());
+        ensure_input!(padding.is_finite() && padding >= 0.0, "the padding must not be negative, got {padding}");
+        let Intrinsics { fx, fy, cx, cy } = self.intrinsics;
+        let (width, height) = (self.width, self.height());
+        let fk = robot.fk(q);
+        let to_camera = self.camera.rotation.inverse();
+        let mut out = vec![f32::INFINITY; self.depth.len()];
+        for sphere in &robot.spheres {
+            let center = to_camera * (fk.rot[sphere.link] * sphere.center + fk.pos[sphere.link] - self.camera.position);
+            let r = sphere.radius + padding;
+            if center.z + r <= 0.0 {
+                continue;
+            }
+            // The pixels the sphere can cover: the projections of its bounding box's sides at its
+            // near and far depths. The whole image when the camera is inside or next to it.
+            let (near, far) = (center.z - r, center.z + r);
+            let span = |c: f32, f: f32, k: f32, n: usize| {
+                if near <= 1e-3 {
+                    return (0, n);
+                }
+                let ends = [(c - r) / near, (c - r) / far, (c + r) / near, (c + r) / far].map(|x| f * x + k);
+                let lo = ends.iter().fold(f32::INFINITY, |m, &e| m.min(e)).floor().max(0.0);
+                let hi = ends.iter().fold(f32::NEG_INFINITY, |m, &e| m.max(e)).ceil() + 1.0;
+                (lo.min(n as f32) as usize, hi.clamp(0.0, n as f32) as usize)
+            };
+            let ((u0, u1), (v0, v1)) = (span(center.x, fx, cx, width), span(center.y, fy, cy, height));
+            for v in v0..v1 {
+                for u in u0..u1 {
+                    // Points t * ray along the pixel; their depth is t.
+                    let ray = Vec3::new((u as f32 - cx) / fx, (v as f32 - cy) / fy, 1.0);
+                    let (a, b, c) = (ray.length_squared(), ray.dot(center), center.length_squared() - r * r);
+                    let disc = b * b - a * c;
+                    if disc < 0.0 {
+                        continue;
+                    }
+                    let t = ((b - disc.sqrt()) / a).max(0.0);
+                    let o = &mut out[v * width + u];
+                    *o = o.min(t);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Signed distances (meters, negative inside) on a regular grid in its own frame: `dims` points
@@ -167,56 +276,36 @@ impl SdfGrid {
         Self::from_occupancy(dims, origin, o.voxel, &occupied)
     }
 
-    /// The distance field seen in one depth image: `depth` holds z distances in meters, row by
-    /// row, `width` pixels per row, with zero, negative or non-finite values for pixels without a
-    /// reading. `camera` places the camera (x right, y down, z forward, as in OpenCV) in the frame
-    /// the grid is built in. The grid spans the observed points plus the padding.
+    /// The distance field seen in one depth image. The grid spans the observed points plus the
+    /// padding.
     ///
     /// Unobserved space follows one rule: space outside the image and along pixels without a
     /// reading is free, and space behind observed surfaces is what `behind` says. Each voxel is
     /// classified by projecting its center into the image, so coarse sensors such as 8x8
-    /// time-of-flight arrays give solid surfaces, not scattered points.
-    pub fn from_depth(
-        depth: &[f32],
-        width: usize,
-        intrinsics: Intrinsics,
-        camera: Pose,
-        behind: Occlusion,
-        o: &SdfOptions,
-    ) -> Result<Self> {
-        ensure_input!(
-            width > 0 && depth.len().is_multiple_of(width),
-            "{} depth values do not form rows of {width}",
-            depth.len()
-        );
-        let Intrinsics { fx, fy, cx, cy } = intrinsics;
-        ensure_input!(fx > 0.0 && fy > 0.0 && cx.is_finite() && cy.is_finite(), "invalid intrinsics {intrinsics:?}");
-        let height = depth.len() / width;
-        let reading = |u: usize, v: usize| Some(depth[v * width + u]).filter(|z| z.is_finite() && *z > 0.0);
-        let to_world = |u: f32, v: f32, z: f32| camera.rotation * Vec3::new((u - cx) / fx * z, (v - cy) / fy * z, z);
-        let points: Vec<Vec3> = (0..height)
-            .flat_map(|v| (0..width).filter_map(move |u| Some((u, v, reading(u, v)?))))
-            .map(|(u, v, z)| to_world(u as f32, v as f32, z) + camera.position)
-            .collect();
-        ensure_input!(!points.is_empty(), "the depth image has no valid pixels");
+    /// time-of-flight arrays give solid surfaces, not scattered points. With `robot`, each pixel's
+    /// depth to the robot ([`DepthImage::robot_depth`]), readings on or behind the robot are not
+    /// obstacles: space in front of it is free and space behind it is what `behind` says.
+    pub fn from_depth(image: &DepthImage, robot: Option<&[f32]>, behind: Occlusion, o: &SdfOptions) -> Result<Self> {
+        image.check()?;
+        if let Some(r) = robot {
+            ensure_input!(r.len() == image.depth.len(), "{} robot depths for {} pixels", r.len(), image.depth.len());
+        }
+        // A reading at or beyond the robot (within a voxel) sees the robot.
+        let robot_at = |i: usize| robot.map_or(f32::INFINITY, |r| r[i]);
+        let on_robot = |i: usize, z: f32| z >= robot_at(i) - o.voxel;
+        let points: Vec<Vec3> = image.points().filter(|&(i, _)| !on_robot(i, image.depth[i])).map(|(_, p)| p).collect();
+        ensure_input!(!points.is_empty(), "the depth image has no valid pixels off the robot");
         let (lo, hi) = bounds(&points);
         let (dims, origin) = layout(lo, hi, o)?;
-        let to_camera = camera.rotation.inverse();
         let half = 0.5 * o.voxel;
         let mut occupied: Vec<bool> = (0..dims.element_product())
             .into_par_iter()
             .map(|n| {
-                let c = to_camera * (point(dims, origin, o.voxel, n) - camera.position);
-                if c.z <= 0.0 {
-                    return false;
-                }
-                let (u, v) = ((fx * c.x / c.z + cx + 0.5).floor(), (fy * c.y / c.z + cy + 0.5).floor());
-                if u < 0.0 || v < 0.0 || u >= width as f32 || v >= height as f32 {
-                    return false;
-                }
-                match reading(u as usize, v as usize) {
-                    Some(z) if c.z > z + half => behind == Occlusion::Occupied,
-                    Some(z) => c.z >= z - half,
+                let Some((i, z_voxel)) = image.project(point(dims, origin, o.voxel, n)) else { return false };
+                match image.reading(i) {
+                    Some(z) if on_robot(i, z) => z_voxel >= robot_at(i) - half && behind == Occlusion::Occupied,
+                    Some(z) if z_voxel > z + half => behind == Occlusion::Occupied,
+                    Some(z) => z_voxel >= z - half,
                     None => false,
                 }
             })
@@ -430,5 +519,100 @@ impl Line {
             let d = q as f64 - roots[k] as f64;
             self.out.push(d * d + f[roots[k]]);
         }
+    }
+}
+
+/// Log-odds a hit adds, a miss adds, and their clamps: OctoMap's.
+const HIT: f32 = 0.85;
+const MISS: f32 = -0.4;
+const CLAMP: (f32, f32) = (-2.0, 3.5);
+
+/// Occupancy fused from depth images over time, on a fixed grid in the world frame: per voxel, the
+/// log-odds that it is occupied, updated as OctoMap updates them (a hit adds 0.85, a miss -0.4,
+/// clamped to [-2, 3.5]). Readings that come and go settle: something seen once and then seen
+/// through three times is free again. Build distance grids from it with [`OccupancyMap::grid`].
+#[derive(Clone, Debug)]
+pub struct OccupancyMap {
+    dims: UVec3,
+    origin: Vec3,
+    voxel: f32,
+    log_odds: Vec<f32>,
+    observed: Vec<bool>,
+}
+
+impl OccupancyMap {
+    /// An unobserved map with `voxel` spacing whose points cover `lo..=hi`.
+    pub fn new(lo: Vec3, hi: Vec3, voxel: f32) -> Result<Self> {
+        ensure_input!(lo.is_finite() && hi.is_finite() && lo.cmplt(hi).all(), "a map needs lo < hi, got {lo} and {hi}");
+        let (dims, origin) = layout(lo, hi, &SdfOptions { voxel, padding: 0.0 })?;
+        let n = dims.element_product() as usize;
+        Ok(Self { dims, origin, voxel, log_odds: vec![0.0; n], observed: vec![false; n] })
+    }
+
+    /// Fuses one depth image. Each voxel is projected into it: voxels in front of a reading are
+    /// misses, voxels at it (within half a voxel) and those holding a reading's point are hits, and
+    /// voxels behind readings, outside the image or along pixels without a reading are not updated.
+    /// With `robot`, each pixel's depth to the robot ([`DepthImage::robot_depth`]), pixels that see
+    /// the robot only clear the space in front of it.
+    pub fn integrate(&mut self, image: &DepthImage, robot: Option<&[f32]>) -> Result<()> {
+        image.check()?;
+        if let Some(r) = robot {
+            ensure_input!(r.len() == image.depth.len(), "{} robot depths for {} pixels", r.len(), image.depth.len());
+        }
+        let (dims, origin, voxel) = (self.dims, self.origin, self.voxel);
+        let half = 0.5 * voxel;
+        let robot_at = |i: usize| robot.map_or(f32::INFINITY, |r| r[i]);
+        let on_robot = |i: usize, z: f32| z >= robot_at(i) - voxel;
+        // This frame's update of each voxel: -1 a miss, 1 a hit.
+        let mut update: Vec<i8> = (0..dims.element_product())
+            .into_par_iter()
+            .map(|n| {
+                let Some((i, z_voxel)) = image.project(point(dims, origin, voxel, n)) else { return 0 };
+                match image.reading(i) {
+                    Some(z) if on_robot(i, z) => -i8::from(z_voxel < robot_at(i) - half),
+                    Some(z) if z_voxel < z - half => -1,
+                    Some(z) if z_voxel <= z + half => 1,
+                    _ => 0,
+                }
+            })
+            .collect();
+        let (lo, hi) = (origin - half, origin + (dims - 1).as_vec3() * voxel + half);
+        for (i, p) in image.points() {
+            if !on_robot(i, image.depth[i]) && p.cmpge(lo).all() && p.cmplt(hi).all() {
+                update[nearest(dims, origin, voxel, p)] = 1;
+            }
+        }
+        self.log_odds.par_iter_mut().zip(self.observed.par_iter_mut()).zip(update).for_each(|((l, seen), u)| {
+            if u != 0 {
+                *seen = true;
+                *l = (*l + if u > 0 { HIT } else { MISS }).clamp(CLAMP.0, CLAMP.1);
+            }
+        });
+        Ok(())
+    }
+
+    /// The probability that the voxel holding `p` is occupied; `None` if it was never observed or
+    /// lies outside the map.
+    pub fn occupancy(&self, p: Vec3) -> Option<f32> {
+        let half = 0.5 * self.voxel;
+        let (lo, hi) = (self.origin - half, self.origin + (self.dims - 1).as_vec3() * self.voxel + half);
+        if !(p.cmpge(lo).all() && p.cmplt(hi).all()) {
+            return None;
+        }
+        let i = nearest(self.dims, self.origin, self.voxel, p);
+        self.observed[i].then(|| 1.0 / (1.0 + (-self.log_odds[i]).exp()))
+    }
+
+    /// The distance grid of the map: voxels more likely occupied than not are solid, and voxels
+    /// never observed are solid or free as `unknown` says. Errors if nothing is solid.
+    pub fn grid(&self, unknown: Occlusion) -> Result<SdfGrid> {
+        let occupied: Vec<bool> = self
+            .log_odds
+            .iter()
+            .zip(&self.observed)
+            .map(|(&l, &seen)| if seen { l > 0.0 } else { unknown == Occlusion::Occupied })
+            .collect();
+        ensure_input!(occupied.iter().any(|&o| o), "the map holds nothing occupied");
+        SdfGrid::from_occupancy(self.dims, self.origin, self.voxel, &occupied)
     }
 }
