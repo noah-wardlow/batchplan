@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat3, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::description::{self, Geometry, JointType, RobotDescription, Shape, TriMesh};
+use crate::description::{self, Geometry, JointDesc, JointType, LinkDesc, RobotDescription, Shape, TriMesh};
 use crate::error::{self, Error, ensure_input, input};
 use crate::spheres::{self, SphereGeometry, SphereOptions};
 use crate::types::Pose;
@@ -132,6 +132,10 @@ pub struct RobotOptions {
     pub default_q: Option<Vec<f32>>,
     /// Joints held at a value and removed from planning (mimics of a locked joint follow it).
     pub lock_joints: HashMap<String, f32>,
+    /// Position limits `[lower, upper]` by joint name, replacing the description's. Planar, ball and
+    /// floating joints become joints named `<joint>_x`, `_y`, `_z` (translations, which need limits
+    /// from here) and `_theta` or `_rx`, `_ry`, `_rz` (rotations).
+    pub joint_limits: HashMap<String, [f32; 2]>,
     /// Directories searched for `package://` packages: each is a package or holds packages.
     /// Directories above the description file are searched after these.
     pub package_dirs: Vec<PathBuf>,
@@ -157,6 +161,7 @@ impl Default for RobotOptions {
             ee_link: None,
             default_q: None,
             lock_joints: HashMap::new(),
+            joint_limits: HashMap::new(),
             package_dirs: vec![],
             collision_model: None,
             spheres: SphereOptions::default(),
@@ -519,8 +524,75 @@ impl Robot {
     }
 }
 
+/// `desc` with planar, ball and floating joints written as chains of prismatic and revolute joints
+/// on massless links, so kinematics and both devices see only one-axis joints:
+/// - planar: `<joint>_x` and `<joint>_y` slide in the plane (`_x` along the joint frame's x axis
+///   projected into it), `<joint>_theta` turns about its normal;
+/// - ball: `<joint>_rx`, `<joint>_ry`, `<joint>_rz` turn about the joint frame's axes in that order
+///   (intrinsic x-y-z angles), which reach every rotation with `_ry` in [-π/2, π/2] and lose a
+///   direction of motion (gimbal lock) at its ends;
+/// - floating: `<joint>_x`, `<joint>_y`, `<joint>_z` slide along the joint frame's axes, then a ball.
+///
+/// Translations get no limits here: they come from `RobotOptions::joint_limits`.
+fn expand_compound_joints(desc: &RobotDescription) -> Result<RobotDescription> {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let mut out = RobotDescription { name: desc.name.clone(), links: desc.links.clone(), joints: vec![] };
+    for j in &desc.joints {
+        let ball = |range: f32| {
+            let r = if range.is_finite() && range > 0.0 { range.min(PI) } else { PI };
+            [("rx", Vec3::X, r), ("ry", Vec3::Y, r.min(FRAC_PI_2)), ("rz", Vec3::Z, r)]
+                .map(|(name, axis, r)| (name, JointType::Revolute, axis, -r, r))
+        };
+        let slide = |name, axis| (name, JointType::Prismatic, axis, f32::NAN, f32::NAN);
+        let parts: Vec<(&str, JointType, Vec3, f32, f32)> = match j.kind {
+            JointType::Planar => {
+                // `_x` follows the joint frame's x axis, projected into the plane (y if x is normal).
+                let inplane = |v: Vec3| v - j.axis * j.axis.dot(v);
+                let u = inplane(Vec3::X).try_normalize().unwrap_or_else(|| inplane(Vec3::Y).normalize());
+                vec![slide("x", u), slide("y", j.axis.cross(u)), ("theta", JointType::Continuous, j.axis, 0.0, 0.0)]
+            }
+            JointType::Ball => ball(j.upper).to_vec(),
+            JointType::Floating => {
+                [slide("x", Vec3::X), slide("y", Vec3::Y), slide("z", Vec3::Z)].into_iter().chain(ball(PI)).collect()
+            }
+            _ => {
+                out.joints.push(j.clone());
+                continue;
+            }
+        };
+        ensure!(j.mimic.is_none(), "{:?} joint '{}' cannot mimic another joint", j.kind, j.name);
+        let mut parent = j.parent.clone();
+        for (k, &(suffix, kind, axis, lower, upper)) in parts.iter().enumerate() {
+            let name = format!("{}_{suffix}", j.name);
+            let child = if k + 1 == parts.len() { j.child.clone() } else { format!("{}/{name}", j.child) };
+            if child != j.child {
+                out.links.push(LinkDesc { name: child.clone(), ..Default::default() });
+            }
+            let origin = if k == 0 { j.origin } else { Transform::IDENTITY };
+            out.joints.push(JointDesc {
+                name,
+                kind,
+                parent,
+                child: child.clone(),
+                origin,
+                axis,
+                lower,
+                upper,
+                ..j.clone()
+            });
+            parent = child;
+        }
+    }
+    Ok(out)
+}
+
 /// The kinematic tree below the base link, with actuated joints numbered in breadth-first order.
 fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
+    let expanded = expand_compound_joints(desc)?;
+    let desc = &expanded;
+    if let Some(name) = o.joint_limits.keys().find(|n| !desc.joints.iter().any(|j| &j.name == *n)) {
+        bail!("joint_limits names '{name}', which is not a joint of the robot");
+    }
     let joint_index: HashMap<&str, usize> = desc.joints.iter().enumerate().map(|(i, j)| (j.name.as_str(), i)).collect();
     let base = match &o.base_link {
         Some(b) => {
@@ -581,10 +653,16 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         }
         dof_of.insert(j, dof_names.len());
         dof_names.push(joint.name.clone());
-        let (lo, hi) = match joint.kind {
-            JointType::Continuous => (-std::f32::consts::PI, std::f32::consts::PI),
-            _ => (joint.lower, joint.upper),
+        let (lo, hi) = match (o.joint_limits.get(&joint.name), joint.kind) {
+            (Some(&[lo, hi]), _) => (lo, hi),
+            (None, JointType::Continuous) => (-std::f32::consts::PI, std::f32::consts::PI),
+            (None, _) => (joint.lower, joint.upper),
         };
+        ensure!(
+            lo.is_finite() && hi.is_finite(),
+            "joint '{}' has no position limits; give them in RobotOptions::joint_limits",
+            joint.name
+        );
         lower.push(lo);
         upper.push(hi);
         max_velocity.push(or_default(joint.max_velocity, o.max_velocity));

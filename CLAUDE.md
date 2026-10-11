@@ -17,9 +17,9 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 72 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 74 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot,usd | --no-default-features]   # zero warnings everywhere; CI denies them (lints in Cargo.toml)
@@ -138,7 +138,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - Extension columns use names outside `observation.*` and `action*`, so LeRobot policies ignore them.
 
 **Robot model.**
-- `Robot::load` → `description::load_robot` (by extension) → `kinematics` (breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a multiplier and offset, locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
+- `Robot::load` → `description::load_robot` (by extension) → `kinematics` (planar, ball and floating joints expanded into one-axis joints on massless links by `expand_compound_joints`, so nothing downstream sees them; breadth-first tree, actuated joints numbered in that order, mimic joints resolved to their driving joint with a multiplier and offset, locked joints baked into fixed origins) → collision model (given, or fitted by `spheres.rs`) → SRDF pairs.
 - IK Jacobians walk `Link.chain`, a bitmask of the moving links at or above a link, root first, so mimic joints add into their leader. Both devices iterate it in the same order (`robot_wgsl` unrolls it).
 - `assets/franka/panda_collision.json` holds cuRobo's hand-tuned Panda spheres (Apache-2.0, credited in the README and `assets/README.md`); keep that credit when touching assets. `examples/common/mod.rs` has the Panda's options (locked fingers, `ee_link`, default pose).
 

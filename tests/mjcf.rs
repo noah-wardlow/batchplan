@@ -203,3 +203,43 @@ fn scenes_load_as_worlds_without_their_robots() {
     assert_eq!(robot.joint_names(), ["j"]);
     assert_eq!(robot.collision_model().spheres.len(), 1, "only the arm's geometry belongs to the robot");
 }
+
+#[test]
+fn free_and_ball_joints_become_one_axis_joints() {
+    let dir = scratch("mjcf-compound");
+    let path = dir.join("free.xml");
+    std::fs::write(
+        &path,
+        r#"<mujoco model="free">
+  <worldbody>
+    <body name="base" pos="0 0 0.5">
+      <freejoint name="free"/>
+      <geom type="box" size="0.1 0.1 0.05"/>
+      <body name="arm" pos="0 0 0.05">
+        <joint name="shoulder" type="ball" range="0 60"/>
+        <geom type="capsule" fromto="0 0 0 0 0 0.4" size="0.03"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>"#,
+    )
+    .unwrap();
+    let limits = ["free_x", "free_y", "free_z"].map(|n| (n.to_string(), [-1.0f32, 1.0]));
+    let options =
+        RobotOptions { joint_limits: limits.into_iter().collect(), ee_link: Some("arm".into()), ..no_spheres() };
+    let robot = Robot::load(&path, &options).unwrap();
+    let names =
+        ["free_x", "free_y", "free_z", "free_rx", "free_ry", "free_rz", "shoulder_rx", "shoulder_ry", "shoulder_rz"];
+    assert_eq!(robot.joint_names(), names);
+    // A ball joint's range bounds each of its angles (60 degrees, under the 90 the middle one allows).
+    let sixty = 60f32.to_radians();
+    assert!(robot.upper()[6..].iter().all(|&u| (u - sixty).abs() < 1e-6), "{:?}", robot.upper());
+    // The free joint starts at the body's authored pose and moves it in the world frame.
+    let mut q = vec![0.0; 9];
+    assert!((robot.link_pose(&q, "base").unwrap().position - Vec3::new(0.0, 0.0, 0.5)).length() < 1e-6);
+    q[2] = 0.2;
+    q[5] = 0.4;
+    let base = robot.link_pose(&q, "base").unwrap();
+    let expected = DAffine3::from_translation(DVec3::new(0.0, 0.0, 0.7)) * DAffine3::from_rotation_z(0.4);
+    assert!(difference(affine(base), expected) < 1e-6, "{base:?}");
+}

@@ -2,7 +2,8 @@
 //! colliders outside rigid bodies become scene shapes.
 //!
 //! - Rigid bodies (`PhysicsRigidBodyAPI`) are links. The tree grows from the world over Revolute,
-//!   Prismatic and Fixed joints: a joint frame is `localPos0`/`localRot0` in body0, and body1
+//!   Prismatic, Spherical (a ball joint, its cone limits bounding each rotation angle) and Fixed
+//!   joints: a joint frame is `localPos0`/`localRot0` in body0, and body1
 //!   sits at `localPos1`/`localRot1` from it (a fixed child frame when that is not identity).
 //!   Joints authored from child to parent are flipped; joints that close a loop, or are excluded
 //!   from the articulation, are skipped. Bodies without a joint stay where they are authored.
@@ -474,6 +475,15 @@ fn joint_from(
             let (Some(lo), Some(hi)) = (lo, hi) else { bail!("{}: prismatic joints need limits", j.path) };
             let v = velocity.map_or(f32::INFINITY, |v| (v * l.meters) as f32);
             (JointType::Prismatic, unit_axis()?, (lo * l.meters) as f32, (hi * l.meters) as f32, v)
+        }
+        "PhysicsSphericalJoint" => {
+            // Cone limits are degrees from the joint axis; a missing or negative one leaves its
+            // direction free.
+            let upper = match [limit("physics:coneAngle0Limit")?, limit("physics:coneAngle1Limit")?] {
+                [Some(a), Some(b)] if a >= 0.0 && b >= 0.0 => a.max(b).to_radians() as f32,
+                _ => f32::INFINITY,
+            };
+            (JointType::Ball, Vec3::Z, 0.0, upper, velocity.map_or(f32::INFINITY, |v| v.to_radians() as f32))
         }
         other => bail!("{}: joint type {other} is not supported", j.path),
     };

@@ -40,6 +40,8 @@ pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescrip
                 J::Revolute => JointType::Revolute,
                 J::Continuous => JointType::Continuous,
                 J::Prismatic => JointType::Prismatic,
+                J::Planar => JointType::Planar,
+                J::Floating => JointType::Floating,
                 ref other => bail!("joint '{}' has unsupported type {other:?}", j.name),
             };
             let (lower, upper) = (j.limit.lower as f32, j.limit.upper as f32);

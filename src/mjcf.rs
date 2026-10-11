@@ -1,7 +1,8 @@
 //! MJCF (MuJoCo XML) loading. The robot becomes a [`RobotDescription`]; static geometry becomes
 //! scene shapes. Covers what kinematics and collision need: `<include>`, `<default>` classes and
 //! `childclass`, the compiler's angle units, mesh directory and Euler sequence, every orientation
-//! form, bodies with several joints, `fromto`, and `<equality><joint>` as mimic joints.
+//! form, bodies with several joints, free (`freejoint` or `type="free"`) and ball joints,
+//! `fromto`, and `<equality><joint>` as mimic joints.
 //!
 //! Body subtrees that contain a joint are the robot; bodies with no joint anywhere below them, and
 //! geoms placed directly in the world body, are the scene. `connect` and `weld` equalities close
@@ -288,12 +289,10 @@ impl Builder<'_> {
         let class = body.attr("childclass").unwrap_or(inherited).to_string();
         let a = Attrs(body.attrs.clone());
         let frame = offset.mul(&self.compiler.frame(&a)?);
-        if body.children.iter().any(|c| c.tag == "freejoint") {
-            bail!("body '{name}' has a free joint; floating bases are not supported");
-        }
         // Each joint turns about its anchor in the frame the previous joints left behind, so the
         // body becomes a chain: joint i's frame sits at anchor i, the body frame at -anchor.
-        let joints: Vec<&Element> = body.children("joint").collect();
+        let joints: Vec<&Element> =
+            body.children.iter().filter(|c| matches!(c.tag.as_str(), "joint" | "freejoint")).collect();
         let (mut link, mut origin, mut anchor) = (parent.to_string(), frame, Vec3::ZERO);
         for (i, j) in joints.iter().enumerate() {
             let ja = Attrs(self.defaults.resolve(j, &class)?);
@@ -301,7 +300,7 @@ impl Builder<'_> {
             let pos = ja.vec3("pos")?.unwrap_or(Vec3::ZERO);
             let last = i + 1 == joints.len();
             let child = if last && pos == Vec3::ZERO { name.clone() } else { format!("{name}/{joint_name}") };
-            let kind_name = ja.get("type").unwrap_or("hinge");
+            let kind_name = if j.tag == "freejoint" { "free" } else { ja.get("type").unwrap_or("hinge") };
             let range = ja.floats("range")?.unwrap_or(vec![0.0, 0.0]);
             ensure!(range.len() == 2, "joint '{joint_name}' range needs 2 numbers");
             let limited = match ja.get("limited").unwrap_or("auto") {
@@ -314,6 +313,10 @@ impl Builder<'_> {
                 ("hinge", false) => (JointType::Continuous, 0.0, 0.0),
                 ("slide", true) => (JointType::Prismatic, range[0], range[1]),
                 ("slide", false) => bail!("slide joint '{joint_name}' needs a range"),
+                // A ball joint's range is [0, largest rotation angle].
+                ("ball", true) => (JointType::Ball, 0.0, self.compiler.angle(range[1])),
+                ("ball", false) => (JointType::Ball, 0.0, f32::INFINITY),
+                ("free", _) => (JointType::Floating, f32::NAN, f32::NAN),
                 (other, _) => bail!("joint '{joint_name}' has unsupported type '{other}'"),
             };
             self.links.push(LinkDesc { name: child.clone(), ..Default::default() });

@@ -38,6 +38,12 @@ pub(crate) enum JointType {
     /// Revolute without position limits.
     Continuous,
     Prismatic,
+    /// Motion in the plane perpendicular to `axis`: two translations and a rotation about `axis`.
+    Planar,
+    /// Any rotation about the joint origin; `upper`, when finite, bounds each rotation angle.
+    Ball,
+    /// Free motion of the child relative to the parent.
+    Floating,
 }
 
 #[derive(Clone, Debug)]

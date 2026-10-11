@@ -108,7 +108,7 @@ Performance claims come from alternating runs of two builds on one machine. Two 
   - **Variants:** `RobotOptions::variants` selects variants where the file authors no selection.
 - **Scenes.** `World::load` reads the static geometry of an MJCF or USD scene as obstacles; planes become slabs and ellipsoids their bounding boxes. Meshes become [distance grids](#distance-grids) of their convex hulls where the format collides them that way: MJCF always (as MuJoCo does), USD when `physics:approximation` is `convexHull`. Other USD approximations use the exact mesh.
 
-- **Kinematics.** Revolute, continuous, prismatic and fixed joints. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Robots have no fixed size limit (a 40-joint, 41-link, 130-sphere test robot runs on both devices).
+- **Kinematics.** Revolute, continuous, prismatic and fixed joints. Planar, ball and floating joints (URDF `planar`/`floating`, MJCF `free`/`ball`, USD spherical joints) become chains of one-axis joints: `<joint>_x`, `_y`, `_z` for translations, whose limits come from `RobotOptions::joint_limits`, and `_theta` or `_rx`, `_ry`, `_rz` (intrinsic x-y-z angles, singular where `_ry` reaches ±90°) for rotations. Mimic joints follow their leader (value = multiplier × leader + offset); the leader's range and velocity limit shrink so that every mimic joint stays within its own limits. Joints can be locked at a value. Robots have no fixed size limit (a 40-joint, 41-link, 130-sphere test robot runs on both devices).
 - **Collision spheres.** Without a collision model, spheres are fitted to each link's collision geometry (or its visual geometry) with cuRobo's voxel method:
   1. Interior grid points become candidate spheres that touch the surface.
   2. A greedy cover picks the candidates that reach the most surface samples.
@@ -210,7 +210,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 72 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 6 OpenUSD tests. Without default features (CPU only), 64 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 74 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 66 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -319,7 +319,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 ## Limits of the MVP
 
 - **Geometry.** The robot is modeled as spheres only. Distance grids are built on the CPU, from one depth image at a time (no fusion over frames), and depth images must have the robot masked out by the caller.
-- **Kinematics.** Floating, planar and ball joints aren't supported; closed loops (MJCF `connect`, USD loop joints) are dropped from the tree.
+- **Kinematics.** Closed loops (MJCF `connect`, USD loop joints) are dropped from the tree. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
 - **Long motions.** Joint ranges are intervals, not circles: continuous joints are planned within ±π and nothing wraps. On the UR5e, a goal whose shoulder has turned past the table below is unreachable even for RRT-Connect.
 - **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.
 - **Kernel performance.** Kernels run one invocation per configuration (or per collision sample, or per control point), with no shared memory or subgroup work. Worlds stay on the device, but per-call buffers (configurations, paths) are allocated per call. This leaves performance on the table.

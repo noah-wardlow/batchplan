@@ -7,6 +7,8 @@ mod common;
 
 use batchplan::rng::Rng;
 use batchplan::*;
+use std::f32::consts::{FRAC_PI_2, PI};
+
 use glam::{DAffine3, DMat3, DVec3, Vec3};
 
 fn affine(p: Pose) -> DAffine3 {
@@ -163,4 +165,82 @@ fn franka_usd_converted_from_our_urdf_matches_it() {
         b.evaluate(&b.upload(&[World::default()]).unwrap(), &item_world, &q_all, &CollisionWeights::NONE).unwrap(),
     );
     assert!(ea.self_clearance.iter().zip(&eb.self_clearance).all(|(x, y)| (x - y).abs() < 1e-5));
+}
+
+#[test]
+fn spherical_joints_become_three_revolute_joints() {
+    let dir = std::env::temp_dir().join(format!("batchplan-usd-ball-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (cones, upper) in [((45.0, 30.0), [45f32.to_radians(); 3]), ((-1.0, 30.0), [PI, FRAC_PI_2, PI])] {
+        let path = dir.join("neck.usda");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#usda 1.0
+(
+    defaultPrim = "robot"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "robot" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{{
+    def Xform "base" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {{
+        def Cube "box" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            double size = 0.2
+        }}
+    }}
+
+    def PhysicsFixedJoint "anchor"
+    {{
+        rel physics:body1 = </robot/base>
+    }}
+
+    def Xform "head" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {{
+        double3 xformOp:translate = (0, 0, 0.3)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "ball" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            double radius = 0.1
+        }}
+    }}
+
+    def PhysicsSphericalJoint "neck"
+    {{
+        rel physics:body0 = </robot/base>
+        rel physics:body1 = </robot/head>
+        point3f physics:localPos0 = (0, 0, 0.3)
+        float physics:coneAngle0Limit = {}
+        float physics:coneAngle1Limit = {}
+    }}
+}}
+"#,
+                cones.0, cones.1
+            ),
+        )
+        .unwrap();
+        let robot = Robot::load(&path, &RobotOptions::default()).unwrap();
+        assert_eq!(robot.joint_names(), ["neck_rx", "neck_ry", "neck_rz"]);
+        let close = robot.upper().iter().zip(upper).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(close, "cones {cones:?}: upper {:?}, expected {upper:?}", robot.upper());
+        // The head turns about the joint, which sits at its centre.
+        let q = [0.0, 0.0, 0.5];
+        let head = robot.link_pose(&q, "head").unwrap();
+        assert!((head.position - Vec3::new(0.0, 0.0, 0.3)).length() < 1e-6, "{head:?}");
+        assert!(head.rotation.dot(glam::Quat::from_rotation_z(0.5)).abs() > 1.0 - 1e-6, "{head:?}");
+    }
 }

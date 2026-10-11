@@ -381,6 +381,30 @@ fn every_test_arm_loads_spherizes_and_plans() {
     }
 }
 
+/// Evaluates 500 random configurations among `scene`'s obstacles on every device, checks that the
+/// devices agree on clearances and gradients and that enough configurations carry cost, and
+/// returns the devices.
+fn devices_agree(robot: &Robot, scene: &[World]) -> Vec<Device> {
+    let mut rng = Rng::new(17);
+    let q: Vec<f32> = (0..500).flat_map(|_| random_q(robot, &mut rng)).collect();
+    let item_world = vec![0; 500];
+    let w = CollisionWeights { world: 1.0, self_collision: 1.0, margin: 0.05, self_margin: 0.02 };
+    let devices = devices(robot);
+    let reference = devices[0].evaluate(&devices[0].upload(scene).unwrap(), &item_world, &q, &w).unwrap();
+    assert!(reference.cost.iter().filter(|&&c| c > 0.0).count() > 50, "too few configurations carry cost");
+    for d in &devices {
+        let e = d.evaluate(&d.upload(scene).unwrap(), &item_world, &q, &w).unwrap();
+        for i in 0..500 {
+            assert!((e.world_clearance[i] - reference.world_clearance[i]).abs() < 1e-4, "{}: clearance", d.name());
+            assert!((e.self_clearance[i] - reference.self_clearance[i]).abs() < 1e-4, "{}: self clearance", d.name());
+        }
+        let scale = reference.grad.iter().fold(1.0f32, |m, g| m.max(g.abs()));
+        let worst = e.grad.iter().zip(&reference.grad).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(worst / scale < 1e-3, "{}: gradient off by {worst}", d.name());
+    }
+    devices
+}
+
 /// A planar-ish snake: `joints` revolute joints, alternating between two axes, each carrying a
 /// 10 cm capsule-like cylinder.
 fn snake_urdf(joints: usize) -> String {
@@ -415,28 +439,78 @@ fn robots_past_the_old_kernel_limits_work_on_every_device() {
             rotation: Quat::IDENTITY,
         }],
     }];
-    let mut rng = Rng::new(17);
-    let q: Vec<f32> = (0..500).flat_map(|_| random_q(&robot, &mut rng)).collect();
-    let item_world = vec![0; 500];
-    let w = CollisionWeights { world: 1.0, self_collision: 1.0, margin: 0.05, self_margin: 0.02 };
-    let devices = devices(&robot);
-    let reference = devices[0].evaluate(&devices[0].upload(&scene).unwrap(), &item_world, &q, &w).unwrap();
-    assert!(reference.cost.iter().filter(|&&c| c > 0.0).count() > 50, "too few configurations carry cost");
-    for d in &devices {
+    for d in devices_agree(&robot, &scene) {
         let worlds = d.upload(&scene).unwrap();
-        let e = d.evaluate(&worlds, &item_world, &q, &w).unwrap();
-        for i in 0..500 {
-            assert!((e.world_clearance[i] - reference.world_clearance[i]).abs() < 1e-4, "{}: clearance", d.name());
-            assert!((e.self_clearance[i] - reference.self_clearance[i]).abs() < 1e-4, "{}: self clearance", d.name());
-        }
-        let scale = reference.grad.iter().fold(1.0f32, |m, g| m.max(g.abs()));
-        let worst = e.grad.iter().zip(&reference.grad).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(worst / scale < 1e-3, "{}: gradient off by {worst}", d.name());
         let start = vec![0.0; 40];
         let mut goal = vec![0.0; 40];
         goal[0] = 1.0;
         let problem = PlanProblem { world: 0, start, goal };
-        let result = plan(d, &worlds, &[problem], &PlanOptions::default()).unwrap();
+        let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
         assert!(result.best(0).is_some(), "{}: no plan for the snake", d.name());
+    }
+}
+
+/// A one-link arm on a `kind` joint ("floating" or "planar", normal z) from `world`.
+fn mounted_arm_urdf(kind: &str) -> String {
+    format!(
+        r#"<robot name="mounted">
+  <link name="world"/>
+  <link name="base"><collision><geometry><box size="0.2 0.2 0.1"/></geometry></collision></link>
+  <link name="arm"><collision><origin xyz="0 0 0.25"/><geometry><cylinder radius="0.03" length="0.5"/></geometry></collision></link>
+  <joint name="mount" type="{kind}"><parent link="world"/><child link="base"/><origin xyz="0 0 0.5"/><axis xyz="0 0 1"/></joint>
+  <joint name="shoulder" type="revolute"><parent link="base"/><child link="arm"/><origin xyz="0 0 0.05"/>
+    <axis xyz="0 1 0"/><limit lower="-2" upper="2" velocity="2" effort="1"/></joint>
+</robot>"#
+    )
+}
+
+#[test]
+fn floating_and_planar_joints_become_one_axis_joints() {
+    let dir = scratch("compound");
+    let floating = ["mount_x", "mount_y", "mount_z", "mount_rx", "mount_ry", "mount_rz"];
+    for (kind, joints) in [("floating", &floating[..]), ("planar", &["mount_x", "mount_y", "mount_theta"][..])] {
+        let path = dir.join(format!("{kind}.urdf"));
+        std::fs::write(&path, mounted_arm_urdf(kind)).unwrap();
+        // Translations have no limits of their own.
+        let err = Robot::load(&path, &RobotOptions::default()).unwrap_err().to_string();
+        assert!(err.contains("mount_x") && err.contains("joint_limits"), "{err}");
+        let joint_limits = ["mount_x", "mount_y", "mount_z"]
+            .into_iter()
+            .filter(|n| joints.contains(n))
+            .map(|n| (n.to_string(), [-1.0, 1.0]))
+            .collect();
+        let options = RobotOptions { joint_limits, ee_link: Some("arm".into()), ..Default::default() };
+        let robot = Robot::load(&path, &options).unwrap();
+        assert_eq!(robot.joint_names()[..joints.len()], *joints, "{kind}");
+        assert_eq!(robot.dof(), joints.len() + 1);
+        // Sliding along x moves the arm along x; the last rotation turns it about z.
+        let mut q = vec![0.0; robot.dof()];
+        let home = robot.ee_pose(&q);
+        q[0] = 0.3;
+        let slid = robot.ee_pose(&q);
+        assert!((slid.position - home.position - Vec3::new(0.3, 0.0, 0.0)).length() < 1e-5, "{kind}: {slid:?}");
+        q[0] = 0.0;
+        q[joints.len() - 1] = 0.7;
+        let turned = robot.ee_pose(&q);
+        let expected = Mat3::from_quat(Quat::from_rotation_z(0.7) * home.rotation);
+        let off =
+            (Mat3::from_quat(turned.rotation) - expected).to_cols_array().iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(off < 1e-5, "{kind}: rotation off by {off}");
+        // Every device sees the same robot and can move its base.
+        let scene = [World {
+            obstacles: vec![Obstacle::Cuboid {
+                center: Vec3::new(0.0, 0.0, 0.5),
+                half_extents: Vec3::splat(0.6),
+                rotation: Quat::IDENTITY,
+            }],
+        }];
+        for d in devices_agree(&robot, &scene) {
+            let worlds = d.upload(&[World::default()]).unwrap();
+            let mut goal = vec![0.0; robot.dof()];
+            goal[0] = 0.8;
+            let problem = PlanProblem { world: 0, start: vec![0.0; robot.dof()], goal };
+            let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
+            assert!(result.best(0).is_some(), "{}: no plan for the {kind} base", d.name());
+        }
     }
 }
