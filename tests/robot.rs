@@ -368,7 +368,7 @@ fn every_test_arm_loads_spherizes_and_plans() {
                 .collect();
             let far: f32 = goal.iter().zip(robot.default_q()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
             if far > 1.0 && cpu.evaluate(&worlds, &[world], &goal, &CollisionWeights::NONE).unwrap().collision_free(0) {
-                problems.push(PlanProblem { world, start: robot.default_q().to_vec(), goal });
+                problems.push(PlanProblem { world, start: robot.default_q().to_vec(), goal, start_motion: None });
             }
         }
         for d in devices(&robot) {
@@ -444,7 +444,7 @@ fn robots_past_the_old_kernel_limits_work_on_every_device() {
         let start = vec![0.0; 40];
         let mut goal = vec![0.0; 40];
         goal[0] = 1.0;
-        let problem = PlanProblem { world: 0, start, goal };
+        let problem = PlanProblem { world: 0, start, goal, start_motion: None };
         let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
         assert!(result.best(0).is_some(), "{}: no plan for the snake", d.name());
     }
@@ -508,7 +508,7 @@ fn floating_and_planar_joints_become_one_axis_joints() {
             let worlds = d.upload(&[World::default()]).unwrap();
             let mut goal = vec![0.0; robot.dof()];
             goal[0] = 0.8;
-            let problem = PlanProblem { world: 0, start: vec![0.0; robot.dof()], goal };
+            let problem = PlanProblem { world: 0, start: vec![0.0; robot.dof()], goal, start_motion: None };
             let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
             assert!(result.best(0).is_some(), "{}: no plan for the {kind} base", d.name());
         }

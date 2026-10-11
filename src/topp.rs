@@ -36,8 +36,10 @@ const STRETCH_MARGIN: f32 = 1.003;
 const REFINEMENTS: usize = 3;
 
 /// A time map for `cp`: seconds per span and control points, or `None` when the path does not
-/// move or cannot be timed.
-pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
+/// move or cannot be timed. With `start_speed`, the map starts at that ṡ (spans per second) with
+/// no s̈, to continue a motion already under way; it is then never stretched (that would change the
+/// start), so a path that cannot be timed from that speed within the limits has no map.
+pub(crate) fn time_map(robot: &Robot, cp: &[f32], start_speed: Option<f64>) -> Option<(f32, Vec<f32>)> {
     let n = robot.dof();
     let spans = cp.len() / n - 3;
     let (stages, step) = (spans * STAGES_PER_SPAN, 1.0 / STAGES_PER_SPAN as f64);
@@ -70,9 +72,16 @@ pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
     let jmax: Vec<f64> = robot.max_jerk().iter().map(|&j| j as f64 * HEADROOM).collect();
 
     // Bounds on u at stage i for state x, as lines u = slope x + offset, plus the largest x the
-    // velocity limits and the joints that do not move allow, scaled by `scale`.
+    // velocity limits and the joints that do not move allow, scaled by `scale`. A given start is
+    // held to the full limits rather than the headroom: it is not ours to choose.
     let bounds = |i: usize, next: (f64, f64), scale: f64| {
         let (mut lower, mut upper, mut cap) = (vec![], vec![], f64::INFINITY);
+        let full = if i == 0 && start_speed.is_some() { 1.0 / HEADROOM } else { 1.0 };
+        let (vmax, amax, jmax): (Vec<f64>, Vec<f64>, Vec<f64>) = (
+            vmax.iter().map(|v| v * full).collect(),
+            amax.iter().map(|a| a * full).collect(),
+            jmax.iter().map(|j| j * full).collect(),
+        );
         for j in 0..n {
             // Jerk's speed term, the path's third derivative times ṡ³, caps ṡ like velocity does.
             if third[i][j] > 1e-9 {
@@ -130,12 +139,24 @@ pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
             let (lower, upper, cap) = bounds(i, controllable[i + 1], scale[i]);
             controllable[i] = feasible(&lower, &upper, cap)?;
         }
-        // Forward: from the fastest start, the largest u each stage allows.
+        // Forward: from the given start or the fastest one, the largest u each stage allows, except
+        // that a given start keeps s̈ as near 0 as it can.
         let mut x = vec![0.0f64; stages + 1];
-        x[0] = controllable[0].1;
+        x[0] = match start_speed {
+            Some(speed) => {
+                let x0 = speed * speed;
+                let (lo, hi) = controllable[0];
+                (x0 >= lo * (1.0 - 1e-9) && x0 <= hi * (1.0 + 1e-9)).then_some(x0)?
+            }
+            None => controllable[0].1,
+        };
         for i in 0..stages {
-            let (_, upper, _) = bounds(i, controllable[i + 1], scale[i]);
-            let u = upper.iter().map(|&(slope, offset)| slope * x[i] + offset).fold(f64::INFINITY, f64::min);
+            let (lower, upper, _) = bounds(i, controllable[i + 1], scale[i]);
+            let at = |lines: &[(f64, f64)], pick: fn(f64, f64) -> f64, from: f64| {
+                lines.iter().map(|&(slope, offset)| slope * x[i] + offset).fold(from, pick)
+            };
+            let (u_lo, u_hi) = (at(&lower, f64::max, f64::NEG_INFINITY), at(&upper, f64::min, f64::INFINITY));
+            let u = if i == 0 && start_speed.is_some() { 0.0f64.clamp(u_lo.min(u_hi), u_hi) } else { u_hi };
             x[i + 1] = (x[i] + 2.0 * step * u).clamp(controllable[i + 1].0, controllable[i + 1].1).max(0.0);
         }
         // Time at each stage; s̈ is constant between stages.
@@ -155,7 +176,8 @@ pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
     // and the profile is solved again; whatever overshoot remains is taken out by stretching.
     let mut scale = vec![1.0f64; stages + 1];
     let mut best: Option<(f32, Vec<f32>)> = None;
-    for _ in 0..REFINEMENTS {
+    let rounds = if start_speed.is_some() { 2 * REFINEMENTS } else { REFINEMENTS };
+    for _ in 0..rounds {
         let (t, x) = profile(&scale)?;
         let total = t[stages];
         // s at time `time`, between stages at constant s̈.
@@ -176,12 +198,23 @@ pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
             let mut points: Vec<f32> = (0..m + 3).map(|k| s_at((k as f64 - 1.0) * tau) as f32).collect();
             points[0] = -4.0 * points[1] - points[2];
             points[m + 2] = 6.0 * spans as f32 - 4.0 * points[m + 1] - points[m];
+            // A given start: σ(0) = 0, σ̇(0) = that speed, σ̈(0) = 0.
+            if let Some(speed) = start_speed {
+                let lead = (tau * speed) as f32;
+                points[..3].copy_from_slice(&[-lead, 0.0, lead]);
+            }
             // Candidates are compared and located at a quarter of the checking density; the winner
-            // is stretched at the full density below.
-            let (stretch, overshoots) = assess(robot, cp, tau as f32, &points, CHECK_SAMPLES / 4);
+            // is stretched at the full density below. A given start cannot be stretched, so its
+            // candidates are measured at the full density against limits that leave the margin.
+            let (samples, target) = match start_speed {
+                None => (CHECK_SAMPLES / 4, 1.0),
+                Some(_) => (CHECK_SAMPLES, 1.0 / (STRETCH_MARGIN * STRETCH_MARGIN)),
+            };
+            let (stretch, overshoots) = assess(robot, cp, tau as f32, &points, samples, target);
             let knot = tau as f32 * stretch;
             let duration = |knot: f32, points: &[f32]| knot * (points.len() - 3) as f32;
-            if best.as_ref().is_none_or(|(b, p)| duration(knot, &points) < duration(*b, p)) {
+            let usable = start_speed.is_none() || stretch <= 1.0;
+            if usable && best.as_ref().is_none_or(|(b, p)| duration(knot, &points) < duration(*b, p)) {
                 best = Some((knot, points));
             }
             if round.as_ref().is_none_or(|(r, ..)| stretch < *r) {
@@ -201,13 +234,23 @@ pub(crate) fn time_map(robot: &Robot, cp: &[f32]) -> Option<(f32, Vec<f32>)> {
                 factor[i as usize] = factor[i as usize].min(f as f64);
             }
         }
+        // A given start speed stays.
+        if start_speed.is_some() {
+            factor[0] = 1.0;
+        }
         for (sc, f) in scale.iter_mut().zip(factor) {
             *sc *= f;
         }
     }
     let (knot, points) = best?;
-    let (stretch, _) = assess(robot, cp, knot, &points, CHECK_SAMPLES);
-    Some((knot * stretch * STRETCH_MARGIN, points))
+    match start_speed {
+        None => {
+            let (stretch, _) = assess(robot, cp, knot, &points, CHECK_SAMPLES, 1.0);
+            Some((knot * stretch * STRETCH_MARGIN, points))
+        }
+        // Only candidates that needed no stretch at full density are kept.
+        Some(_) => Some((knot, points)),
+    }
 }
 
 /// The path's joint velocity, acceleration and jerk where the time map is at `u` of span `m`.
@@ -228,7 +271,7 @@ pub(crate) fn derivatives(cp: &[f32], n: usize, knot: f32, points: &[f32], m: us
 /// How much longer the time map must take for every joint's sampled velocity, acceleration and jerk
 /// to keep its limits (velocity scales with 1/k, acceleration 1/k², jerk 1/k³; at least 1), and
 /// where it overshoots: each such sample's path position and the factor on x that limit needs there.
-fn assess(robot: &Robot, cp: &[f32], knot: f32, points: &[f32], samples: usize) -> (f32, Vec<(f32, f32)>) {
+fn assess(robot: &Robot, cp: &[f32], knot: f32, points: &[f32], samples: usize, target: f32) -> (f32, Vec<(f32, f32)>) {
     let n = robot.dof();
     let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
     let mut out = vec![[0.0f32; 3]; n];
@@ -240,7 +283,7 @@ fn assess(robot: &Robot, cp: &[f32], knot: f32, points: &[f32], samples: usize) 
             let mut factor = 1.0f32;
             for (j, d) in out.iter().enumerate() {
                 for order in 0..3 {
-                    let ratio = d[order].abs() / limits[order][j];
+                    let ratio = d[order].abs() / (limits[order][j] * target);
                     k = k.max(ratio.powf(1.0 / (order + 1) as f32));
                     if ratio > 1.0 {
                         factor = factor.min(ratio.powf(-2.0 / (order + 1) as f32));

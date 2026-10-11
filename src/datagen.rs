@@ -59,7 +59,7 @@ pub fn recovery_problems(
             let start: Vec<f32> = (0..n)
                 .map(|j| (on_path[j] + o.sigma * rng.normal()).clamp(robot.bounds(j).0, robot.bounds(j).1))
                 .collect();
-            let next = PlanProblem { world: problem.world, start, goal: problem.goal.clone() };
+            let next = PlanProblem { world: problem.world, start, goal: problem.goal.clone(), start_motion: None };
             candidates.push(Recovery { parent, phase, problem: next });
         }
     }
@@ -168,7 +168,7 @@ pub fn demonstrations(
         .solved()
         .map(|s| {
             let start = starts[s.index * n..(s.index + 1) * n].to_vec();
-            (s.index, PlanProblem { world: s.problem.world, start, goal: s.solution.to_vec() })
+            (s.index, PlanProblem { world: s.problem.world, start, goal: s.solution.to_vec(), start_motion: None })
         })
         .unzip();
     let nominal = plan(device, worlds, &problems, &o.plan)?;

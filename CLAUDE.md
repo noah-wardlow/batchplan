@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 78 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 80 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -121,7 +121,10 @@ These decisions are settled. Keep to them unless the user decides otherwise.
 4. `best()` picks the shortest valid seed.
 5. Problems without a valid seed fall back (`PlanOptions::fallback`): `rrt::connect` (RRT-Connect toward every goal variant, several extensions per problem per round, every problem's edges checked in one `Device::clearance`; continuous joints step and measure the short way, `Robot::turn_toward`, and the found path is unwrapped), `shortcut::shortcut`, then `trace` turns the waypoints into control points whose spline runs exactly along them (each waypoint tripled). The traced spline and its optimized version are validated; the shorter valid one replaces seed 0.
 
-`timing::Trajectory` is the path plus a time map `σ(t)` (a uniform cubic B-spline in time). `Trajectory::new` keeps the faster of uniform timing (`σ = t / h`, `h` from control-point differences, exact along the whole curve) and `topp::time_map`. The latter is TOPP-RA on the path parameter, smoothed (Schoenberg), with caps lowered locally where the smoothed map overshoots and a final stretch measured at `CHECK_SAMPLES` per map span. `check` is exact for uniform maps and samples `CHECK_SAMPLES` per span otherwise.
+`timing::Trajectory` is the path plus a time map `σ(t)` (a uniform cubic B-spline in time). `Trajectory::new` keeps the faster of uniform timing (`σ = t / h`, `h` from control-point differences, exact along the whole curve) and `topp::time_map`. The latter is TOPP-RA on the path parameter, smoothed (Schoenberg), with caps lowered locally where the smoothed map overshoots and a final stretch measured at `CHECK_SAMPLES` per map span. `check` is exact for uniform maps and samples `CHECK_SAMPLES` per span otherwise. Moving starts (`PlanProblem::start_motion`):
+- `trajopt::continue_motion` pins the first three control points for a knot interval `h0`;
+- `Trajectory::moving` recovers `h0` from them and times the path from ṡ = 1/h0. Stage 0 is held to the full limits, candidates are refined at full density against limits less the margin, and nothing is stretched;
+- `check_from` checks the start state.
 
 **Data pipeline.**
 - `datagen::demonstrations` runs:

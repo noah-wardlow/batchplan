@@ -211,6 +211,7 @@ fn ik_and_plan(device: &Device, worlds: &Worlds, problems: &[Problem], o: &PlanO
             world: s.problem.world,
             start: problems[s.problem.world as usize].start.clone(),
             goal: s.solution.to_vec(),
+            start_motion: None,
         })
         .collect();
     Ok(plan(device, worlds, &plans, o)?)
@@ -272,7 +273,12 @@ fn main() -> Result<()> {
             let to_ik: Vec<PlanProblem> = problems
                 .iter()
                 .enumerate()
-                .map(|(i, p)| PlanProblem { world: i as u32, start: p.start.clone(), goal: p.goal_ik[0].clone() })
+                .map(|(i, p)| PlanProblem {
+                    world: i as u32,
+                    start: p.start.clone(),
+                    goal: p.goal_ik[0].clone(),
+                    start_motion: None,
+                })
                 .collect();
             let t = Instant::now();
             let planned = plan(device, &device.upload(&scene)?, &to_ik, &args.plan)?;

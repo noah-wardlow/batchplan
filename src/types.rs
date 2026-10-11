@@ -53,6 +53,13 @@ impl JointPaths {
     }
 }
 
+/// How the robot is already moving where a plan starts: joint velocity and acceleration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StartMotion {
+    pub velocity: Vec<f32>,
+    pub acceleration: Vec<f32>,
+}
+
 /// One trajectory sampled every `dt` seconds, row-major `[len, dof]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JointTrajectory {

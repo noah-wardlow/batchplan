@@ -6,7 +6,7 @@
 //! - Uniform: `σ(t) = t / h`. On the path, velocity is a quadratic B-spline over the control-point
 //!   differences, acceleration a linear one over the second differences, and jerk is constant per
 //!   span, so `h` chosen from those differences bounds the whole curve exactly.
-//! - Time-optimal ([`crate::topp`]): the fastest velocity- and acceleration-limited timing of the
+//! - Time-optimal (TOPP-RA, Pham & Pham 2018): the fastest velocity- and acceleration-limited timing of the
 //!   same path, smoothed and stretched until velocity, acceleration and jerk, sampled densely
 //!   along it, keep their limits.
 
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::robot::Robot;
 use crate::spline::{BASIS_D3, basis, basis_d1, basis_d2, blend};
 use crate::topp::{self, CHECK_SAMPLES};
-use crate::types::JointTrajectory;
+use crate::types::{JointTrajectory, StartMotion};
 
 /// Joint position, velocity and acceleration at one instant.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -56,23 +56,17 @@ impl Trajectory {
     pub fn new(robot: &Robot, control_points: &[f32], speed_scale: f32) -> Result<Self> {
         let n = robot.dof();
         ensure_input!(speed_scale > 0.0 && speed_scale <= 1.0, "speed_scale must be in (0, 1], got {speed_scale}");
-        ensure_input!(
-            control_points.len().is_multiple_of(n) && control_points.len() / n >= 7,
-            "a path needs a whole number of at least 7 control points of {n} joints"
-        );
-        ensure_input!(control_points.iter().all(|v| v.is_finite()), "control points must be finite");
-        let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
-        let mut h = 0.0f32;
-        for (order, &(width, weights)) in DIFFERENCES.iter().enumerate() {
-            for (j, &limit) in limits[order].iter().enumerate() {
-                let largest = largest_difference(control_points, n, j, width, weights);
-                h = h.max((largest / limit).powf(1.0 / (order + 1) as f32));
-            }
-        }
+        check_path(control_points, n)?;
+        let h = uniform_knot(robot, control_points);
         let spans = control_points.len() / n - 3;
+        let first = &control_points[..3 * n];
+        ensure_input!(
+            first.chunks(n).all(|p| p == &first[..n]),
+            "the path starts moving: time it with Trajectory::moving and its start motion"
+        );
         let (mut knot, mut points) = (h, linear(spans));
         if h > 0.0
-            && let Some((tau, map)) = topp::time_map(robot, control_points)
+            && let Some((tau, map)) = topp::time_map(robot, control_points, None)
             && tau * ((map.len() - 3) as f32) < h * spans as f32
         {
             (knot, points) = (tau, map);
@@ -83,6 +77,35 @@ impl Trajectory {
             knot_interval: knot / speed_scale,
             time_points: points,
         })
+    }
+
+    /// Times a path planned from a moving start ([`crate::PlanProblem::start_motion`]) so that it
+    /// starts with exactly that velocity and acceleration, which its first three control points
+    /// encode. Errors with [`Error::Unsafe`] if no timing of the path from that motion keeps the
+    /// limits, as when it cannot brake in time.
+    pub fn moving(robot: &Robot, control_points: &[f32], motion: &StartMotion) -> Result<Self> {
+        let n = robot.dof();
+        ensure_input!(
+            motion.velocity.len() == n && motion.acceleration.len() == n,
+            "a start motion needs {n} velocities and accelerations"
+        );
+        check_path(control_points, n)?;
+        let Some(h0) = start_knot(control_points, n, motion)? else { return Self::new(robot, control_points, 1.0) };
+        let spans = control_points.len() / n - 3;
+        // Uniform timing at exactly h0, when that is no faster than the differences allow.
+        let at = |knot_interval: f32, time_points: Vec<f32>| Self {
+            dof: n,
+            control_points: control_points.to_vec(),
+            knot_interval,
+            time_points,
+        };
+        let uniform = (uniform_knot(robot, control_points) <= h0).then(|| at(h0, linear(spans)));
+        let optimal = topp::time_map(robot, control_points, Some(1.0 / h0 as f64)).map(|(knot, map)| at(knot, map));
+        [uniform, optimal]
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| a.duration().total_cmp(&b.duration()))
+            .ok_or_else(|| Error::Unsafe("no timing of this path from its start motion keeps the limits".into()))
     }
 
     fn spans(&self) -> usize {
@@ -178,6 +201,16 @@ impl Trajectory {
     /// position limit, and within every velocity, acceleration and jerk limit: exactly for uniform
     /// timing, at 64 points per time-map span otherwise.
     pub fn check(&self, robot: &Robot) -> Result<()> {
+        self.verify(robot, None)
+    }
+
+    /// [`Trajectory::check`] for a trajectory that starts in motion ([`Trajectory::moving`]): it
+    /// must start exactly at `start`, position, velocity and acceleration, instead of at rest.
+    pub fn check_from(&self, robot: &Robot, start: &JointState) -> Result<()> {
+        self.verify(robot, Some(start))
+    }
+
+    fn verify(&self, robot: &Robot, start: Option<&JointState>) -> Result<()> {
         let n = robot.dof();
         let cp = &self.control_points;
         ensure_input!(self.dof == n, "trajectory has {} joints, the robot has {n}", self.dof);
@@ -214,11 +247,26 @@ impl Trajectory {
             ends[0],
             ends[1]
         );
-        for end in [0, points - 3] {
-            ensure_safe!(
-                (end..end + 3).all(|i| cp[i * n..(i + 1) * n] == cp[end * n..(end + 1) * n]),
-                "trajectory must start and end at rest (three equal control points at each end)"
-            );
+        let rests = |end: usize| (end..end + 3).all(|i| cp[i * n..(i + 1) * n] == cp[end * n..(end + 1) * n]);
+        ensure_safe!(rests(points - 3), "trajectory must end at rest (three equal control points at the end)");
+        match start {
+            None => ensure_safe!(rests(0), "trajectory must start at rest (three equal control points at the start)"),
+            Some(expected) => {
+                ensure_input!(
+                    [&expected.position, &expected.velocity, &expected.acceleration].iter().all(|v| v.len() == n),
+                    "a start state needs {n} positions, velocities and accelerations"
+                );
+                let mut first = JointState::new(n);
+                self.at(0.0, &mut first);
+                let close =
+                    |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4 * (1.0 + y.abs()));
+                ensure_safe!(
+                    close(&first.position, &expected.position)
+                        && close(&first.velocity, &expected.velocity)
+                        && close(&first.acceleration, &expected.acceleration),
+                    "trajectory does not start at the given state: it starts at {first:?}"
+                );
+            }
         }
         let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
         let names = ["velocity", "acceleration", "jerk"];
@@ -257,6 +305,55 @@ impl Trajectory {
         }
         Ok(())
     }
+}
+
+/// Errors unless `cp` is a whole, finite path of at least 7 control points of `n` joints.
+fn check_path(cp: &[f32], n: usize) -> Result<()> {
+    ensure_input!(
+        cp.len().is_multiple_of(n) && cp.len() / n >= 7,
+        "a path needs a whole number of at least 7 control points of {n} joints"
+    );
+    ensure_input!(cp.iter().all(|v| v.is_finite()), "control points must be finite");
+    Ok(())
+}
+
+/// The smallest knot interval for which uniform timing keeps every joint's velocity, acceleration
+/// and jerk limits along the whole of `cp`.
+pub(crate) fn uniform_knot(robot: &Robot, cp: &[f32]) -> f32 {
+    let n = robot.dof();
+    let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
+    let mut h = 0.0f32;
+    for (order, &(width, weights)) in DIFFERENCES.iter().enumerate() {
+        for (j, &limit) in limits[order].iter().enumerate() {
+            let largest = largest_difference(cp, n, j, width, weights);
+            h = h.max((largest / limit).powf(1.0 / (order + 1) as f32));
+        }
+    }
+    h
+}
+
+/// The knot interval `h0` a path's first three control points continue `motion` at: they are
+/// `q0 - v0 h0 + a0 h0²/3`, `q0 - a0 h0²/6`, `q0 + v0 h0 + a0 h0²/3`. `None` for a start at rest.
+fn start_knot(cp: &[f32], n: usize, motion: &StartMotion) -> Result<Option<f32>> {
+    let (v, a) = (&motion.velocity, &motion.acceleration);
+    ensure_input!(v.iter().chain(a).all(|x| x.is_finite()), "the start motion must be finite");
+    let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+    let (p0, p1, p2) = (&cp[..n], &cp[n..2 * n], &cp[2 * n..3 * n]);
+    let first: Vec<f32> = (0..n).map(|j| (p2[j] - p0[j]) / 2.0).collect();
+    let second: Vec<f32> = (0..n).map(|j| p0[j] - 2.0 * p1[j] + p2[j]).collect();
+    let h0 = if dot(v, v) > 1e-12 {
+        dot(&first, v) / dot(v, v)
+    } else if dot(a, a) > 1e-12 {
+        (dot(&second, a) / dot(a, a)).max(0.0).sqrt()
+    } else {
+        return Ok(None);
+    };
+    let matches = (0..n).all(|j| {
+        (first[j] - v[j] * h0).abs() <= 1e-4 * (1.0 + first[j].abs())
+            && (second[j] - a[j] * h0 * h0).abs() <= 1e-4 * (1.0 + second[j].abs())
+    });
+    ensure_input!(h0 > 0.0 && matches, "the path's first control points do not continue this start motion");
+    Ok(Some(h0))
 }
 
 /// The time map of uniform timing over `spans` path spans: `σ(t) = t / h`.

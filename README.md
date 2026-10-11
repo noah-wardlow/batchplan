@@ -156,6 +156,7 @@ A planned path is a uniform cubic B-spline over its control points. The first th
   - **Uniform**: `σ(t) = t / h`. Velocity is then a quadratic B-spline over the control-point differences divided by `h`, acceleration a linear one over second differences divided by `h²`, and jerk constant per span (third differences over `h³`). The smallest `h` that keeps every joint within its limits bounds the whole curve exactly.
 
   Either is then slowed by the speed scale. Limits come from the robot description when it has them (URDF 1.2 `acceleration` and `jerk`), otherwise from `RobotOptions` (5 rad/s² and 50 rad/s³ by default).
+- **From a moving start.** `PlanProblem::start_motion` gives the robot's current velocity and acceleration, for replanning mid-motion. The path's first three control points then continue that motion: `q0 − v0 h0 + a0 h0²/3`, `q0 − a0 h0²/6` and `q0 + v0 h0 + a0 h0²/3`, with `h0` a quarter slower than a straight path's uniform timing. `Trajectory::moving` times such a path from exactly that state, starting the time-optimal profile at ṡ = 1/h0 with no s̈. Neither timing stretches a moving start, since that would change it, so a path that cannot brake in time is refused (`Error::Unsafe`). `check_from(&robot, &state)` verifies that a trajectory starts at a given state.
 - **For control loops.** `trajectory.at(t, &mut state)` writes position, velocity and acceleration without allocating. A test with a counting allocator holds it to that. `sample(hz)` returns fixed-rate samples for datasets.
 - **For safety layers.** A `Trajectory` is plain serializable data, so a planner process can hand it to a controller process. `trajectory.check(&robot)` refuses one that is non-finite, not at rest at both ends, out of a joint range, running backward, or over a velocity, acceleration or jerk limit: anywhere along its length for uniform timing, at 64 points per time-map span otherwise (time-optimal maps are stretched 0.3% beyond what those points need, which covers the curve between them).
 
@@ -214,7 +215,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 78 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 70 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 80 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 72 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -324,7 +325,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 
 - **Geometry.** The robot is modeled as spheres only. Distance grids are built on the CPU, from one depth image at a time (no fusion over frames), and depth images must have the robot masked out by the caller.
 - **Kinematics.** A closed loop must have exactly one actuated joint, and its passive joints must follow it by a quartic to within 0.5 mm of closure; other loops are rejected when loading. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
-- **Timing.** Trajectories are rest-to-rest and not time-optimal: bounding the B-spline by its control points is conservative. They cannot start from a moving state.
+- **Timing.** Time-optimal timing smooths a velocity- and acceleration-optimal profile, so it is not jerk-optimal. Trajectories end at rest.
 - **Kernel performance.** Small batches stay latency-bound on the GPU: one IK-and-plan query takes about 16 ms on the Radeon and 29 ms on the M4 Pro, mostly serial IK iterations. Shader modules without bounds checks would add 6–12% but need `unsafe`.
 - **Training data.** Demonstrations are state-only reaches with the gripper held open, and every episode shares one task string. The LeRobot export writes all episode metadata to a single file, which caps it at roughly 100k episodes.
 

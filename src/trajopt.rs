@@ -15,7 +15,7 @@ use crate::robot::Robot;
 use crate::rrt::{RrtOptions, RrtProblem, connect_until, distance};
 use crate::shortcut::{ShortcutOptions, length, locate, shortcut_until};
 use crate::spline;
-use crate::types::{JointPaths, Solved};
+use crate::types::{JointPaths, Solved, StartMotion};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanOptions {
@@ -87,6 +87,10 @@ pub struct PlanProblem {
     /// way, if that is the one that is free), and a joint whose range spans more than a turn may
     /// end a turn away from this value when that is nearer or free. Every such end is the same pose.
     pub goal: Vec<f32>,
+    /// How the robot is already moving at `start`, to replan mid-motion; `None` starts at rest.
+    /// The path's first three control points then continue that motion, and
+    /// [`crate::Trajectory::moving`] times it.
+    pub start_motion: Option<StartMotion>,
 }
 
 /// Per-seed results for `problems`; paths are problem-major (`item = problem * seeds + seed`).
@@ -141,6 +145,17 @@ pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &Plan
             robot.within(&p.start) && robot.within(&p.goal),
             "problem {pi}: start and goal must be within the joint limits"
         );
+        if let Some(m) = &p.start_motion {
+            ensure_input!(
+                m.velocity.len() == n && m.acceleration.len() == n,
+                "problem {pi}: the start motion needs {n} velocities and accelerations"
+            );
+            let within = |v: &[f32], limits: &[f32]| v.iter().zip(limits).all(|(x, l)| x.is_finite() && x.abs() <= *l);
+            ensure_input!(
+                within(&m.velocity, robot.max_velocity()) && within(&m.acceleration, robot.max_acceleration()),
+                "problem {pi}: the start motion exceeds the velocity or acceleration limits"
+            );
+        }
         // Seed 0 runs straight to the nearest equivalent goal; odd seeds run straight to the others
         // while they last, the rest bend toward the nearest through a random via point.
         let goals = robot.goal_variants(&p.start, &p.goal);
@@ -150,7 +165,11 @@ pub fn plan(device: &Device, worlds: &Worlds, problems: &[PlanProblem], o: &Plan
                 s if s % 2 == 1 && s.div_ceil(2) < goals.len() => (&goals[s.div_ceil(2)], true),
                 _ => (&goals[0], false),
             };
-            seed_path(robot, &p.start, goal, straight, &mut rng, paths.path_mut(pi * o.seeds + s));
+            let path = paths.path_mut(pi * o.seeds + s);
+            seed_path(robot, &p.start, goal, straight, &mut rng, path);
+            if let Some(m) = &p.start_motion {
+                continue_motion(robot, &p.start, goal, m, path);
+            }
             item_world.push(p.world);
         }
     }
@@ -245,6 +264,11 @@ fn fall_back(
         if !trace(path, n, refit.path_mut(i)) {
             spread(path, n, refit.path_mut(i));
         }
+        let problem = &result.problems[solved[i]];
+        if let Some(m) = &problem.start_motion {
+            let goal = &path[path.len() - n..];
+            continue_motion(device.robot(), &problem.start, goal, m, refit.path_mut(i));
+        }
     }
     let mut optimized = refit.clone();
     device.trajopt(worlds, &world, &mut optimized, o, deadline)?;
@@ -317,6 +341,27 @@ fn spread(path: &[f32], n: usize, out: &mut [f32]) {
     for t in 0..3 {
         out[t * n..(t + 1) * n].copy_from_slice(start);
         out[(t_count - 1 - t) * n..(t_count - t) * n].copy_from_slice(goal);
+    }
+}
+
+/// Pins `path`'s first three control points so the spline leaves `start` with `motion`'s velocity
+/// and acceleration at the knot interval uniform timing gives a straight path to `goal` (see
+/// [`crate::Trajectory::moving`]).
+fn continue_motion(robot: &Robot, start: &[f32], goal: &[f32], motion: &StartMotion, path: &mut [f32]) {
+    let n = start.len();
+    let mut straight = vec![0.0; path.len()];
+    for (t, q) in straight.chunks_mut(n).enumerate() {
+        let u = (t.saturating_sub(2) as f32 / (path.len() / n - 5) as f32).min(1.0);
+        q.iter_mut().enumerate().for_each(|(j, v)| *v = start[j] + (goal[j] - start[j]) * u);
+    }
+    // A quarter slower than the straight path allows, leaving room for the bends optimization adds;
+    // a straight path that does not move still needs a time scale to leave its start with.
+    let h0 = (1.25 * crate::timing::uniform_knot(robot, &straight)).max(1e-2);
+    let (v, a) = (&motion.velocity, &motion.acceleration);
+    for j in 0..n {
+        path[j] = start[j] - v[j] * h0 + a[j] * h0 * h0 / 3.0;
+        path[n + j] = start[j] - a[j] * h0 * h0 / 6.0;
+        path[2 * n + j] = start[j] + v[j] * h0 + a[j] * h0 * h0 / 3.0;
     }
 }
 

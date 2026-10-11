@@ -186,7 +186,12 @@ fn gpu_plans_are_collision_free_under_cpu_check() {
     let ik = solve_ik(&gpu, &on_gpu, &problems, &IkOptions::default()).unwrap();
     let plan_problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     let o = PlanOptions::default();
     let result = plan(&gpu, &on_gpu, &plan_problems, &o).unwrap();
@@ -255,7 +260,12 @@ fn trajopt_directions_match_cpu_element_wise() {
     let ik = solve_ik(&cpu, &cpu.upload(&worlds).unwrap(), &ik_problems(&worlds, 9), &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     let o = PlanOptions { fallback: None, ..Default::default() };
     let per_path = o.control_points * n;
@@ -303,7 +313,12 @@ fn trajopt_lowers_the_cost_as_far_as_the_cpu() {
     let ik = solve_ik(&cpu, &on_cpu, &ik_problems(&scene, 13), &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     let o = PlanOptions { fallback: None, ..Default::default() };
     let (points, k) = (o.control_points, o.samples_per_span);

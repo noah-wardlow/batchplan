@@ -37,7 +37,7 @@ fn far_reaches(robot: &Robot, cpu: &Device, count: usize, above_table: bool) -> 
         }
         let far = goal.iter().zip(robot.default_q()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt() > 4.0;
         if far && cpu.evaluate(&worlds, &[world], &goal, &CollisionWeights::NONE).unwrap().collision_free(0) {
-            problems.push(PlanProblem { world, start: robot.default_q().to_vec(), goal });
+            problems.push(PlanProblem { world, start: robot.default_q().to_vec(), goal, start_motion: None });
         }
     }
     (scene, problems)
@@ -259,7 +259,7 @@ fn continuous_joints_turn_the_short_way_unless_it_is_blocked() {
     let robot = Robot::load(dir.join("turntable.urdf"), &RobotOptions::default()).unwrap();
     assert_eq!(robot.continuous(), [true, false]);
     // From 2.6 rad to -2.6 rad is 1.08 rad through pi, or 5.2 rad the long way.
-    let problem = PlanProblem { world: 0, start: vec![2.6, 0.0], goal: vec![-2.6, 0.0] };
+    let problem = PlanProblem { world: 0, start: vec![2.6, 0.0], goal: vec![-2.6, 0.0], start_motion: None };
     let short = std::f32::consts::TAU - 5.2;
     // A fin along -x, beyond the turntable but within the arm's reach: across the short way only
     // (the arm points along -x at pi).
@@ -325,7 +325,7 @@ fn ur5e_reaches_a_goal_a_turn_away_the_other_way_round() {
     };
     for d in devices(&robot) {
         let worlds = d.upload(std::slice::from_ref(&wall)).unwrap();
-        let problem = PlanProblem { world: 0, start: start.clone(), goal: goal.clone() };
+        let problem = PlanProblem { world: 0, start: start.clone(), goal: goal.clone(), start_motion: None };
         let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
         let path = result.best(0).unwrap_or_else(|| panic!("{}: no plan", d.name()));
         let n = robot.dof();

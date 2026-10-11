@@ -79,7 +79,12 @@ fn main() -> Result<()> {
     let ik = solve_ik(&device, &worlds, &goals, &IkOptions::default())?;
     let problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: 0, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: 0,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     let result = plan(&device, &worlds, &problems, &PlanOptions::default())?;
     println!(

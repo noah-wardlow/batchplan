@@ -45,7 +45,12 @@ fn planned(robot: &Robot, count: usize) -> Vec<Vec<f32>> {
     let ik = solve_ik(&cpu, &worlds, &goals, &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     let result = plan(&cpu, &worlds, &problems, &PlanOptions::default()).unwrap();
     let paths: Vec<Vec<f32>> = result.solved().map(|s| s.solution.to_vec()).collect();
@@ -235,4 +240,34 @@ fn time_optimal_timing_beats_uniform_timing_within_the_limits() {
     assert!(ratios.iter().all(|&r| r <= 1.0 + 1e-5), "slower than uniform timing: {ratios:?}");
     assert!(mean < 0.95, "time-optimal timing gains little: {mean}");
     assert!(peak.iter().take(2).all(|&p| p <= 1.0), "between the checked samples a limit is exceeded: {peak:?}");
+}
+
+#[test]
+fn moving_starts_are_timed_from_their_motion_or_refused() {
+    let robot = common::panda().unwrap();
+    let n = robot.dof();
+    let q0 = robot.default_q().to_vec();
+    // Joint 0 at 2 rad/s, on a path that stops 2 mrad later: no deceleration within the limits
+    // brakes in time.
+    let mut velocity = vec![0.0; n];
+    velocity[0] = 2.0;
+    let motion = StartMotion { velocity, acceleration: vec![0.0; n] };
+    let h0 = 1e-3;
+    let mut cp = vec![];
+    for k in 0..8 {
+        let mut q = q0.clone();
+        q[0] += match k {
+            0 => -2.0 * h0,
+            1 => 0.0,
+            _ => 2.0 * h0,
+        };
+        cp.extend(q);
+    }
+    let err = Trajectory::moving(&robot, &cp, &motion).unwrap_err();
+    assert!(matches!(err, Error::Unsafe(_)), "{err:?}");
+    // Control points that do not continue the motion are an input error.
+    let still = StartMotion { velocity: vec![0.5; n], acceleration: vec![0.0; n] };
+    assert!(matches!(Trajectory::moving(&robot, &cp, &still), Err(Error::Input(_))));
+    // A path that starts moving cannot be timed as if from rest.
+    assert!(matches!(Trajectory::new(&robot, &cp, 1.0), Err(Error::Input(_))));
 }

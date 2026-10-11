@@ -53,6 +53,7 @@ fn main() -> Result<()> {
                 world: s.problem.world,
                 start: robot.default_q().to_vec(),
                 goal: s.solution.to_vec(),
+                start_motion: None,
             })
             .collect();
 

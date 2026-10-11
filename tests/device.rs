@@ -38,13 +38,13 @@ fn malformed_batches_are_errors_on_every_device() {
         assert!(d.evaluate(&worlds, &[1], &q, &none).is_err(), "{name}: world index past the end");
         let target = robot.ee_pose(&q);
         assert!(solve_ik(&d, &worlds, &[IkProblem { world: 1, target }], &IkOptions::default()).is_err(), "{name}: IK");
-        let problem = PlanProblem { world: 1, start: q.clone(), goal: q.clone() };
+        let problem = PlanProblem { world: 1, start: q.clone(), goal: q.clone(), start_motion: None };
         assert!(plan(&d, &worlds, &[problem], &PlanOptions::default()).is_err(), "{name}: plan");
         // Inputs no device could check consistently are refused before any work.
         let input = |r: Result<_, Error>| matches!(r, Err(Error::Input(_)));
         let mut beyond = q.clone();
         beyond[3] = robot.upper()[3] + 0.5;
-        let past_limits = PlanProblem { world: 0, start: q.clone(), goal: beyond };
+        let past_limits = PlanProblem { world: 0, start: q.clone(), goal: beyond, start_motion: None };
         assert!(
             input(plan(&d, &worlds, &[past_limits], &PlanOptions::default()).map(|_| ())),
             "{name}: goal past limits"
@@ -158,9 +158,13 @@ fn obstacle_free_worlds_work_on_every_device() {
         assert!(e.world_clearance[0] > 1e29, "{name}: an empty world has nothing to hit");
         let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target }], &IkOptions::default()).unwrap();
         let goal = ik.best(0).unwrap_or_else(|| panic!("{name}: reachable target unsolved")).to_vec();
-        let result =
-            plan(&d, &worlds, &[PlanProblem { world: 0, start: start.clone(), goal }], &PlanOptions::default())
-                .unwrap();
+        let result = plan(
+            &d,
+            &worlds,
+            &[PlanProblem { world: 0, start: start.clone(), goal, start_motion: None }],
+            &PlanOptions::default(),
+        )
+        .unwrap();
         assert!(result.best(0).is_some(), "{name}: no valid plan in an empty world");
     }
 }
@@ -187,6 +191,7 @@ fn results_keep_the_worlds_of_their_problems() {
                 world: s.problem.world,
                 start: robot.default_q().to_vec(),
                 goal: s.solution.to_vec(),
+                start_motion: None,
             })
             .collect();
         assert!(problems.len() >= 2, "{}: too few IK solutions to test", d.name());
@@ -224,7 +229,7 @@ fn trajopt_smoothness_gradient_matches_its_cost() {
     let mut goal = robot.default_q().to_vec();
     goal[0] += 1.0;
     goal[2] -= 0.7;
-    let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal }];
+    let problems = vec![PlanProblem { world: 0, start: robot.default_q().to_vec(), goal, start_motion: None }];
     let scene = vec![World::default()];
     let o = PlanOptions { collision: CollisionWeights::NONE, fallback: None, ..Default::default() };
     let cost = |path: &[f64]| {
@@ -297,7 +302,7 @@ fn trajopt_collision_gradient_matches_its_cost() {
     let center = robot.ee_pose(&middle).position;
     let post = Obstacle::Cylinder { center, rotation: glam::Quat::IDENTITY, radius: 0.05, half_height: 0.3 };
     let scene = vec![World { obstacles: vec![post] }];
-    let problems = vec![PlanProblem { world: 0, start, goal }];
+    let problems = vec![PlanProblem { world: 0, start, goal, start_motion: None }];
     let o = PlanOptions { fallback: None, ..Default::default() };
     let (points, k) = (o.control_points, o.samples_per_span);
     let samples_of = |cp: &[f64]| -> Vec<f32> {
@@ -392,7 +397,12 @@ fn reaches(robot: &Robot) -> (Vec<World>, Vec<PlanProblem>) {
     let ik = solve_ik(&cpu, &cpu.upload(&scene).unwrap(), &goals, &IkOptions::default()).unwrap();
     let problems = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     (scene, problems)
 }
@@ -434,5 +444,41 @@ fn planning_without_a_budget_gives_the_same_result_every_run() {
         let b = plan(&d, &worlds, &problems, &PlanOptions::default()).unwrap();
         assert_eq!(a.paths, b.paths, "{}: paths differ between runs", d.name());
         assert_eq!((a.valid, a.length), (b.valid, b.length), "{}", d.name());
+    }
+}
+
+#[test]
+fn plans_from_a_moving_start_continue_its_motion() {
+    let robot = panda();
+    let n = robot.dof();
+    let (scene, problems) = reaches(&robot);
+    let motion = StartMotion {
+        velocity: vec![0.5, -0.3, 0.2, 0.4, 0.0, 0.3, 0.0],
+        acceleration: vec![1.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.5],
+    };
+    let moving: Vec<PlanProblem> =
+        problems.iter().take(8).map(|p| PlanProblem { start_motion: Some(motion.clone()), ..p.clone() }).collect();
+    let start = JointState {
+        position: robot.default_q().to_vec(),
+        velocity: motion.velocity.clone(),
+        acceleration: motion.acceleration.clone(),
+    };
+    for d in devices(&robot) {
+        let worlds = d.upload(&scene).unwrap();
+        let result = plan(&d, &worlds, &moving, &PlanOptions::default()).unwrap();
+        let solved: Vec<_> = result.solved().collect();
+        assert!(solved.len() >= 6, "{}: {} of 8 planned", d.name(), solved.len());
+        for s in solved {
+            let trajectory = Trajectory::moving(&robot, s.solution, &motion).unwrap();
+            trajectory.check_from(&robot, &start).unwrap();
+            assert!(
+                matches!(trajectory.check(&robot), Err(Error::Unsafe(_))),
+                "{}: a moving start passes as rest",
+                d.name()
+            );
+            let mut end = JointState::new(n);
+            trajectory.at(trajectory.duration(), &mut end);
+            assert_eq!(end.position, s.problem.goal, "{}", d.name());
+        }
     }
 }

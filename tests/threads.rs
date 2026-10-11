@@ -39,7 +39,12 @@ fn a_one_thread_device_works_on_its_one_thread() {
     let ik = solve_ik(&device, &worlds, &goals, &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()
-        .map(|s| PlanProblem { world: s.problem.world, start: robot.default_q().to_vec(), goal: s.solution.to_vec() })
+        .map(|s| PlanProblem {
+            world: s.problem.world,
+            start: robot.default_q().to_vec(),
+            goal: s.solution.to_vec(),
+            start_motion: None,
+        })
         .collect();
     assert!(!problems.is_empty());
     assert!(plan(&device, &worlds, &problems, &PlanOptions::default()).unwrap().solved().count() > 0);

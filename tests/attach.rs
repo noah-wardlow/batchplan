@@ -127,6 +127,7 @@ fn devices_for_an_attached_robot_plan_in_worlds_already_uploaded() {
                 world: s.problem.world,
                 start: held.default_q().to_vec(),
                 goal: s.solution.to_vec(),
+                start_motion: None,
             })
             .collect();
         let result = plan(&holding, &worlds, &problems, &PlanOptions::default()).unwrap();
