@@ -21,6 +21,12 @@ pub struct ExportOptions {
 /// Writes `demos` under `root`, which must not already hold a dataset:
 /// - `positions.npy`, `velocities.npy`: `[episodes, steps, dof]` float32, padded past each
 ///   episode's `length` with its final position and zero velocity.
+/// - `gripper.npy`: `[episodes, steps]` float32, the gripper's opening (1 open, 0 closed), padded
+///   with its final value.
+/// - `carried.npy` (int32: the obstacle of the episode's world it moves, -1 if none) and
+///   `carried_pose.npy`: `[episodes, steps, 7]` float32, that obstacle's position xyz +
+///   quaternion xyzw, padded with its final pose (zero where nothing is carried).
+/// - `task.npy` (int32, `[episodes]`): each episode's index into `meta.json`'s `tasks`.
 /// - `length.npy` (int32), `kind.npy` (uint8: 0 nominal, 1 recovery), `parent.npy` (int32: the
 ///   episode a recovery branches from, -1 otherwise), `world.npy` (int32): `[episodes]`.
 /// - `goal_pose.npy`: `[episodes, 7]` float32, target position xyz + quaternion xyzw.
@@ -46,8 +52,35 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
             }
         }
     }
+    let padded = |i: usize, h: usize| h.min(demos[i].trajectory.len() - 1);
+    let gripper: Vec<f32> = (0..m).flat_map(|i| (0..horizon).map(move |h| demos[i].gripper[padded(i, h)])).collect();
+    let carried_pose: Vec<f32> = (0..m)
+        .flat_map(|i| {
+            (0..horizon).flat_map(move |h| {
+                demos[i].carried.as_ref().map_or([0.0; 7], |c| {
+                    let (p, q) = (c.poses[padded(i, h)].position, c.poses[padded(i, h)].rotation);
+                    [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
+                })
+            })
+        })
+        .collect();
+    let mut tasks: Vec<&str> = vec![];
+    let task: Vec<i32> = demos
+        .iter()
+        .map(|d| {
+            let k = tasks.iter().position(|&t| t == d.task).unwrap_or_else(|| {
+                tasks.push(&d.task);
+                tasks.len() - 1
+            });
+            k as i32
+        })
+        .collect();
     let column = |f: &dyn Fn(&Demonstration) -> i32| demos.iter().map(f).collect::<Vec<i32>>();
     write(root.join("positions.npy"), &[m, horizon, n], &positions)?;
+    write(root.join("gripper.npy"), &[m, horizon], &gripper)?;
+    write(root.join("carried.npy"), &[m], &column(&|d| d.carried.as_ref().map_or(-1, |c| c.obstacle as i32)))?;
+    write(root.join("carried_pose.npy"), &[m, horizon, 7], &carried_pose)?;
+    write(root.join("task.npy"), &[m], &task)?;
     write(root.join("velocities.npy"), &[m, horizon, n], &velocities)?;
     write(root.join("length.npy"), &[m], &column(&|d| d.trajectory.len() as i32))?;
     write(root.join("parent.npy"), &[m], &column(&|d| d.origin.parent().map_or(-1, |p| p as i32)))?;
@@ -73,7 +106,8 @@ pub fn export(root: &Path, robot: &Robot, worlds: &[World], demos: &[Demonstrati
         "nominal": m - recoveries,
         "recovery": recoveries,
         "kind": {"0": "nominal", "1": "recovery from a perturbed state of episode `parent`"},
-        "goal_pose": "ee frame target: position xyz + quaternion xyzw",
+        "goal_pose": "the pose the episode drives toward (the IK frame's for a reach, the object's for pick-and-place): position xyz + quaternion xyzw",
+        "tasks": tasks,
     });
     meta.as_object_mut().expect("meta is an object").extend(o.metadata.clone());
     std::fs::write(root.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;

@@ -46,6 +46,9 @@ impl Default for IkOptions {
 pub struct IkProblem {
     pub world: u32,
     pub target: Pose,
+    /// Where seed 0 starts instead of the robot's default configuration: the current state, for a
+    /// target close to it (see [`IkResult::nearest`]).
+    pub seed: Option<Vec<f32>>,
 }
 
 /// Per-seed results for `problems`; items are problem-major (`item = problem * seeds + seed`).
@@ -76,6 +79,16 @@ impl IkResult {
             .map(|i| self.solution(i))
     }
 
+    /// The successful seed of `problem` nearest `q` (Euclidean in joint space), which keeps a small
+    /// move on the same IK branch.
+    pub fn nearest(&self, problem: usize, q: &[f32]) -> Option<&[f32]> {
+        let distance = |i: usize| self.solution(i).iter().zip(q).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
+        (problem * self.seeds..(problem + 1) * self.seeds)
+            .filter(|&i| self.success[i])
+            .min_by(|&a, &b| distance(a).total_cmp(&distance(b)))
+            .map(|i| self.solution(i))
+    }
+
     /// Every problem with a successful seed, with its best configuration.
     pub fn solved(&self) -> impl Iterator<Item = Solved<'_, IkProblem>> {
         self.problems
@@ -85,7 +98,8 @@ impl IkResult {
     }
 }
 
-/// Seed 0 starts from the robot's default configuration, the rest uniformly within joint limits.
+/// Seed 0 starts from the problem's seed or else the robot's default configuration, the rest
+/// uniformly within joint limits.
 pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &IkOptions) -> Result<IkResult> {
     let robot = device.robot();
     let n = robot.dof();
@@ -101,6 +115,12 @@ pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &Ik
             position.is_finite() && rotation.is_finite() && (rotation.length() - 1.0).abs() < 1e-3,
             "IK problem {i}: the target needs a finite position and a unit-quaternion rotation"
         );
+        if let Some(seed) = &p.seed {
+            ensure_input!(
+                seed.len() == n && seed.iter().all(|v| v.is_finite()),
+                "IK problem {i}: the seed needs {n} finite values"
+            );
+        }
     }
     let items = problems.len() * o.seeds;
     let mut rng = Rng::new(o.rng_seed);
@@ -110,7 +130,7 @@ pub fn solve_ik(device: &Device, worlds: &Worlds, problems: &[IkProblem], o: &Ik
     for p in problems {
         for s in 0..o.seeds {
             if s == 0 {
-                q.extend_from_slice(&robot.default_q);
+                q.extend_from_slice(p.seed.as_deref().unwrap_or(&robot.default_q));
             } else {
                 q.extend((0..n).map(|j| rng.range(robot.lower[j], robot.upper[j])));
             }

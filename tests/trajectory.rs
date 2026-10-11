@@ -39,7 +39,7 @@ fn planned(robot: &Robot, count: usize) -> Vec<Vec<f32>> {
     let goals: Vec<IkProblem> = worlds
         .iter()
         .enumerate()
-        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
+        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng), seed: None })
         .collect();
     let worlds = cpu.upload(&worlds).unwrap();
     let ik = solve_ik(&cpu, &worlds, &goals, &IkOptions::default()).unwrap();

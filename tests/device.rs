@@ -37,7 +37,10 @@ fn malformed_batches_are_errors_on_every_device() {
         assert!(d.evaluate(&worlds, &[0], &q[..6], &none).is_err(), "{name}: configuration missing a joint");
         assert!(d.evaluate(&worlds, &[1], &q, &none).is_err(), "{name}: world index past the end");
         let target = robot.ee_pose(&q);
-        assert!(solve_ik(&d, &worlds, &[IkProblem { world: 1, target }], &IkOptions::default()).is_err(), "{name}: IK");
+        assert!(
+            solve_ik(&d, &worlds, &[IkProblem { world: 1, target, seed: None }], &IkOptions::default()).is_err(),
+            "{name}: IK"
+        );
         let problem = PlanProblem { world: 1, start: q.clone(), goal: q.clone(), start_motion: None };
         assert!(plan(&d, &worlds, &[problem], &PlanOptions::default()).is_err(), "{name}: plan");
         // Inputs no device could check consistently are refused before any work.
@@ -50,7 +53,7 @@ fn malformed_batches_are_errors_on_every_device() {
             "{name}: goal past limits"
         );
         let skewed = Pose { rotation: glam::Quat::from_xyzw(0.0, 0.0, 0.0, 2.0), ..target };
-        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target: skewed }], &IkOptions::default());
+        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target: skewed, seed: None }], &IkOptions::default());
         assert!(input(ik.map(|_| ())), "{name}: a non-unit target rotation");
         let rotated = |rotation| Obstacle::Cuboid { center: Vec3::ZERO, half_extents: Vec3::ONE, rotation };
         for bad in [
@@ -105,8 +108,9 @@ fn ik_reports_the_clearances_evaluate_finds() {
     let robot = panda();
     let scene = [common::tabletop(&mut batchplan::rng::Rng::new(4))];
     let mut rng = batchplan::rng::Rng::new(9);
-    let problems: Vec<IkProblem> =
-        (0..16).map(|_| IkProblem { world: 0, target: common::grasp_target(&scene[0], &mut rng) }).collect();
+    let problems: Vec<IkProblem> = (0..16)
+        .map(|_| IkProblem { world: 0, target: common::grasp_target(&scene[0], &mut rng), seed: None })
+        .collect();
     for d in devices(&robot) {
         let worlds = d.upload(&scene).unwrap();
         let ik = solve_ik(&d, &worlds, &problems, &IkOptions::default()).unwrap();
@@ -156,7 +160,7 @@ fn obstacle_free_worlds_work_on_every_device() {
         let worlds = d.upload(&[World::default()]).unwrap();
         let e = d.evaluate(&worlds, &[0], &start, &CollisionWeights::NONE).unwrap();
         assert!(e.world_clearance[0] > 1e29, "{name}: an empty world has nothing to hit");
-        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target }], &IkOptions::default()).unwrap();
+        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target, seed: None }], &IkOptions::default()).unwrap();
         let goal = ik.best(0).unwrap_or_else(|| panic!("{name}: reachable target unsolved")).to_vec();
         let result = plan(
             &d,
@@ -177,7 +181,7 @@ fn results_keep_the_worlds_of_their_problems() {
     let scene: Vec<World> = (0..2).map(|_| common::tabletop(&mut rng)).collect();
     let goals: Vec<IkProblem> = [1u32, 1, 0]
         .iter()
-        .map(|&w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng) })
+        .map(|&w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng), seed: None })
         .collect();
     let cpu = Device::cpu(&robot).unwrap();
     let on_cpu = cpu.upload(&scene).unwrap();
@@ -392,7 +396,7 @@ fn reaches(robot: &Robot) -> (Vec<World>, Vec<PlanProblem>) {
     let goals: Vec<IkProblem> = scene
         .iter()
         .enumerate()
-        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
+        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng), seed: None })
         .collect();
     let ik = solve_ik(&cpu, &cpu.upload(&scene).unwrap(), &goals, &IkOptions::default()).unwrap();
     let problems = ik
@@ -519,5 +523,29 @@ fn a_robot_mounted_on_a_table_is_not_in_collision_with_it() {
             PlanProblem { world: 0, start: robot.default_q().to_vec(), goal: goal.clone(), start_motion: None };
         let result = plan(&d, &worlds, &[problem], &PlanOptions::default()).unwrap();
         assert!(result.best(0).is_some(), "{}: no plan on the table", d.name());
+    }
+}
+
+#[test]
+fn seeded_ik_stays_on_the_branch_it_starts_from() {
+    let robot = panda();
+    // A configuration far from the default one, and a target 2 cm above its IK frame.
+    let here = vec![1.2, 0.3, -0.8, -1.6, 0.9, 2.0, -0.4];
+    let far: f32 = here.iter().zip(robot.default_q()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+    assert!(far > 1.5, "the start should be far from the default configuration: {far}");
+    let mut target = robot.ee_pose(&here);
+    target.position.z += 0.02;
+    let one_seed = IkOptions { seeds: 1, ..IkOptions::default() };
+    for d in devices(&robot) {
+        let worlds = d.upload(&[World::default()]).unwrap();
+        let seeded = IkProblem { world: 0, target, seed: Some(here.clone()) };
+        let ik = solve_ik(&d, &worlds, &[seeded], &one_seed).unwrap();
+        let q = ik.nearest(0, &here).unwrap_or_else(|| panic!("{}: no solution from the seed", d.name()));
+        let moved: f32 = q.iter().zip(&here).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(moved < 0.2, "{}: moved {moved} rad from the seed", d.name());
+        // Unseeded, the one seed starts from the default configuration and ends elsewhere.
+        let ik = solve_ik(&d, &worlds, &[IkProblem { world: 0, target, seed: None }], &one_seed).unwrap();
+        let elsewhere = ik.solution(0).iter().zip(&here).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(elsewhere > 0.5, "{}: from the default it lands {elsewhere} rad away", d.name());
     }
 }

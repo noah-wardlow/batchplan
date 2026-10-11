@@ -10,10 +10,10 @@ batchplan is a Rust library for batched, collision-aware robot motion generation
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 91 tests; without the env var, GPU tests skip silently when no adapter exists
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 94 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 5 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 7 OpenUSD tests
-cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, meshes, rrt, attach, threads)
+cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, pick_place, robot, trajectory, mjcf, usd, sdf, meshes, rrt, attach, threads)
 cargo fmt --check                                               # rustfmt.toml: max_width 120
 cargo clippy --release --all-targets [--features lerobot,usd | --no-default-features]   # zero warnings everywhere; CI denies them (lints in Cargo.toml)
 cargo build --release --lib --target aarch64-unknown-linux-gnu --no-default-features     # the CPU-only robot build CI checks
@@ -23,7 +23,7 @@ scripts/fetch_benchmark.sh && cargo run --release --example benchmark   # Motion
 cargo run --release --example datagen -- data/demo 512 20       # .npy dataset: <out_dir> [worlds] [fps]
 cargo run --release --example depth [-- --cpu]                  # a distance grid from a rendered depth image, then plans around it
 cargo run --release --example control_loop -- [seconds]         # a planner thread feeding a 50 Hz loop
-cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20
+cargo run --release --features lerobot --example datagen -- --lerobot data/lerobot_demo 512 20   # --pick-place for pick-and-place, --file-mb N to split files sooner
 REMOTE=user@host SSH_OPTS='...' scripts/sync.sh '<command>'     # rsync to ~/batchplan on a GPU box and run there
 ```
 
@@ -132,11 +132,13 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   3. `recovery_problems`: perturb solved paths and keep collision-free starts.
   4. Replanning from those starts.
   5. `Trajectory::new(..).sample(1 / dt)`: timing within the robot's limits at a random speed scale.
+- `datagen::pick_and_place` chains segments per task: approach (the object an obstacle), descend (worlds without the object, at index `tasks + i`), close, lift (the descent reversed), transfer (on a `with_robot` device holding the object, one per object size), lower, open, retreat (the lowering reversed). IK for the grasp and the place pose is seeded from the configuration above them and takes `IkResult::nearest`. `Episode` concatenates rest-to-rest segments, dropping each one's duplicate first sample.
+- `Demonstration` carries `task`, the gripper's opening per sample and an optional `Carried` obstacle with its pose per sample; `check_demos` checks their lengths.
 - `Origin::parent()` encodes recovery links for both exporters.
 - `lerobot.rs` writes the v3.0 layout natively:
-  - data, episode and task parquet; `tasks.parquet` carries pandas index metadata;
-  - `info.json`, `stats.json`, and a `meta/batchplan.json` extension.
-  - `action` is the next frame's state. `observation.environment_state` holds the goal plus padded obstacles.
+  - data and episode metadata through `Files`, which rolls over past `data_files_size_in_mb`; each episode row records its own file. Global stats are `Aggregate`d from per-episode stats as LeRobot's `aggregate_feature_stats` does, so nothing holds every frame. Keep features in column order (`serde_json::Map` sorts its keys);
+  - `tasks.parquet` lists the distinct tasks with pandas index metadata; `info.json`, `stats.json`, and a `meta/batchplan.json` extension.
+  - The state is the joints plus the gripper; `action` is the next frame's state. `observation.environment_state` holds the goal plus padded obstacles, each where it is at that frame.
   - Extension columns use names outside `observation.*` and `action*`, so LeRobot policies ignore them.
 
 **Robot model.**

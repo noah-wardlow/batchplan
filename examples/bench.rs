@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     let ik_problems: Vec<IkProblem> = worlds
         .iter()
         .enumerate()
-        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng) })
+        .map(|(i, w)| IkProblem { world: i as u32, target: common::grasp_target(w, &mut rng), seed: None })
         .collect();
 
     let mut devices = vec![];

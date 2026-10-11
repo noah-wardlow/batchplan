@@ -113,8 +113,9 @@ fn devices_for_an_attached_robot_plan_in_worlds_already_uploaded() {
     let held = robot.attach(&held_box(&FINGERS)).unwrap();
     let mut rng = Rng::new(5);
     let scene: Vec<World> = (0..8).map(|_| common::tabletop(&mut rng)).collect();
-    let goals: Vec<IkProblem> =
-        (0..8).map(|w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng) }).collect();
+    let goals: Vec<IkProblem> = (0..8)
+        .map(|w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng), seed: None })
+        .collect();
     let checker = Device::cpu(&held).unwrap();
     let on_checker = checker.upload(&scene).unwrap();
     for d in devices(&robot) {

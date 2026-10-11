@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::description::Geometry;
 use crate::sdf::{SdfGrid, SdfOptions, grid_distance};
+use crate::types::Pose;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -171,6 +172,35 @@ impl Obstacle {
         } else {
             Err(Error::Input("needs finite, non-negative sizes and a unit-quaternion rotation".into()))
         }
+    }
+
+    /// The obstacle moved so that its frame (centre and rotation) is `pose`. Spheres keep no
+    /// rotation.
+    pub fn placed(&self, pose: Pose) -> Obstacle {
+        let (center, rotation) = (pose.position, pose.rotation);
+        match self.clone() {
+            Obstacle::Cuboid { half_extents, .. } => Obstacle::Cuboid { center, half_extents, rotation },
+            Obstacle::Sphere { radius, .. } => Obstacle::Sphere { center, radius },
+            Obstacle::Cylinder { radius, half_height, .. } => {
+                Obstacle::Cylinder { center, rotation, radius, half_height }
+            }
+            Obstacle::Capsule { radius, half_length, .. } => {
+                Obstacle::Capsule { center, rotation, radius, half_length }
+            }
+            Obstacle::Sdf { grid, .. } => Obstacle::Sdf { grid, center, rotation },
+        }
+    }
+
+    /// The obstacle's frame: its centre and rotation.
+    pub fn pose(&self) -> Pose {
+        let (position, rotation) = match *self {
+            Obstacle::Cuboid { center, rotation, .. }
+            | Obstacle::Cylinder { center, rotation, .. }
+            | Obstacle::Capsule { center, rotation, .. }
+            | Obstacle::Sdf { center, rotation, .. } => (center, rotation),
+            Obstacle::Sphere { center, .. } => (center, Quat::IDENTITY),
+        };
+        Pose { position, rotation }
     }
 
     /// Signed distance from `p` to the obstacle surface and its gradient (the unit outward

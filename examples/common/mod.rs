@@ -99,3 +99,32 @@ pub fn tabletop_for(robot: &Robot, cpu: &Device, rng: &mut Rng) -> World {
     }
     world
 }
+
+/// A table with its top at z = 0, two tall boxes, and a small box to move across the table: the
+/// world and the task. The small box is the world's last obstacle.
+pub fn pick_place_scene(world: u32, rng: &mut Rng) -> (World, batchplan::datagen::PickPlace) {
+    let table = Obstacle::Cuboid {
+        center: Vec3::new(0.4, 0.0, -0.02),
+        half_extents: Vec3::new(0.7, 0.8, 0.02),
+        rotation: Quat::IDENTITY,
+    };
+    let mut obstacles = vec![table];
+    for side in [-1.0, 1.0] {
+        obstacles.push(Obstacle::Cuboid {
+            center: Vec3::new(rng.range(0.6, 0.7), side * rng.range(0.3, 0.45), 0.15),
+            half_extents: Vec3::new(0.04, 0.04, 0.15),
+            rotation: Quat::from_rotation_z(rng.range(0.0, 3.0)),
+        });
+    }
+    let half = Vec3::new(rng.range(0.015, 0.03), rng.range(0.025, 0.04), rng.range(0.02, 0.04));
+    let spot = |rng: &mut Rng, side: f32| Vec3::new(rng.range(0.35, 0.55), side * rng.range(0.1, 0.3), half.z);
+    let side = if rng.uniform() < 0.5 { -1.0 } else { 1.0 };
+    obstacles.push(Obstacle::Cuboid {
+        center: spot(rng, side),
+        half_extents: half,
+        rotation: Quat::from_rotation_z(rng.range(-1.2, 1.2)),
+    });
+    let place = Pose { position: spot(rng, -side), rotation: Quat::from_rotation_z(rng.range(-1.2, 1.2)) };
+    let object = obstacles.len() - 1;
+    (World { obstacles }, batchplan::datagen::PickPlace { world, object, place })
+}

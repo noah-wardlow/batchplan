@@ -34,8 +34,9 @@ fn a_one_thread_device_works_on_its_one_thread() {
     let mut rng = Rng::new(3);
     let scene: Vec<World> = (0..2).map(|_| common::tabletop(&mut rng)).collect();
     let worlds = device.upload(&scene).unwrap();
-    let goals: Vec<IkProblem> =
-        (0..2).map(|w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng) }).collect();
+    let goals: Vec<IkProblem> = (0..2)
+        .map(|w| IkProblem { world: w, target: common::grasp_target(&scene[w as usize], &mut rng), seed: None })
+        .collect();
     let ik = solve_ik(&device, &worlds, &goals, &IkOptions::default()).unwrap();
     let problems: Vec<PlanProblem> = ik
         .solved()

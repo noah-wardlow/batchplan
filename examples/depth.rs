@@ -76,7 +76,7 @@ fn main() -> Result<()> {
     let worlds = device.upload(&[observed])?;
     // Grasp targets clear of the true scene; some lie in space the camera cannot see.
     let goals: Vec<IkProblem> =
-        (0..64).map(|_| IkProblem { world: 0, target: common::grasp_target(&scene, &mut rng) }).collect();
+        (0..64).map(|_| IkProblem { world: 0, target: common::grasp_target(&scene, &mut rng), seed: None }).collect();
     let ik = solve_ik(&device, &worlds, &goals, &IkOptions::default())?;
     let problems: Vec<PlanProblem> = ik
         .solved()

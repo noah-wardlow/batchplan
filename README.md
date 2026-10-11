@@ -265,7 +265,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 91 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 83 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 94 tests; `--features lerobot` adds 5 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 86 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
@@ -287,7 +287,8 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
   - Fixed seeds give identical paths; changing either seed changes them.
   - With the fallback, `plan` solves every UR5e problem RRT-Connect can reach, and problems trajectory optimization solved keep their paths.
   - Planting coarse edge checks, trees that never join, an unreversed path, a lengthening shortcut, an ignored seed, an arc-length refit or no fallback fails a test.
-- **Exporters:** the `.npy` export round-trips trajectories, padding and labels, and the LeRobot export writes consistent v3.0 metadata. Both refuse to overwrite an existing dataset.
+- **Exporters:** the `.npy` export round-trips trajectories, padding, labels, grippers, carried poses and tasks, and the LeRobot export writes consistent v3.0 metadata. A 1,500-episode export with 1 MB files spreads frames and episode metadata over several files, each episode row naming its own file and the file holding its frames, and its statistics match the frames. Tasks are indexed per frame, the gripper is the last state dimension, and a carried box moves in the environment state frame by frame. Both refuse to overwrite an existing dataset. Planting rows that all claim the first metadata file, episodes weighted equally in the statistics, a carried box left in place, one task index, or an unpadded gripper fails a test.
+- **Pick-and-place:** on each device, 6 of 6 tabletop tasks succeed. The gripper closes once and moves gradually, the box is set down within 3 mm of the place pose, held at the grasp point without slipping, closed on across its narrower side, the arm never touches the scene, the lifted box clears it, and velocities agree with positions. Seeded IK stays on the branch it starts from. Planting a grasp across the wider side, unreversed velocities, a box left behind, a grasp above the box, a gripper that never reopens, lowering to the wrong pose, or a seed that IK ignores fails a test.
 - **Obstacle distances:** every obstacle kind returns unit gradients that match finite differences, stepping back along the gradient lands on the surface, and cylinder and capsule distances match closed forms. The GPU agrees with the CPU for each kind.
 - **Distance grids:**
   - Gradients match finite differences inside the grid and beyond its box, away from cell faces; so do collision gradients through a grid.
@@ -342,7 +343,15 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 3. **Plan recoveries:** perturb each solved path partway along it (20–80% by default), keep the collision-free perturbed states, and replan from them to the same goal. These are the recovery examples that raw planner data lacks.
 4. **Time:** each trajectory runs at a random fraction (60–100% by default) of the fastest timing within the robot's limits, sampled at a fixed `dt`.
 
-Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, goal pose and timed trajectory. Two exporters write them, `npy::export` and `lerobot::export`. `examples/datagen.rs` uses one or the other. Generated from the same worlds, the two formats hold identical trajectories, labels, worlds and goals.
+`datagen::pick_and_place` turns tasks (a box in a world and where to set it down) into pick-and-place demonstrations. Each episode chains segments planned in batches, all from rest to rest:
+1. **Approach** a pose 10 cm above the box from the default configuration, with the box an obstacle.
+2. **Descend** to a top-down grasp across the box's narrower side, the box no longer an obstacle as the fingers close around it, then **close** the gripper over half a second.
+3. **Lift** back up and **transfer** to above the place pose holding the box (`Robot::attach`, touching only the links fixed to the wrist, on a `Device::with_robot` device that shares the uploaded worlds).
+4. **Lower** it, **open** the gripper and **retreat**.
+
+Short moves keep the arm on one IK branch: IK for the grasp and the place pose starts from the configuration above them (`IkProblem::seed`) and takes the solution nearest it (`IkResult::nearest`). Each episode records the gripper's opening and where the box is at every sample, and a task such as "Pick up the box and put it 20 cm to the left." `examples/datagen.rs --pick-place` completes 492 of 512 random tabletop tasks in 20 s on the M4 Pro's GPU.
+
+Each `Demonstration` holds its origin (nominal, or recovery with its parent and phase), world, task, goal pose, timed trajectory, the gripper's opening per sample (1 open, 0 closed; reaches hold it open), and any obstacle it carries with its pose per sample. Two exporters write them, `npy::export` and `lerobot::export`. `examples/datagen.rs` uses one or the other. Generated from the same worlds, the two formats hold identical trajectories, labels, worlds and goals.
 
 ### Plain arrays (`npy::export`, default)
 
@@ -353,30 +362,33 @@ Each `Demonstration` holds its origin (nominal, or recovery with its parent and 
 | `kind.npy` | `[episodes]` uint8: 0 = nominal, 1 = recovery |
 | `parent.npy` | `[episodes]` int32: for recoveries, the row of the nominal episode they branch from; -1 otherwise |
 | `world.npy`, `worlds.json` | world index per episode, and `{"grids", "worlds"}`: the obstacles of every world, with each distance grid written once |
-| `goal_pose.npy` | `[episodes, 7]` target of the `ee_link` frame: xyz + quaternion xyzw |
-| `meta.json` | `dt`, joint names, velocity, acceleration and jerk limits, nominal/recovery counts, device |
+| `goal_pose.npy` | `[episodes, 7]` the pose the episode drives toward (the `ee_link` frame's for a reach, the box's for pick-and-place): xyz + quaternion xyzw |
+| `gripper.npy` | `[episodes, steps]` float32, the gripper's opening (1 open, 0 closed), padded with its final value |
+| `carried.npy`, `carried_pose.npy` | `[episodes]` int32, the obstacle the episode moves (-1 if none), and `[episodes, steps, 7]` float32, its pose at each step (zero if none) |
+| `task.npy` | `[episodes]` int32, each episode's index into `meta.json`'s `tasks` |
+| `meta.json` | `dt`, joint names, velocity, acceleration and jerk limits, nominal/recovery counts, tasks, device |
 
 ### LeRobot v3.0 (optional bridge)
 
-Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The core library doesn't depend on them. `lerobot::export` writes a dataset that `lerobot.datasets.LeRobotDataset(repo_id, root=path)` loads directly. The layout is LeRobot's standard v3.0 set: frame data, episode metadata and tasks as parquet, plus `info.json` and normalization `stats.json`. Each demonstration is one episode:
+Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The core library doesn't depend on them. `lerobot::export` writes a dataset that `lerobot.datasets.LeRobotDataset(repo_id, root=path)` loads directly. The layout is LeRobot's standard v3.0 set: frame data, episode metadata and tasks as parquet, plus `info.json` and normalization `stats.json`. Frame data and episode metadata are written as they are converted, each starting a new file past `ExportOptions::data_files_size_in_mb` (100 MB, LeRobot's default) and a new chunk every 1,000 files. Dataset statistics combine the episodes' as LeRobot's `aggregate_feature_stats` does, so nothing holds every frame and datasets can exceed memory. Each demonstration is one episode:
 
 | Feature | Contents |
 |---|---|
-| `observation.state` | joint positions |
-| `action` | joint positions of the next frame (absolute targets); the last frame repeats its own |
-| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of a grid's box, else (radius, radius, half height or half length) |
+| `observation.state` | joint positions, then the gripper's opening |
+| `action` | the next frame's state (absolute targets); the last frame repeats its own |
+| `observation.environment_state` | goal pose (xyz, quaternion xyzw with w ≥ 0), then each obstacle where it is at that frame (so a carried box moves) as `[present, kind, center xyz, size xyz, quaternion xyzw]`, zero-padded to the largest world. `kind` is 0 cuboid, 1 sphere, 2 cylinder, 3 capsule, 4 distance grid; `size` is the half extents of a cuboid or of a grid's box, else (radius, radius, half height or half length) |
 | `is_recovery`, `parent_episode_index`, `world_index` | extensions; LeRobot policies only read `observation.*` and `action`, so these are ignored in training |
-| `task` | "Move the gripper to the target pose." (`ExportOptions::task`) |
+| `task` | the episode's task string, indexed in `meta/tasks.parquet` |
 
 `meta/batchplan.json` adds the worlds, the environment-state layout and each episode's origin. There are no camera features: the data is state-only until rendering is added.
 
-`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). On the 512-world export (1,401 episodes, 65,186 frames), every check passed:
-- **Loading:** episodes, frames and the task string load as written.
+`scripts/validate_lerobot.py` checks an export with the real `lerobot` package (0.6.1). Every check passed on three exports: 512 reach worlds (1,401 episodes, 65,186 frames), 2,048 reach worlds written with 1 MB files (5,693 episodes and 216,902 frames across 6 episode-metadata files), and 512 pick-and-place tasks (492 episodes, 89,753 frames, 18 tasks):
+- **Loading:** episodes, frames and task strings load as written, from every file.
 - **Episodes:** boundaries are correct, and `action` is the next frame's state.
 - **Labels and stats:** recovery labels match `meta/batchplan.json`, and the normalization stats match the data.
 - **Action chunks:** chunks are padded correctly at episode ends.
 
-`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. On the same export, a 50-step CPU run cut the loss from 44.2 (step 10) to 5.8.
+`lerobot-train --policy.type=act --dataset.root=<export>` trains LeRobot's stock ACT policy on it from state plus environment state. A 50-step CPU run cut the loss from 44.2 (step 10) to 5.8 on the reach export, and from 45.4 to 5.8 on the pick-and-place one.
 
 ## Limits of the MVP
 
@@ -384,7 +396,7 @@ Build with `--features lerobot`, which adds the Arrow/Parquet dependencies. The 
 - **Kinematics.** A closed loop must have exactly one actuated joint, and its passive joints must follow it by a quartic to within 0.5 mm of closure; other loops are rejected when loading. Ball and floating rotations are Euler angles, so they lose a direction of motion where the middle angle reaches ±90°.
 - **Timing.** Time-optimal timing smooths a velocity- and acceleration-optimal profile, so it is not jerk-optimal. Trajectories end at rest.
 - **Kernel performance.** Small batches stay latency-bound on the GPU: one IK-and-plan query takes about 16 ms on the Radeon and 29 ms on the M4 Pro, mostly serial IK iterations. Shader modules without bounds checks would add 6–12% but need `unsafe`.
-- **Training data.** Demonstrations are state-only reaches with the gripper held open, and every episode shares one task string. The LeRobot export writes all episode metadata to a single file, which caps it at roughly 100k episodes.
+- **Training data.** Demonstrations are state-only. Pick-and-place grasps upright boxes from above, one object size per held robot, and its episodes have no recoveries.
 
 ## License
 

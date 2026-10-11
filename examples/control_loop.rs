@@ -33,7 +33,7 @@ fn planner(
     for start in starts {
         let t = Instant::now();
         let target = common::grasp_target(&scene, &mut rng);
-        let ik = solve_ik(&device, &worlds, &[IkProblem { world: 0, target }], &IkOptions::default())?;
+        let ik = solve_ik(&device, &worlds, &[IkProblem { world: 0, target, seed: None }], &IkOptions::default())?;
         let Some(goal) = ik.best(0) else { continue };
         let problem = PlanProblem { world: 0, start, goal: goal.to_vec(), start_motion: None };
         let options = PlanOptions { time_budget: Some(Duration::from_millis(500)), ..Default::default() };

@@ -41,7 +41,7 @@ fn ik_problems(worlds: &[World], seed: u64) -> Vec<IkProblem> {
     worlds
         .iter()
         .enumerate()
-        .map(|(i, s)| IkProblem { world: i as u32, target: common::grasp_target(s, &mut rng) })
+        .map(|(i, s)| IkProblem { world: i as u32, target: common::grasp_target(s, &mut rng), seed: None })
         .collect()
 }
 

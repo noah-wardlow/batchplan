@@ -482,8 +482,11 @@ fn still_demo(robot: &Robot, world: u32) -> batchplan::datagen::Demonstration {
     batchplan::datagen::Demonstration {
         origin: batchplan::datagen::Origin::Nominal,
         world,
+        task: batchplan::datagen::REACH_TASK.into(),
         goal: robot.ee_pose(q),
         trajectory,
+        gripper: vec![1.0; 2],
+        carried: None,
     }
 }
 

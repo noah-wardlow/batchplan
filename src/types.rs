@@ -10,6 +10,19 @@ pub struct Pose {
     pub rotation: Quat,
 }
 
+impl Pose {
+    /// `other`, given in this pose's frame, in the frame this pose is given in.
+    pub fn mul_pose(self, other: Pose) -> Pose {
+        Pose { position: self.position + self.rotation * other.position, rotation: self.rotation * other.rotation }
+    }
+
+    /// The frame this pose is given in, in this pose's frame.
+    pub fn inverse(self) -> Pose {
+        let rotation = self.rotation.inverse();
+        Pose { position: rotation * -self.position, rotation }
+    }
+}
+
 /// A problem that has a solution: its position in the batch, the problem itself and its best
 /// solution (a configuration for IK, a path's `[points, dof]` B-spline control points for planning).
 #[derive(Clone, Copy, Debug)]

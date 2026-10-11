@@ -185,7 +185,7 @@ fn ik_reaches_targets_from_collision_free_configurations() {
     while problems.len() < 64 {
         let q = random_q(&robot, &mut rng);
         if cpu.evaluate(&empty, &[0], &q, &CollisionWeights::NONE).unwrap().collision_free(0) {
-            problems.push(IkProblem { world: 0, target: robot.ee_pose(&q) });
+            problems.push(IkProblem { world: 0, target: robot.ee_pose(&q), seed: None });
         }
     }
     let o = IkOptions { seeds: 16, ..Default::default() };

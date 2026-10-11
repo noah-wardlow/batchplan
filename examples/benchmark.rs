@@ -216,7 +216,7 @@ fn percentile(v: &mut [f64], p: f64) -> f64 {
 }
 
 fn ik_problems(problems: &[Problem]) -> Vec<IkProblem> {
-    problems.iter().enumerate().map(|(i, p)| IkProblem { world: i as u32, target: p.hand_goal() }).collect()
+    problems.iter().enumerate().map(|(i, p)| IkProblem { world: i as u32, target: p.hand_goal(), seed: None }).collect()
 }
 
 /// IK for every goal, then a plan from each start to its best IK solution.
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
         solve_ik(
             device,
             &device.upload(&[World::default()])?,
-            &[IkProblem { world: 0, target: robot.ee_pose(robot.default_q()) }],
+            &[IkProblem { world: 0, target: robot.ee_pose(robot.default_q()), seed: None }],
             &IkOptions::default(),
         )?;
         for (name, problems) in &sets {
