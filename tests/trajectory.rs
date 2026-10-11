@@ -154,7 +154,7 @@ fn check_rejects_unsafe_trajectories() {
 
     rejects(Trajectory { knot_interval: good.knot_interval * 0.8, ..good.clone() }, "running too fast");
 
-    // A long move over few control points, where velocity is the binding limit, sped up 10%.
+    // A long move over few control points, timed to its limits, sped up 10%.
     let mut cp = vec![];
     for q0 in [-2.5, -2.5, -2.5, 0.0, 2.5, 2.5, 2.5] {
         let mut q = robot.default_q().to_vec();
@@ -164,7 +164,7 @@ fn check_rejects_unsafe_trajectories() {
     let sweep = Trajectory::new(&robot, &cp, 1.0).unwrap();
     sweep.check(&robot).unwrap();
     let err = Trajectory { knot_interval: sweep.knot_interval * 0.9, ..sweep }.check(&robot).unwrap_err().to_string();
-    assert!(err.contains("velocity"), "{err}");
+    assert!(err.contains("velocity") || err.contains("acceleration"), "{err}");
 
     let mut spike = good.clone();
     spike.control_points[(points / 2) * n] += 0.05;
@@ -191,4 +191,48 @@ fn trajectories_round_trip_through_json() {
     let back: Trajectory = serde_json::from_str(&text).unwrap();
     assert_eq!(back, trajectory);
     back.check(&robot).unwrap();
+}
+
+#[test]
+fn time_optimal_timing_beats_uniform_timing_within_the_limits() {
+    let robot = common::panda().unwrap();
+    let n = robot.dof();
+    let limits = [robot.max_velocity(), robot.max_acceleration(), robot.max_jerk()];
+    // Uniform timing's knot interval: control-point differences over their limits.
+    let uniform = |cp: &[f32]| {
+        let diff =
+            |k: usize, j: usize, w: &[f32]| w.iter().enumerate().map(|(i, w)| w * cp[(k + i) * n + j]).sum::<f32>();
+        let weights: [&[f32]; 3] = [&[-1.0, 1.0], &[1.0, -2.0, 1.0], &[-1.0, 3.0, -3.0, 1.0]];
+        let points = cp.len() / n;
+        let mut h = 0.0f32;
+        for (order, w) in weights.iter().enumerate() {
+            for (j, limit) in limits[order].iter().enumerate() {
+                let largest = (0..=points - w.len()).map(|k| diff(k, j, w).abs()).fold(0.0, f32::max);
+                h = h.max((largest / limit).powf(1.0 / (order + 1) as f32));
+            }
+        }
+        h * (points - 3) as f32
+    };
+    let (mut ratios, mut peak) = (vec![], [0.0f32; 3]);
+    for path in planned(&robot, 16) {
+        let trajectory = Trajectory::new(&robot, &path, 1.0).unwrap();
+        trajectory.check(&robot).unwrap();
+        ratios.push(trajectory.duration() / uniform(&path));
+        // Four times denser than the check samples.
+        let dt = trajectory.knot_interval / 256.0;
+        let s = trajectory.sample(1.0 / dt).unwrap();
+        for i in 0..s.positions.len() {
+            let j = i % n;
+            peak[0] = peak[0].max(s.velocities[i].abs() / limits[0][j]);
+            peak[1] = peak[1].max(s.accelerations[i].abs() / limits[1][j]);
+        }
+    }
+    let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
+    eprintln!(
+        "duration against uniform timing: mean {mean:.3}, worst {:.3}; peaks {peak:?}",
+        ratios.iter().fold(0.0f32, |m, &r| m.max(r))
+    );
+    assert!(ratios.iter().all(|&r| r <= 1.0 + 1e-5), "slower than uniform timing: {ratios:?}");
+    assert!(mean < 0.95, "time-optimal timing gains little: {mean}");
+    assert!(peak.iter().take(2).all(|&p| p <= 1.0), "between the checked samples a limit is exceeded: {peak:?}");
 }

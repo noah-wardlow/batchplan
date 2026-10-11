@@ -44,6 +44,7 @@ pub mod shortcut;
 pub mod spheres;
 mod spline;
 pub mod timing;
+mod topp;
 pub mod trajopt;
 pub mod types;
 mod urdf;

@@ -146,14 +146,18 @@ Outside its box, a grid reads the value at the nearest box point plus the distan
 
 A planned path is a uniform cubic B-spline over its control points. The first three and last three equal the start and goal, so the path starts and ends at rest.
 - **Optimization and validation see the same curve.** Trajectory optimization samples collision cost along the spline (`samples_per_span` points per span), and validation samples it densely (`validate_substeps` per span).
-- **Timing bounds the whole curve, not samples of it.** On a B-spline with knot interval `h`:
-  - velocity is a quadratic B-spline over the control-point differences divided by `h`;
-  - acceleration is a linear one over the second differences divided by `h²`;
-  - jerk is constant per span: third differences divided by `h³`.
+- **Timing is time-optimal along the planned path, without changing it.** A trajectory is the path `P(s)` and a time map `s = σ(t)`, itself a uniform cubic B-spline. `Trajectory::new` computes two timings and keeps the faster:
+  - **Time-optimal** (TOPP-RA, Pham & Pham 2018):
+    - the fastest timing of the path under joint velocity and acceleration limits, plus a cap from jerk's speed term (the path's third derivative times ṡ³);
+    - smoothed into a B-spline time map (Schoenberg's approximation of s(t));
+    - where the smoothed map overshoots, the speed caps there are lowered and the profile solved again, three rounds; a final stretch takes out whatever overshoot remains when sampled at 64 points per span.
 
-  Each stays within its largest control value. `Trajectory::new` picks the smallest `h` that keeps every joint within its velocity, acceleration and jerk limits, then divides by the speed scale. Limits come from the robot description when it has them (URDF 1.2 `acceleration` and `jerk`), otherwise from `RobotOptions` (5 rad/s² and 50 rad/s³ by default).
+    On planned Panda paths it is 12% faster than uniform timing on average and never slower, at about 0.5 ms per trajectory.
+  - **Uniform**: `σ(t) = t / h`. Velocity is then a quadratic B-spline over the control-point differences divided by `h`, acceleration a linear one over second differences divided by `h²`, and jerk constant per span (third differences over `h³`). The smallest `h` that keeps every joint within its limits bounds the whole curve exactly.
+
+  Either is then slowed by the speed scale. Limits come from the robot description when it has them (URDF 1.2 `acceleration` and `jerk`), otherwise from `RobotOptions` (5 rad/s² and 50 rad/s³ by default).
 - **For control loops.** `trajectory.at(t, &mut state)` writes position, velocity and acceleration without allocating. A test with a counting allocator holds it to that. `sample(hz)` returns fixed-rate samples for datasets.
-- **For safety layers.** A `Trajectory` is plain serializable data, so a planner process can hand it to a controller process. `trajectory.check(&robot)` refuses one that is non-finite, not at rest at both ends, out of a joint range, or over any velocity, acceleration or jerk limit anywhere along its length.
+- **For safety layers.** A `Trajectory` is plain serializable data, so a planner process can hand it to a controller process. `trajectory.check(&robot)` refuses one that is non-finite, not at rest at both ends, out of a joint range, running backward, or over a velocity, acceleration or jerk limit: anywhere along its length for uniform timing, at 64 points per time-map span otherwise (time-optimal maps are stretched 0.3% beyond what those points need, which covers the curve between them).
 
 ## Fallback: RRT-Connect
 
@@ -210,7 +214,7 @@ Uploading worlds once and adding distance grids changed no success rate. In alte
 
 ## Verification
 
-`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 77 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 69 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
+`BATCHPLAN_REQUIRE_GPU=1 cargo test --release` runs 78 tests; `--features lerobot` adds 3 export tests and `--features usd` adds 7 OpenUSD tests. Without default features (CPU only), 70 tests run. All configurations pass on the Framework (Radeon, Vulkan) and the Mac (M4 Pro, Metal), and CI runs them on Linux with the kernels on Mesa's llvmpipe. An earlier version of the suite (14 tests at commit `950e06c`) also passed on an NVIDIA T4 (Vulkan).
 - **FK:** URDF forward kinematics matches Franka's published DH parameters to 1e-5.
 - **Collision gradients:** analytic gradients match finite differences.
 - **Trajectory optimization:**
