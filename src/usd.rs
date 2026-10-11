@@ -6,7 +6,8 @@
 //!   joints: a joint frame is `localPos0`/`localRot0` in body0, and body1
 //!   sits at `localPos1`/`localRot1` from it (a fixed child frame when that is not identity).
 //!   Joints authored from child to parent are flipped; joints that close a loop, or are excluded
-//!   from the articulation, are skipped. Bodies without a joint stay where they are authored.
+//!   from the articulation, become loop closures (`loops.rs`), driven by joints that `MjcActuator`s
+//!   (directly or through an `MjcTendon`) or `PhysicsDriveAPI` drive. Bodies without a joint stay where they are authored.
 //! - Plain `Xform` prims without physics whose children are all `Xform`s (the ghost links URDF
 //!   converters leave, such as an end-effector frame) become fixed frames of the rigid body above
 //!   them. Prims holding geometry, such as visual groups, do not.
@@ -25,7 +26,7 @@ use openusd::usd::{Prim, PrimPredicate, SchemaBase, SchemaKind, Stage, TimeCode}
 use openusd_schemas::geom::{Imageable, Xformable};
 
 use crate::description::{
-    Curve, Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape, TriMesh,
+    Curve, Geometry, JointDesc, JointType, LinkDesc, LoopClosure, Mimic, Model, RobotDescription, Shape, TriMesh,
 };
 use crate::mjcf::WORLD;
 use crate::robot::Transform;
@@ -260,6 +261,7 @@ impl Loader {
     }
 }
 
+#[derive(Clone)]
 struct JointPrim {
     path: String,
     kind: String,
@@ -296,8 +298,14 @@ pub(crate) fn load(path: &Path, variants: &[(String, String)]) -> Result<Model> 
 
     let mut bodies: Vec<String> = vec![];
     let mut joints: Vec<JointPrim> = vec![];
+    // Joints that close loops rather than grow the tree.
+    let mut closures: Vec<JointPrim> = vec![];
     let mut colliders: Vec<String> = vec![];
     let mut frames: Vec<String> = vec![];
+    // Joints a motor drives: MuJoCo actuators (directly or through a fixed tendon) and UsdPhysics
+    // drives. A stage with neither drives every joint.
+    let mut driven: HashSet<String> = HashSet::new();
+    let mut any_drive = false;
     for p in &paths {
         let prim = l.stage.prim(p.as_str())?;
         let kind = prim.type_name()?.map(|t| t.as_str().to_string()).unwrap_or_default();
@@ -312,18 +320,36 @@ pub(crate) fn load(path: &Path, variants: &[(String, String)]) -> Result<Model> 
         if kind == "Xform" && !body && !collider && prim.api_schemas()?.is_empty() && only_xform_children(&prim)? {
             frames.push(p.clone());
         }
+        if kind == "MjcActuator" {
+            any_drive = true;
+            for t in prim.relationship("mjc:target").targets()? {
+                let t = l.stage.prim(t.as_str())?;
+                if t.type_name()?.is_some_and(|k| k.as_str() == "MjcTendon") {
+                    driven.extend(t.relationship("mjc:path").targets()?.iter().map(|p| p.to_string()));
+                } else {
+                    driven.insert(t.path().to_string());
+                }
+            }
+        }
+        if prim.api_schemas()?.iter().any(|a| a.as_str().starts_with("PhysicsDriveAPI")) {
+            any_drive = true;
+            driven.insert(p.clone());
+        }
         if kind.starts_with("Physics") && kind.ends_with("Joint") {
-            if !boolean(&prim, "physics:jointEnabled", true)?
-                || boolean(&prim, "physics:excludeFromArticulation", false)?
-            {
+            if !boolean(&prim, "physics:jointEnabled", true)? {
                 continue;
             }
-            joints.push(JointPrim {
+            let joint = JointPrim {
                 path: p.clone(),
                 kind,
                 body0: target(&prim, "physics:body0")?,
                 body1: target(&prim, "physics:body1")?,
-            });
+            };
+            if boolean(&prim, "physics:excludeFromArticulation", false)? {
+                closures.push(joint);
+            } else {
+                joints.push(joint);
+            }
         }
     }
     let body_set: HashSet<&str> = bodies.iter().map(String::as_str).collect();
@@ -354,6 +380,7 @@ pub(crate) fn load(path: &Path, variants: &[(String, String)]) -> Result<Model> 
             let (parent_side, child_side, flipped) = match (in_tree(&j.body0), in_tree(&j.body1)) {
                 (true, true) => {
                     // Closes a loop (or joins two world-fixed sides): not part of the tree.
+                    closures.push(j.clone());
                     used[k] = true;
                     continue;
                 }
@@ -407,13 +434,31 @@ pub(crate) fn load(path: &Path, variants: &[(String, String)]) -> Result<Model> 
         links.push(LinkDesc { name: link_name(root), ..Default::default() });
         placed.insert(root.clone());
     }
-    // Mimic joints, resolved now that every joint has its name.
+    // Mimic joints, actuation and springs, now that every joint has its name.
     for j in out_joints.iter_mut() {
         let Some(path) = joints.iter().find(|p| joint_name[&p.path] == j.name).map(|p| p.path.clone()) else {
             continue;
         };
         let prim = l.stage.prim(path.as_str())?;
         j.mimic = mimic(&prim, &joint_name, j.kind, l.meters)?;
+        j.actuated = !any_drive || driven.contains(&path);
+        // MjcJointAPI keeps MJCF's values: stiffness per radian or meter, springref in radians or meters.
+        j.stiffness = scalar(&prim, "mjc:stiffness")?.unwrap_or(0.0) as f32;
+        let spring_ref = scalar(&prim, "mjc:springref")?.unwrap_or(0.0);
+        j.spring_ref = if j.kind == JointType::Prismatic { spring_ref * l.meters } else { spring_ref } as f32;
+    }
+    // Loop closures hold their joint's two anchor points together; a point is exact for spherical
+    // joints and enough for planar loops.
+    let mut loops = vec![];
+    for c in &closures {
+        let (Some(b0), Some(b1)) = (&c.body0, &c.body1) else { continue };
+        if !(body_set.contains(b0.as_str()) && body_set.contains(b1.as_str())) {
+            continue;
+        }
+        let prim = l.stage.prim(c.path.as_str())?;
+        let anchor = |side: u8| -> Result<Vec3> { Ok(l.local_frame(&prim, side)?.translation.as_vec3()) };
+        let anchors = (anchor(0)?, Some(anchor(1)?));
+        loops.push(LoopClosure { name: c.path.clone(), links: [link_name(b0), link_name(b1)], anchors });
     }
 
     // Ghost-link frames, fixed to the nearest rigid body above them or to the world.
@@ -442,7 +487,7 @@ pub(crate) fn load(path: &Path, variants: &[(String, String)]) -> Result<Model> 
             None => scene.push(shape),
         }
     }
-    Ok(Model { robot: RobotDescription { name: robot_name, links, joints: out_joints }, scene })
+    Ok(Model { robot: RobotDescription { name: robot_name, links, joints: out_joints, loops }, scene })
 }
 
 /// The joint's kind, axis, limits and velocity limit; parent, child and mimic are filled in later.
@@ -502,6 +547,9 @@ fn joint_from(
         max_acceleration: f32::INFINITY,
         max_jerk: f32::INFINITY,
         mimic: None,
+        actuated: true,
+        stiffness: 0.0,
+        spring_ref: 0.0,
     })
 }
 

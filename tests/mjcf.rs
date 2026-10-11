@@ -89,18 +89,33 @@ fn menagerie_ur5e_matches_the_urdf_ur5e_up_to_frame_offsets() {
 }
 
 #[test]
-fn menagerie_2f85_couples_its_drivers() {
+fn menagerie_2f85_closes_its_four_bars_as_mujoco_settles_them() {
     let robot = Robot::load(common::asset("menagerie/robotiq_2f85/2f85.xml"), &no_spheres()).unwrap();
-    // right_driver_joint follows left_driver_joint; the four-bar `connect` loops are not
-    // representable in a tree, so the passive joints stay independent.
-    assert!(!robot.joint_names().iter().any(|j| j == "right_driver_joint"));
-    assert_eq!(robot.dof(), 7);
-    let left = robot.joint_names().iter().position(|j| j == "left_driver_joint").unwrap();
-    let mut q = robot.default_q().to_vec();
-    let before = robot.link_pose(&q, "right_driver").unwrap();
-    q[left] = 0.5;
-    let after = robot.link_pose(&q, "right_driver").unwrap();
-    assert!((before.rotation.angle_between(after.rotation) - 0.5).abs() < 1e-3, "the right driver does not follow");
+    // right_driver_joint follows left_driver_joint through a joint equality, and each finger's
+    // coupler, spring link and follower follow it around the four-bar `connect` closes.
+    assert_eq!(robot.joint_names(), ["left_driver_joint"]);
+    assert_eq!((robot.lower()[0], robot.upper()[0]), (0.0, 0.8));
+    // MuJoCo 3.15 with gravity and contact off, settled at actuator targets 0, 31.875, ..., 255:
+    // (left_driver_joint, left_pad x, left_pad z).
+    let mujoco = [
+        (0.00260, -0.04918, 0.12282),
+        (0.10251, -0.04459, 0.12626),
+        (0.20241, -0.03967, 0.12924),
+        (0.30232, -0.03447, 0.13171),
+        (0.40222, -0.02905, 0.13367),
+        (0.50212, -0.02345, 0.13507),
+        (0.60202, -0.01773, 0.13591),
+        (0.70193, -0.01195, 0.13618),
+        (0.80002, -0.00626, 0.13588),
+    ];
+    for (driver, x, z) in mujoco {
+        let left = robot.link_pose(&[driver], "left_pad").unwrap().position;
+        let off = (left - Vec3::new(x, 0.0, z)).length();
+        assert!(off < 2e-4, "left pad {left} at {driver}, MuJoCo ({x}, 0, {z}): {off} m off");
+        // The right finger mirrors the left.
+        let right = robot.link_pose(&[driver], "right_pad").unwrap().position;
+        assert!((right - Vec3::new(-left.x, left.y, left.z)).length() < 1e-4, "right pad {right}, left {left}");
+    }
 }
 
 const CONVENTIONS: &str = r#"<mujoco model="conventions">

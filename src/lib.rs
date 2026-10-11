@@ -33,6 +33,7 @@ mod gpu;
 pub mod ik;
 #[cfg(feature = "lerobot")]
 pub mod lerobot;
+mod loops;
 mod mjcf;
 pub mod npy;
 pub mod rng;

@@ -22,6 +22,20 @@ pub(crate) struct RobotDescription {
     pub(crate) name: String,
     pub(crate) links: Vec<LinkDesc>,
     pub(crate) joints: Vec<JointDesc>,
+    /// Kinematic loops the tree of joints leaves open.
+    pub(crate) loops: Vec<LoopClosure>,
+}
+
+/// A point on one link held to a point on another: a kinematic loop a tree cannot express (MJCF
+/// `connect`, USD joints that close a loop).
+#[derive(Clone, Debug)]
+pub(crate) struct LoopClosure {
+    /// Where it was declared, for messages.
+    pub(crate) name: String,
+    pub(crate) links: [String; 2],
+    /// The point in the first link's frame, and in the second's; `None` there means wherever the
+    /// first point is with every joint at zero, as MuJoCo's `connect` defines it.
+    pub(crate) anchors: (Vec3, Option<Vec3>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,6 +77,13 @@ pub(crate) struct JointDesc {
     pub(crate) max_acceleration: f32,
     pub(crate) max_jerk: f32,
     pub(crate) mimic: Option<Mimic>,
+    /// Whether a motor drives the joint. Loops are driven by their actuated joints; elsewhere every
+    /// joint is planned.
+    pub(crate) actuated: bool,
+    /// A spring toward `spring_ref` (MJCF `stiffness`, `springref`): what holds a loop's passive
+    /// joints where closure alone does not.
+    pub(crate) stiffness: f32,
+    pub(crate) spring_ref: f32,
 }
 
 impl JointDesc {
@@ -80,6 +101,9 @@ impl JointDesc {
             max_acceleration: f32::INFINITY,
             max_jerk: f32::INFINITY,
             mimic: None,
+            actuated: false,
+            stiffness: 0.0,
+            spring_ref: 0.0,
         }
     }
 }

@@ -265,6 +265,15 @@ impl Robot {
     }
 
     fn from_description(desc: &RobotDescription, o: &RobotOptions) -> Result<Self> {
+        let closed;
+        let desc = if desc.loops.is_empty() {
+            desc
+        } else {
+            // Loops are solved on the tree they leave open, with every joint planned.
+            let open = RobotOptions { lock_joints: HashMap::new(), default_q: None, ..o.clone() };
+            closed = crate::loops::close_loops(desc, &kinematics(desc, &open)?)?;
+            &closed
+        };
         let mut robot = kinematics(desc, o)?;
         let mut model = match &o.collision_model {
             Some(model) => model.clone(),
@@ -548,7 +557,12 @@ impl Robot {
 /// Translations get no limits here: they come from `RobotOptions::joint_limits`.
 fn expand_compound_joints(desc: &RobotDescription) -> Result<RobotDescription> {
     use std::f32::consts::{FRAC_PI_2, PI};
-    let mut out = RobotDescription { name: desc.name.clone(), links: desc.links.clone(), joints: vec![] };
+    let mut out = RobotDescription {
+        name: desc.name.clone(),
+        links: desc.links.clone(),
+        joints: vec![],
+        loops: desc.loops.clone(),
+    };
     for j in &desc.joints {
         let ball = |range: f32| {
             let r = if range.is_finite() && range > 0.0 { range.min(PI) } else { PI };

@@ -65,10 +65,13 @@ pub(crate) fn load(path: &Path, package_dirs: &[PathBuf]) -> Result<RobotDescrip
                     joint: m.joint.clone(),
                     curve: Curve::linear(m.multiplier.unwrap_or(1.0) as f32, m.offset.unwrap_or(0.0) as f32),
                 }),
+                actuated: true,
+                stiffness: 0.0,
+                spring_ref: 0.0,
             })
         })
         .collect::<Result<_>>()?;
-    Ok(RobotDescription { name: urdf.name, links, joints })
+    Ok(RobotDescription { name: urdf.name, links, joints, loops: vec![] })
 }
 
 fn pose(p: &urdf_rs::Pose) -> Transform {

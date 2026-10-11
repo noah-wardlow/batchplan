@@ -5,8 +5,9 @@
 //! `fromto`, and `<equality><joint>` as mimic joints.
 //!
 //! Body subtrees that contain a joint are the robot; bodies with no joint anywhere below them, and
-//! geoms placed directly in the world body, are the scene. `connect` and `weld` equalities close
-//! kinematic loops, which a tree cannot represent; they are ignored.
+//! geoms placed directly in the world body, are the scene. `connect` equalities close kinematic
+//! loops, which `loops.rs` solves; joints that actuators drive (directly or through a fixed tendon)
+//! drive them. `weld` equalities are ignored.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat3, Quat, Vec3};
 
-use crate::description::{Curve, Geometry, JointDesc, JointType, LinkDesc, Mimic, Model, RobotDescription, Shape};
+use crate::description::{
+    Curve, Geometry, JointDesc, JointType, LinkDesc, LoopClosure, Mimic, Model, RobotDescription, Shape,
+};
 use crate::robot::Transform;
 
 /// The world body's link name.
@@ -259,13 +262,45 @@ pub(crate) fn load(path: &Path) -> Result<Model> {
             }
         }
     }
+    let mut loops = vec![];
     for eq in model.children("equality") {
         for j in eq.children("joint") {
             out.mimic(j)?;
         }
+        for (k, c) in eq.children("connect").enumerate() {
+            let a = Attrs(c.attrs.clone());
+            let (Some(body1), Some(body2)) = (a.get("body1"), a.get("body2")) else {
+                bail!("connect equalities between sites are not supported; name body1 and body2");
+            };
+            let anchor = a.vec3("anchor")?.context("connect equality without an anchor")?;
+            let name = a.get("name").map_or_else(|| format!("connect {k} ({body1}, {body2})"), str::to_string);
+            loops.push(LoopClosure { name, links: [body1.to_string(), body2.to_string()], anchors: (anchor, None) });
+        }
+    }
+    // Joints that actuators drive, directly or through a fixed tendon. A model without actuators
+    // drives every joint.
+    let mut tendons: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in model.children("tendon") {
+        for fixed in t.children("fixed") {
+            let joints = fixed.children("joint").filter_map(|j| j.attr("joint")).collect();
+            tendons.insert(fixed.attr("name").unwrap_or_default(), joints);
+        }
+    }
+    let mut driven: Vec<&str> = vec![];
+    let mut any_actuator = false;
+    for actuators in model.children("actuator") {
+        for act in &actuators.children {
+            any_actuator = true;
+            driven.extend(act.attr("joint"));
+            driven.extend(act.attr("tendon").and_then(|t| tendons.get(t)).into_iter().flatten());
+        }
+    }
+    for j in &mut out.joints {
+        j.actuated = !any_actuator || driven.contains(&j.name.as_str());
     }
     let name = model.attr("model").unwrap_or("mjcf").to_string();
-    Ok(Model { robot: RobotDescription { name, links: out.links, joints: out.joints }, scene: out.scene })
+    let robot = RobotDescription { name, links: out.links, joints: out.joints, loops };
+    Ok(Model { robot, scene: out.scene })
 }
 
 fn has_joint(body: &Element) -> bool {
@@ -319,6 +354,9 @@ impl Builder<'_> {
                 ("free", _) => (JointType::Floating, f32::NAN, f32::NAN),
                 (other, _) => bail!("joint '{joint_name}' has unsupported type '{other}'"),
             };
+            let scalar =
+                |name: &str| -> Result<f32> { Ok(ja.floats(name)?.and_then(|v| v.first().copied()).unwrap_or(0.0)) };
+            let spring_ref = scalar("springref")?;
             self.links.push(LinkDesc { name: child.clone(), ..Default::default() });
             self.joints.push(JointDesc {
                 name: joint_name,
@@ -333,6 +371,10 @@ impl Builder<'_> {
                 max_acceleration: f32::INFINITY,
                 max_jerk: f32::INFINITY,
                 mimic: None,
+                // Set once the actuators are read.
+                actuated: false,
+                stiffness: scalar("stiffness")?,
+                spring_ref: if kind_name == "slide" { spring_ref } else { self.compiler.angle(spring_ref) },
             });
             (link, origin, anchor) = (child, Transform::IDENTITY, pos);
         }

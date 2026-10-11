@@ -94,22 +94,30 @@ fn newton_ur5e_matches_the_mjcf_it_was_converted_from() {
 }
 
 #[test]
-fn newton_2f85_mimics_its_driver_and_skips_loop_closures() {
+fn newton_2f85_closes_its_four_bars() {
     let robot = Robot::load(
         common::asset("newton/robotiq_2f85_v4/usd_structured/Dual_wrist_camera.usda"),
         &RobotOptions::default(),
     )
     .unwrap();
-    // right_driver_joint follows left_driver_joint through NewtonMimicAPI; the four-bar loops,
-    // closed by spherical joints, are not part of the tree.
-    assert!(robot.joint_names().iter().any(|j| j == "left_driver_joint"));
-    assert!(!robot.joint_names().iter().any(|j| j == "right_driver_joint"));
-    let left = robot.joint_names().iter().position(|j| j == "left_driver_joint").unwrap();
+    // right_driver_joint follows left_driver_joint through NewtonMimicAPI; each finger's spring
+    // link and follower follow it around the four-bar its spherical joint closes, so the gripper
+    // has one planned joint.
+    assert_eq!(robot.joint_names(), ["left_driver_joint"]);
     let mut q = robot.default_q().to_vec();
     let before = robot.link_pose(&q, "right_driver").unwrap();
-    q[left] = 0.5;
+    q[0] = 0.5;
     let after = robot.link_pose(&q, "right_driver").unwrap();
     assert!((before.rotation.angle_between(after.rotation) - 0.5).abs() < 1e-3, "the right driver does not follow");
+    // Closing over the 0.8 rad Menagerie gives its fingers brings the pads together by the
+    // gripper's 85 mm stroke.
+    let gap = |x: f32| {
+        let pad = |side: &str| robot.link_pose(&[x], &format!("{side}_pad")).unwrap().position;
+        (pad("left") - pad("right")).length()
+    };
+    let stroke = gap(0.0) - gap(0.8);
+    assert!((0.08..0.09).contains(&stroke), "the pads close by {stroke} m");
+    assert!((0..8).all(|k| gap(0.1 * k as f32) > gap(0.1 * (k + 1) as f32)), "the pads do not close steadily");
     // Mesh colliders from the binary geometry layer give spheres.
     assert!(robot.collision_model().spheres.contains_key("base"));
 }
