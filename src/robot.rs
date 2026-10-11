@@ -12,14 +12,6 @@ use crate::error::{self, Error, ensure_input, input};
 use crate::spheres::{self, SphereGeometry, SphereOptions};
 use crate::types::Pose;
 
-/// Limits of the CPU kernels, whose per-configuration arrays are sized from these. The GPU kernels
-/// are written for each robot (`gpu::robot_wgsl`).
-pub(crate) const MAX_DOF: usize = 16;
-pub(crate) const MAX_LINKS: usize = 32;
-pub(crate) const MAX_SPHERES: usize = 128;
-// `Fk::prismatic` and `Link::chain` are bitmasks over links.
-const _: () = assert!(MAX_LINKS <= 32);
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Transform {
     pub(crate) rot: Mat3,
@@ -73,8 +65,8 @@ pub(crate) struct Link {
     /// Joint frame relative to the parent link frame.
     pub(crate) origin: Transform,
     pub(crate) joint: JointKind,
-    /// Bit `i` is set when link `i` is this link or above it and has a moving joint.
-    pub(crate) chain: u32,
+    /// The links at or above this one with a moving joint, root first.
+    pub(crate) chain: Vec<usize>,
 }
 
 /// A pair of links checked for self-collision: sphere pairs `first..first + count` of
@@ -220,22 +212,32 @@ pub struct AttachedObject {
     pub spheres: SphereOptions,
 }
 
-/// World-frame kinematic state for one configuration.
-#[derive(Clone, Copy)]
+/// World-frame kinematic state for one configuration, per link. Hot loops reuse one per thread
+/// through [`Robot::fk_into`].
+#[derive(Clone)]
 pub(crate) struct Fk {
-    pub(crate) rot: [Mat3; MAX_LINKS],
-    pub(crate) pos: [Vec3; MAX_LINKS],
+    pub(crate) rot: Vec<Mat3>,
+    pub(crate) pos: Vec<Vec3>,
     /// World axis of each link's joint (zero for fixed joints).
-    pub(crate) axis: [Vec3; MAX_LINKS],
-    /// Bit `i` is set when link `i` slides on a prismatic joint.
-    pub(crate) prismatic: u32,
+    pub(crate) axis: Vec<Vec3>,
+    /// Whether each link slides on a prismatic joint.
+    pub(crate) slides: Vec<bool>,
 }
 
 impl Fk {
+    pub(crate) fn new(links: usize) -> Self {
+        Self {
+            rot: vec![Mat3::IDENTITY; links],
+            pos: vec![Vec3::ZERO; links],
+            axis: vec![Vec3::ZERO; links],
+            slides: vec![false; links],
+        }
+    }
+
     /// Derivative of a point rigidly attached downstream of link `i`'s joint, per unit of joint motion.
     #[inline]
     pub(crate) fn dpoint(&self, i: usize, p: Vec3) -> Vec3 {
-        if self.prismatic >> i & 1 == 1 { self.axis[i] } else { self.axis[i].cross(p - self.pos[i]) }
+        if self.slides[i] { self.axis[i] } else { self.axis[i].cross(p - self.pos[i]) }
     }
 }
 
@@ -275,13 +277,12 @@ impl Robot {
         }
         o.check().map_err(anyhow::Error::msg)?;
         let with_geometry = meshes.iter().filter(|m| !m.is_empty()).count();
-        let o = SphereOptions { budget: o.budget.min(MAX_SPHERES), ..*o };
         ensure!(
             o.budget >= with_geometry,
             "a budget of {} spheres cannot cover {with_geometry} links with geometry",
             o.budget
         );
-        let (fitted, overhang) = spheres::fit(&meshes, &o);
+        let (fitted, overhang) = spheres::fit(&meshes, o);
         let source = format!("fitted by batchplan: spheres reach up to {:.1} mm beyond the geometry", overhang * 1e3);
         let mut model = CollisionModel { source: Some(source), ..Default::default() };
         for (link, fitted) in self.links.iter().zip(fitted) {
@@ -290,7 +291,7 @@ impl Robot {
             }
         }
         self.set_collision_model(model.clone())?;
-        model.self_collision_ignore = spheres::ignore_pairs(self, &meshes, &o);
+        model.self_collision_ignore = spheres::ignore_pairs(self, &meshes, o);
         Ok(model)
     }
 
@@ -311,7 +312,6 @@ impl Robot {
                 });
             }
         }
-        ensure!(spheres.len() <= MAX_SPHERES, "{} spheres exceeds MAX_SPHERES={MAX_SPHERES}", spheres.len());
         let mut ignore = HashSet::new();
         for (a, others) in &model.self_collision_ignore {
             for b in others {
@@ -368,7 +368,6 @@ impl Robot {
         if let Some(t) = object.touch_links.iter().find(|t| link(t).is_none()) {
             return Err(input!("unknown touch link '{t}'"));
         }
-        ensure_input!(self.links.len() < MAX_LINKS, "attaching '{}' exceeds MAX_LINKS={MAX_LINKS}", object.name);
         object.spheres.check().map_err(Error::Input)?;
         let meshes = object
             .shapes
@@ -390,7 +389,7 @@ impl Robot {
             here.install(fit)
         };
         let mut robot = self.clone();
-        let chain = robot.links[parent].chain;
+        let chain = robot.links[parent].chain.clone();
         robot.links.push(Link {
             name: object.name.clone(),
             parent: Some(parent),
@@ -484,52 +483,39 @@ impl Robot {
     /// The moving joints at or above `link`, root first: (link index, actuated joint, multiplier).
     #[inline]
     pub(crate) fn chain(&self, link: usize) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
-        let mut bits = self.links[link].chain;
-        std::iter::from_fn(move || {
-            if bits == 0 {
-                return None;
-            }
-            let i = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
+        self.links[link].chain.iter().map(|&i| {
             let (dof, m) = self.links[i].joint.actuation().expect("chain links have moving joints");
-            Some((i, dof, m))
+            (i, dof, m)
         })
     }
 
+    pub(crate) fn fk(&self, q: &[f32]) -> Fk {
+        let mut fk = Fk::new(self.links.len());
+        self.fk_into(q, &mut fk);
+        fk
+    }
+
+    /// Forward kinematics into `fk`, which must have one entry per link.
     // Hot in the CPU backend's inner loops: `#[inline]` keeps it inlinable whichever codegen unit
     // the caller lands in (a 20% swing on the CPU benchmark otherwise).
     #[inline]
-    pub(crate) fn fk(&self, q: &[f32]) -> Fk {
-        let mut fk = Fk {
-            rot: [Mat3::IDENTITY; MAX_LINKS],
-            pos: [Vec3::ZERO; MAX_LINKS],
-            axis: [Vec3::ZERO; MAX_LINKS],
-            prismatic: 0,
-        };
+    pub(crate) fn fk_into(&self, q: &[f32], fk: &mut Fk) {
+        let (rot, pos, axes, slides) = (&mut fk.rot[..], &mut fk.pos[..], &mut fk.axis[..], &mut fk.slides[..]);
         for (i, link) in self.links.iter().enumerate() {
-            let (prot, ppos) = link.parent.map_or((Mat3::IDENTITY, Vec3::ZERO), |p| (fk.rot[p], fk.pos[p]));
+            let (prot, ppos) = link.parent.map_or((Mat3::IDENTITY, Vec3::ZERO), |p| (rot[p], pos[p]));
             let jrot = prot * link.origin.rot;
             let jpos = prot * link.origin.trans + ppos;
-            match link.joint {
-                JointKind::Fixed => {
-                    fk.rot[i] = jrot;
-                    fk.pos[i] = jpos;
-                }
+            (rot[i], pos[i], axes[i], slides[i]) = match link.joint {
+                JointKind::Fixed => (jrot, jpos, Vec3::ZERO, false),
                 JointKind::Revolute { dof, axis, multiplier, offset } => {
-                    fk.rot[i] = jrot * Mat3::from_axis_angle(axis, multiplier * q[dof] + offset);
-                    fk.pos[i] = jpos;
-                    fk.axis[i] = jrot * axis;
+                    (jrot * Mat3::from_axis_angle(axis, multiplier * q[dof] + offset), jpos, jrot * axis, false)
                 }
                 JointKind::Prismatic { dof, axis, multiplier, offset } => {
                     let a = jrot * axis;
-                    fk.rot[i] = jrot;
-                    fk.pos[i] = jpos + a * (multiplier * q[dof] + offset);
-                    fk.axis[i] = a;
-                    fk.prismatic |= 1 << i;
+                    (jrot, jpos + a * (multiplier * q[dof] + offset), a, true)
                 }
-            }
+            };
         }
-        fk
     }
 }
 
@@ -606,10 +592,9 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         max_jerk.push(or_default(joint.max_jerk, o.max_jerk));
     }
     ensure!(!dof_names.is_empty(), "the robot has no actuated joints to plan with");
-    ensure!(dof_names.len() <= MAX_DOF, "{} actuated joints exceeds MAX_DOF={MAX_DOF}", dof_names.len());
 
     let root =
-        Link { name: base.clone(), parent: None, origin: Transform::IDENTITY, joint: JointKind::Fixed, chain: 0 };
+        Link { name: base.clone(), parent: None, origin: Transform::IDENTITY, joint: JointKind::Fixed, chain: vec![] };
     let mut links = vec![root];
     let mut link_index: HashMap<String, usize> = HashMap::from([(base, 0)]);
     for &j in &order {
@@ -657,8 +642,10 @@ fn kinematics(desc: &RobotDescription, o: &RobotOptions) -> Result<Robot> {
         } else {
             JointKind::Fixed
         };
-        ensure!(links.len() < MAX_LINKS, "more than MAX_LINKS={MAX_LINKS} links");
-        let chain = links[parent].chain | if kind.actuation().is_some() { 1 << links.len() } else { 0 };
+        let mut chain = links[parent].chain.clone();
+        if kind.actuation().is_some() {
+            chain.push(links.len());
+        }
         link_index.insert(joint.child.clone(), links.len());
         links.push(Link { name: joint.child.clone(), parent: Some(parent), origin, joint: kind, chain });
     }

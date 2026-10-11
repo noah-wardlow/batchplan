@@ -17,7 +17,7 @@ Deliberate scope decisions:
 
 ```bash
 cargo build --release --all-targets [--features lerobot] [--no-default-features]   # without `gpu`: CPU only, no wgpu
-BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 71 tests; without the env var, GPU tests skip silently when no adapter exists
+BATCHPLAN_REQUIRE_GPU=1 cargo test --release                    # 72 tests; without the env var, GPU tests skip silently when no adapter exists
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features lerobot # + 3 export tests
 BATCHPLAN_REQUIRE_GPU=1 cargo test --release --features usd     # + 6 OpenUSD tests
 cargo test --release --test gpu trajopt_directions_match_cpu_element_wise   # one test (test files: cpu, gpu, device, export, robot, trajectory, mjcf, usd, sdf, rrt, attach, threads)
@@ -81,7 +81,9 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   2. Fill it in `GpuBackend`.
   3. Read it in WGSL as `P.<field>`.
   4. Mirror it in `cpu.rs`.
-- The limits (`MAX_DOF` = 16, `MAX_LINKS` = 32, `MAX_SPHERES` = 128) size the CPU kernels' arrays. They are defined in `robot.rs` and enforced when a robot loads.
+- There are no fixed size limits on robots.
+  - The CPU kernels keep per-configuration state in `Scratch` (`cpu.rs`: FK frames, sphere centres, wrenches, IK buffers). It is sized to the robot and reused per thread (`for_each_init`, or one per path), so hot loops neither allocate nor clear more than the robot needs. Inline small vectors were tried first and cost 5–27% of CPU throughput.
+  - The GPU kernels are written per robot. Self-collision is unrolled per link pair up to `UNROLLED_LINK_PAIRS` (64); beyond that, a run-time loop over frames copied into arrays keeps the generated code growing with links, not pairs.
 - World collision is gated per link: an obstacle farther from a link's bounding sphere (`link_bounds`, `GpuLink.bound`) than `max(margin, 0)` skips the link's spheres (`Robot::sphere_ranges`), and the gap stands in for their clearance. Distance grids are never gated: their interpolated distance is not 1-Lipschitz.
 - Self-collision sphere pairs are grouped by link pair (`Robot::self_link_pairs`). A link pair whose bounding spheres (`link_bounds`, `GpuLink.bound`) are farther apart than `max(self_margin, 0)` skips its sphere pairs, and its gap stands in for its clearance. On the GPU, the `pairs` buffer starts with one `(first, count)` entry per link pair, followed by the sphere pairs.
 
@@ -150,7 +152,7 @@ These decisions are settled. Keep to them unless the user decides otherwise.
   - Build the previous commit in a `git worktree` with its own `CARGO_TARGET_DIR`, and alternate runs with the current code.
   - Check the load first; the dev machines often run other heavy work.
   - A single run proves nothing.
-- **Keep `#[inline]` on hot functions the CPU backend calls across modules** (`Robot::fk`, `Fk::dpoint`, `box_distance`, `sphere_distance`). Without it, how the compiler splits the crate into chunks swings CPU throughput by 15–20%. Mark new hot cross-module helpers the same way. `cpu::collision` is `#[inline(always)]`: with a second cost-only caller, LLVM stopped inlining it into the line search (−5%).
+- **Keep `#[inline]` on hot functions the CPU backend calls across modules** (`Robot::fk_into`, `Fk::dpoint`, `box_distance`, `sphere_distance`). Without it, how the compiler splits the crate into chunks swings CPU throughput by 15–20%. Mark new hot cross-module helpers the same way. `cpu::collision` is `#[inline(always)]`: with a second cost-only caller, LLVM stopped inlining it into the line search (−5%).
 - **`unwrap`/`expect` only for invariants you can prove.** Fallible paths return errors.
 - **The repo is public.** Keep hostnames, usernames and account details out of committed files.
 - **Comments only for what the next reader can't quickly recover from the code.** No comments referencing conversation context. If a workaround needs a paragraph of justification, fix the code instead.

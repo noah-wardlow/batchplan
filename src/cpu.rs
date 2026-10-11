@@ -14,7 +14,7 @@ use rayon::prelude::*;
 
 use crate::device::{Backend, CollisionWeights, Evaluation, Worlds};
 use crate::ik::IkOptions;
-use crate::robot::{Fk, JointKind, MAX_DOF, MAX_LINKS, MAX_SPHERES, Robot};
+use crate::robot::{Fk, JointKind, Robot};
 use crate::sdf::SdfGrid;
 use crate::spline;
 use crate::trajopt::{LINE_SEARCH, MAX_HISTORY, PlanOptions};
@@ -85,6 +85,44 @@ struct CollisionOut {
     self_clearance: f32,
 }
 
+/// A configuration's sphere centres and per-link collision wrenches (force, and moment about the
+/// world origin).
+struct CollisionBuffers {
+    centers: Vec<Vec3>,
+    force: Vec<Vec3>,
+    moment: Vec<Vec3>,
+}
+
+/// Working memory for one configuration at a time, sized to the robot. The hot loops keep one per
+/// thread and reuse it, so they neither allocate nor clear more than the robot needs.
+struct Scratch {
+    fk: Fk,
+    q: Vec<f32>,
+    collision: CollisionBuffers,
+    /// IK: the end effector's Jacobian (6 x dof, row-major), the step and the collision gradient.
+    jac: Vec<f32>,
+    dq: Vec<f32>,
+    grad: Vec<f32>,
+}
+
+impl Scratch {
+    fn new(robot: &Robot) -> Self {
+        let (n, links) = (robot.dof(), robot.links.len());
+        Self {
+            fk: Fk::new(links),
+            q: vec![0.0; n],
+            collision: CollisionBuffers {
+                centers: vec![Vec3::ZERO; robot.spheres.len()],
+                force: vec![Vec3::ZERO; links],
+                moment: vec![Vec3::ZERO; links],
+            },
+            jac: vec![0.0; 6 * n],
+            dq: vec![0.0; n],
+            grad: vec![0.0; n],
+        }
+    }
+}
+
 /// Signed distance from `o` to `p` and its gradient. Mirrors `obstacle_distance` in kernels.wgsl.
 #[inline]
 fn obstacle_distance(o: &Prepared, p: Vec3) -> (f32, Vec3) {
@@ -110,15 +148,19 @@ fn collision<const GRADIENT: bool>(
     fk: &Fk,
     w: &CollisionWeights,
     grad: &mut [f32],
+    buffers: &mut CollisionBuffers,
 ) -> CollisionOut {
-    let mut sc = [Vec3::ZERO; MAX_SPHERES];
-    // Each link's collision wrench: force, and moment about the world origin.
-    let mut force = [Vec3::ZERO; MAX_LINKS];
-    let mut moment = [Vec3::ZERO; MAX_LINKS];
-    let mut touched = false;
-    for (s, sp) in robot.spheres.iter().enumerate() {
-        sc[s] = fk.rot[sp.link] * sp.center + fk.pos[sp.link];
+    let (rot, pos) = (&fk.rot[..], &fk.pos[..]);
+    let CollisionBuffers { centers: sc, force, moment } = buffers;
+    for (c, sp) in sc.iter_mut().zip(&robot.spheres) {
+        *c = rot[sp.link] * sp.center + pos[sp.link];
     }
+    let sc = &sc[..];
+    if GRADIENT {
+        force.fill(Vec3::ZERO);
+        moment.fill(Vec3::ZERO);
+    }
+    let mut touched = false;
     let (mut cost, mut wmin, mut smin) = (0.0f32, FAR, FAR);
     // An obstacle farther from a link's bounding sphere than the margin cannot add cost through the
     // link's spheres; the gap bounds their clearance from below. Distance grids are interpolated,
@@ -129,7 +171,7 @@ fn collision<const GRADIENT: bool>(
             continue;
         }
         let b = robot.link_bounds[link];
-        let bc = fk.rot[link] * Vec3::new(b[0], b[1], b[2]) + fk.pos[link];
+        let bc = rot[link] * Vec3::new(b[0], b[1], b[2]) + pos[link];
         for o in world {
             if !matches!(o, Prepared::Sdf { .. }) {
                 let gap = obstacle_distance(o, bc).0 - b[3];
@@ -159,7 +201,7 @@ fn collision<const GRADIENT: bool>(
     let gate = w.self_margin.max(0.0);
     for lp in &robot.self_link_pairs {
         let (ba, bb) = (robot.link_bounds[lp.a as usize], robot.link_bounds[lp.b as usize]);
-        let at = |link: u32, b: [f32; 4]| fk.rot[link as usize] * Vec3::new(b[0], b[1], b[2]) + fk.pos[link as usize];
+        let at = |link: u32, b: [f32; 4]| rot[link as usize] * Vec3::new(b[0], b[1], b[2]) + pos[link as usize];
         let gap = (at(lp.a, ba) - at(lp.b, bb)).length() - ba[3] - bb[3];
         if gap > gate {
             smin = smin.min(gap);
@@ -196,14 +238,15 @@ fn collision<const GRADIENT: bool>(
         let link = &robot.links[i];
         match link.joint {
             JointKind::Revolute { dof, multiplier, .. } => {
-                grad[dof] += multiplier * fk.axis[i].dot(moment[i] - fk.pos[i].cross(force[i]));
+                grad[dof] += multiplier * fk.axis[i].dot(moment[i] - pos[i].cross(force[i]));
             }
             JointKind::Prismatic { dof, multiplier, .. } => grad[dof] += multiplier * fk.axis[i].dot(force[i]),
             JointKind::Fixed => {}
         }
         if let Some(p) = link.parent {
-            force[p] += force[i];
-            moment[p] += moment[i];
+            let (f, m) = (force[i], moment[i]);
+            force[p] += f;
+            moment[p] += m;
         }
     }
     CollisionOut { cost, world_clearance: wmin, self_clearance: smin }
@@ -276,17 +319,19 @@ fn pose_error(robot: &Robot, fk: &Fk, target: &(Vec3, Mat3), rot_weight: f32) ->
 }
 
 /// One damped-least-squares IK step with a null-space collision push.
-fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f32], o: &IkOptions) {
+fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f32], o: &IkOptions, s: &mut Scratch) {
     let n = q.len();
-    let fk = robot.fk(q);
-    let (e, _, _) = pose_error(robot, &fk, target, o.rot_weight);
+    robot.fk_into(q, &mut s.fk);
+    let fk = &s.fk;
+    let (e, _, _) = pose_error(robot, fk, target, o.rot_weight);
     let ee = robot.ee_link;
-    let mut jac = [[0.0f32; MAX_DOF]; 6];
+    let jac = &mut s.jac[..];
+    jac.fill(0.0);
     for (i, dof, m) in robot.chain(ee) {
         let jp = m * fk.dpoint(i, fk.pos[ee]);
-        let jo = if fk.prismatic >> i & 1 == 1 { Vec3::ZERO } else { m * fk.axis[i] * o.rot_weight };
+        let jo = if fk.slides[i] { Vec3::ZERO } else { m * fk.axis[i] * o.rot_weight };
         for (r, v) in [jp.x, jp.y, jp.z, jo.x, jo.y, jo.z].into_iter().enumerate() {
-            jac[r][dof] += v;
+            jac[r * n + dof] += v;
         }
     }
     let mut a = [0.0f32; 36];
@@ -294,7 +339,7 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
         for c in 0..=r {
             let mut s = 0.0;
             for j in 0..n {
-                s += jac[r][j] * jac[c][j];
+                s += jac[r * n + j] * jac[c * n + j];
             }
             if r == c {
                 s += o.damping * o.damping;
@@ -305,26 +350,28 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
     }
     chol6(&mut a);
     let y = chol6_solve(&a, e);
-    let mut dq = [0.0f32; MAX_DOF];
+    let dq = &mut s.dq[..];
+    dq.fill(0.0);
     for j in 0..n {
         for r in 0..6 {
-            dq[j] += jac[r][j] * y[r];
+            dq[j] += jac[r * n + j] * y[r];
         }
     }
     if o.collision_step > 0.0 {
-        let mut g = [0.0f32; MAX_DOF];
-        collision::<true>(robot, world, &fk, &o.collision, &mut g[..n]);
+        let g = &mut s.grad[..];
+        g.fill(0.0);
+        collision::<true>(robot, world, fk, &o.collision, g, &mut s.collision);
         let mut jg = [0.0f32; 6];
         for r in 0..6 {
             for j in 0..n {
-                jg[r] += jac[r][j] * g[j];
+                jg[r] += jac[r * n + j] * g[j];
             }
         }
         let z = chol6_solve(&a, jg);
         for j in 0..n {
             let mut proj = g[j];
             for r in 0..6 {
-                proj -= jac[r][j] * z[r];
+                proj -= jac[r * n + j] * z[r];
             }
             dq[j] -= o.collision_step * proj;
         }
@@ -338,6 +385,7 @@ fn ik_step(robot: &Robot, world: &[Prepared], target: &(Vec3, Mat3), q: &mut [f3
 
 /// Collision gradient of the trajectory cost at sample `s` of span `span`, with respect to the
 /// configuration there. Must match `traj_samples` in kernels.wgsl.
+#[allow(clippy::too_many_arguments)]
 fn traj_sample_grad(
     robot: &Robot,
     world: &[Prepared],
@@ -346,12 +394,13 @@ fn traj_sample_grad(
     s: usize,
     o: &PlanOptions,
     out: &mut [f32],
+    scratch: &mut Scratch,
 ) {
     let n = robot.dof();
-    let mut q = [0.0f32; MAX_DOF];
-    spline::blend(cp, n, span, spline::basis(spline::sample_u(s, o.samples_per_span)), &mut q[..n]);
+    spline::blend(cp, n, span, spline::basis(spline::sample_u(s, o.samples_per_span)), &mut scratch.q);
+    robot.fk_into(&scratch.q, &mut scratch.fk);
     out.fill(0.0);
-    collision::<true>(robot, world, &robot.fk(&q[..n]), &o.collision, out);
+    collision::<true>(robot, world, &scratch.fk, &o.collision, out, &mut scratch.collision);
 }
 
 /// Gradient of the trajectory cost w.r.t. free control point `t`: the collision gradients of the
@@ -413,15 +462,16 @@ fn traj_cost(
     span: usize,
     s: usize,
     o: &PlanOptions,
+    scratch: &mut Scratch,
 ) -> f32 {
     let n = robot.dof();
     let w = spline::basis(spline::sample_u(s, o.samples_per_span));
-    let mut q = [0.0f32; MAX_DOF];
     for j in 0..n {
         let c = |i: usize| candidate(robot, x, d, alpha, span + i, j);
-        q[j] = w[0] * c(0) + w[1] * c(1) + w[2] * c(2) + w[3] * c(3);
+        scratch.q[j] = w[0] * c(0) + w[1] * c(1) + w[2] * c(2) + w[3] * c(3);
     }
-    collision::<false>(robot, world, &robot.fk(&q[..n]), &o.collision, &mut []).cost
+    robot.fk_into(&scratch.q, &mut scratch.fk);
+    collision::<false>(robot, world, &scratch.fk, &o.collision, &mut [], &mut scratch.collision).cost
 }
 
 /// One path's L-BFGS state, as kernels.wgsl keeps it in `aux`.
@@ -578,12 +628,20 @@ fn lbfgs_direction(st: &mut Lbfgs, n: usize, o: &PlanOptions) {
     }
 }
 
-/// `f(index, chunk)` over `size`-long chunks of `data`, on the pool's threads when `parallel`.
-fn each_chunk<T: Send>(parallel: bool, data: &mut [T], size: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+/// `f(scratch, index, chunk)` over `size`-long chunks of `data`: on the pool's threads, each with
+/// its own scratch, when `parallel`; otherwise in order with `scratch`.
+fn each_chunk<T: Send>(
+    parallel: bool,
+    robot: &Robot,
+    scratch: &mut Scratch,
+    data: &mut [T],
+    size: usize,
+    f: impl Fn(&mut Scratch, usize, &mut [T]) + Sync,
+) {
     if parallel {
-        data.par_chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+        data.par_chunks_mut(size).enumerate().for_each_init(|| Scratch::new(robot), |s, (i, chunk)| f(s, i, chunk));
     } else {
-        data.chunks_mut(size).enumerate().for_each(|(i, chunk)| f(i, chunk));
+        data.chunks_mut(size).enumerate().for_each(|(i, chunk)| f(scratch, i, chunk));
     }
 }
 
@@ -617,9 +675,12 @@ impl Backend for CpuBackend {
         let rows =
             out.world_clearance.par_iter_mut().zip(out.self_clearance.par_iter_mut()).zip(out.cost.par_iter_mut());
         self.pool.install(|| {
-            rows.zip(out.grad.par_chunks_mut(n)).zip(q.par_chunks(n).zip(item_world.par_iter())).for_each(
-                |((((wc, sc), cost), g), (qi, &s))| {
-                    let c = collision::<true>(&self.robot, &prepared[s as usize], &self.robot.fk(qi), w, g);
+            rows.zip(out.grad.par_chunks_mut(n)).zip(q.par_chunks(n).zip(item_world.par_iter())).for_each_init(
+                || Scratch::new(&self.robot),
+                |scratch, ((((wc, sc), cost), g), (qi, &s))| {
+                    self.robot.fk_into(qi, &mut scratch.fk);
+                    let world = &prepared[s as usize];
+                    let c = collision::<true>(&self.robot, world, &scratch.fk, w, g, &mut scratch.collision);
                     (*wc, *sc, *cost) = (c.world_clearance, c.self_clearance, c.cost);
                 },
             )
@@ -632,11 +693,16 @@ impl Backend for CpuBackend {
         let prepared: &CpuWorlds = worlds.prepared();
         let mut out = vec![[0.0; 2]; item_world.len()];
         self.pool.install(|| {
-            out.par_iter_mut().zip(q.par_chunks(n).zip(item_world.par_iter())).for_each(|(c, (qi, &s))| {
-                let fk = self.robot.fk(qi);
-                let r = collision::<false>(&self.robot, &prepared[s as usize], &fk, &CollisionWeights::NONE, &mut []);
-                *c = [r.world_clearance, r.self_clearance];
-            })
+            out.par_iter_mut().zip(q.par_chunks(n).zip(item_world.par_iter())).for_each_init(
+                || Scratch::new(&self.robot),
+                |scratch, (c, (qi, &s))| {
+                    self.robot.fk_into(qi, &mut scratch.fk);
+                    let world = &prepared[s as usize];
+                    let none = &CollisionWeights::NONE;
+                    let r = collision::<false>(&self.robot, world, &scratch.fk, none, &mut [], &mut scratch.collision);
+                    *c = [r.world_clearance, r.self_clearance];
+                },
+            )
         });
         Ok(out)
     }
@@ -654,15 +720,19 @@ impl Backend for CpuBackend {
         Ok(self.pool.install(|| {
             q.par_chunks_mut(n)
                 .zip(item_world.par_iter().zip(targets.par_iter()))
-                .map(|(qi, (&s, target))| {
-                    let world = &prepared[s as usize];
-                    let target = (target.position, Mat3::from_quat(target.rotation));
-                    for _ in 0..o.iterations {
-                        ik_step(&self.robot, world, &target, qi, o);
-                    }
-                    let (_, pos_err, rot_err) = pose_error(&self.robot, &self.robot.fk(qi), &target, o.rot_weight);
-                    [pos_err, rot_err]
-                })
+                .map_init(
+                    || Scratch::new(&self.robot),
+                    |scratch, (qi, (&s, target))| {
+                        let world = &prepared[s as usize];
+                        let target = (target.position, Mat3::from_quat(target.rotation));
+                        for _ in 0..o.iterations {
+                            ik_step(&self.robot, world, &target, qi, o, scratch);
+                        }
+                        self.robot.fk_into(qi, &mut scratch.fk);
+                        let (_, pos_err, rot_err) = pose_error(&self.robot, &scratch.fk, &target, o.rot_weight);
+                        [pos_err, rot_err]
+                    },
+                )
                 .collect()
         }))
     }
@@ -688,15 +758,17 @@ impl Backend for CpuBackend {
             let (world, k) = (&prepared[s as usize], o.samples_per_span);
             let mut sample_grad = vec![0.0f32; samples * n];
             let mut st = Lbfgs::new(t_count, n, samples, o);
+            let mut scratch = Scratch::new(&self.robot);
             // The first round only prices the seed: its direction is still zero.
             for round in 0..=o.iterations {
                 if deadline.is_some_and(|d| Instant::now() >= d) {
                     break;
                 }
                 let tr_ref = &*tr;
-                each_chunk(per_sample, &mut st.costs, 1, |i, cost| {
+                let dir = &st.dir;
+                each_chunk(per_sample, &self.robot, &mut scratch, &mut st.costs, 1, |s, i, cost| {
                     let (c, i) = (i / samples, i % samples);
-                    cost[0] = traj_cost(&self.robot, world, tr_ref, &st.dir, LINE_SEARCH[c], i / k, i % k, o);
+                    cost[0] = traj_cost(&self.robot, world, tr_ref, dir, LINE_SEARCH[c], i / k, i % k, o, s);
                 });
                 let steepest = st.count == 0;
                 traj_search(&self.robot, tr, &mut st, o);
@@ -705,8 +777,8 @@ impl Backend for CpuBackend {
                     break;
                 }
                 let tr_ref = &*tr;
-                each_chunk(per_sample, &mut sample_grad, n, |i, g| {
-                    traj_sample_grad(&self.robot, world, tr_ref, i / k, i % k, o, g);
+                each_chunk(per_sample, &self.robot, &mut scratch, &mut sample_grad, n, |s, i, g| {
+                    traj_sample_grad(&self.robot, world, tr_ref, i / k, i % k, o, g, s);
                 });
                 for t in 3..t_count - 3 {
                     traj_grad(tr, &sample_grad, n, t, o, &mut st.grad[t * n..(t + 1) * n]);

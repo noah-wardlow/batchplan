@@ -380,3 +380,63 @@ fn every_test_arm_loads_spherizes_and_plans() {
         }
     }
 }
+
+/// A planar-ish snake: `joints` revolute joints, alternating between two axes, each carrying a
+/// 10 cm capsule-like cylinder.
+fn snake_urdf(joints: usize) -> String {
+    let mut urdf = String::from("<robot name=\"snake\">\n  <link name=\"base\"/>\n");
+    for i in 0..joints {
+        let (parent, axis) =
+            (if i == 0 { "base".to_string() } else { format!("l{}", i - 1) }, ["0 1 0", "0 0 1"][i % 2]);
+        urdf += &format!(
+            "  <link name=\"l{i}\"><collision><origin xyz=\"0 0 0.05\"/><geometry><cylinder radius=\"0.02\" length=\"0.1\"/></geometry></collision></link>\n\
+             <joint name=\"j{i}\" type=\"revolute\"><parent link=\"{parent}\"/><child link=\"l{i}\"/>\
+             <origin xyz=\"0 0 {}\"/><axis xyz=\"{axis}\"/><limit lower=\"-1.5\" upper=\"1.5\" velocity=\"2\" effort=\"1\"/></joint>\n",
+            if i == 0 { 0.0 } else { 0.1 }
+        );
+    }
+    urdf + "</robot>\n"
+}
+
+#[test]
+fn robots_past_the_old_kernel_limits_work_on_every_device() {
+    // 40 actuated joints, 41 links and more than 128 spheres: past every former fixed limit
+    // (16 joints, 32 links, 128 spheres).
+    let dir = scratch("snake");
+    std::fs::write(dir.join("snake.urdf"), snake_urdf(40)).unwrap();
+    let options = RobotOptions { spheres: SphereOptions { budget: 200, ..Default::default() }, ..Default::default() };
+    let robot = Robot::load(dir.join("snake.urdf"), &options).unwrap();
+    let spheres: usize = robot.collision_model().spheres.values().map(Vec::len).sum();
+    assert!(robot.dof() == 40 && spheres > 128, "{} joints, {spheres} spheres", robot.dof());
+    let scene = [World {
+        obstacles: vec![Obstacle::Cuboid {
+            center: Vec3::new(0.6, 0.0, 1.2),
+            half_extents: Vec3::splat(0.3),
+            rotation: Quat::IDENTITY,
+        }],
+    }];
+    let mut rng = Rng::new(17);
+    let q: Vec<f32> = (0..500).flat_map(|_| random_q(&robot, &mut rng)).collect();
+    let item_world = vec![0; 500];
+    let w = CollisionWeights { world: 1.0, self_collision: 1.0, margin: 0.05, self_margin: 0.02 };
+    let devices = devices(&robot);
+    let reference = devices[0].evaluate(&devices[0].upload(&scene).unwrap(), &item_world, &q, &w).unwrap();
+    assert!(reference.cost.iter().filter(|&&c| c > 0.0).count() > 50, "too few configurations carry cost");
+    for d in &devices {
+        let worlds = d.upload(&scene).unwrap();
+        let e = d.evaluate(&worlds, &item_world, &q, &w).unwrap();
+        for i in 0..500 {
+            assert!((e.world_clearance[i] - reference.world_clearance[i]).abs() < 1e-4, "{}: clearance", d.name());
+            assert!((e.self_clearance[i] - reference.self_clearance[i]).abs() < 1e-4, "{}: self clearance", d.name());
+        }
+        let scale = reference.grad.iter().fold(1.0f32, |m, g| m.max(g.abs()));
+        let worst = e.grad.iter().zip(&reference.grad).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(worst / scale < 1e-3, "{}: gradient off by {worst}", d.name());
+        let start = vec![0.0; 40];
+        let mut goal = vec![0.0; 40];
+        goal[0] = 1.0;
+        let problem = PlanProblem { world: 0, start, goal };
+        let result = plan(d, &worlds, &[problem], &PlanOptions::default()).unwrap();
+        assert!(result.best(0).is_some(), "{}: no plan for the snake", d.name());
+    }
+}

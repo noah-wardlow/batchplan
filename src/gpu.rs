@@ -21,6 +21,10 @@ use crate::world::{Obstacle, World};
 const WORKGROUP: u32 = 64;
 // traj_search prices the line-search steps in the components of one vec4.
 const _: () = assert!(LINE_SEARCH.len() <= 4);
+/// Robots with at most this many pairs of links checked for self-collision get one block of
+/// generated code per pair, with every frame in registers; more pairs loop at run time over frames
+/// copied into arrays, so the code grows with links rather than pairs.
+const UNROLLED_LINK_PAIRS: usize = 64;
 /// Lanes per configuration in the collision kernels built for small batches (`LANES` in
 /// kernels.wgsl).
 const SHARED_LANES: u32 = 8;
@@ -242,24 +246,27 @@ fn collision(
     }
     w += "    // Likewise for link pairs whose bounding spheres are farther apart than the self margin.\n";
     w += "    let gate = max(self_margin, 0.0);\n";
-    for (l, lp) in robot.self_link_pairs.iter().enumerate() {
-        let (a, b) = (lp.a, lp.b);
-        let _ = write!(
-            w,
-            r"    {{
-        let ba = links[{a}u].bound;
-        let bb = links[{b}u].bound;
-        let gap = length(rot_{a} * ba.xyz + pos_{a} - rot_{b} * bb.xyz - pos_{b}) - ba.w - bb.w;
+    // One link pair: `ends` index its two links in the links buffer; `frame(e)` names end e's
+    // rotation and position, `wrench(e)` its force and moment accumulators.
+    type Names<'a> = &'a dyn Fn(usize) -> (String, String);
+    let pair = |l: &str, ends: [&str; 2], frame: Names, wrench: Names| {
+        let [a, b] = ends;
+        let ((ra, pa), (rb, pb)) = (frame(0), frame(1));
+        let ((fa, ma), (fb, mb)) = (wrench(0), wrench(1));
+        format!(
+            r"        let ba = links[{a}].bound;
+        let bb = links[{b}].bound;
+        let gap = length({ra} * ba.xyz + {pa} - {rb} * bb.xyz - {pb}) - ba.w - bb.w;
         if (gap > gate) {{
             smin = min(smin, gap);
         }} else {{
-            let span = pairs[{l}u];
+            let span = pairs[2u * {l} + 1u];
             for (var k = span.x + lane; k < span.x + span.y; k += LANES) {{
                 let pr = pairs[k];
                 let sa = spheres[pr.x];
                 let sb = spheres[pr.y];
-                let ca = rot_{a} * sa.c.xyz + pos_{a};
-                let cb = rot_{b} * sb.c.xyz + pos_{b};
+                let ca = {ra} * sa.c.xyz + {pa};
+                let cb = {rb} * sb.c.xyz + {pb};
                 let diff = ca - cb;
                 let dist = length(diff);
                 let d = dist - (sa.c.w + sa.self_buf) - (sb.c.w + sb.self_buf);
@@ -273,18 +280,46 @@ fn collision(
                             u = diff / dist;
                         }}
                         let g = 2.0 * w_self * pen * u;
-                        force_{a} -= g;
-                        moment_{a} -= cross(ca, g);
-                        force_{b} += g;
-                        moment_{b} += cross(cb, g);
+                        {fa} -= g;
+                        {ma} -= cross(ca, g);
+                        {fb} += g;
+                        {mb} += cross(cb, g);
                         touched = true;
                     }}
                 }}
             }}
         }}
-    }}
 "
-        );
+        )
+    };
+    let pairs = robot.self_link_pairs.len();
+    if pairs <= UNROLLED_LINK_PAIRS {
+        for (l, lp) in robot.self_link_pairs.iter().enumerate() {
+            let link = [lp.a, lp.b];
+            let frame = |e: usize| (format!("rot_{}", link[e]), format!("pos_{}", link[e]));
+            let wrench = |e: usize| (format!("force_{}", link[e]), format!("moment_{}", link[e]));
+            let body = pair(&format!("{l}u"), [&format!("{}u", lp.a), &format!("{}u", lp.b)], &frame, &wrench);
+            let _ = write!(w, "    {{\n{body}    }}\n");
+        }
+    } else {
+        // Too many pairs to write out: frames go into arrays indexed at run time.
+        let nl = links.len();
+        let _ = writeln!(w, "    var frot: array<mat3x3<f32>, {nl}>;\n    var fpos: array<vec3<f32>, {nl}>;");
+        let _ = writeln!(w, "    var fforce: array<vec3<f32>, {nl}>;\n    var fmoment: array<vec3<f32>, {nl}>;");
+        for i in 0..nl {
+            let _ = writeln!(w, "    frot[{i}u] = rot_{i};\n    fpos[{i}u] = pos_{i};");
+        }
+        let end = ["ab.x", "ab.y"];
+        let frame = |e: usize| (format!("frot[{}]", end[e]), format!("fpos[{}]", end[e]));
+        let wrench = |e: usize| (format!("fforce[{}]", end[e]), format!("fmoment[{}]", end[e]));
+        let body = pair("l", end, &frame, &wrench);
+        let _ =
+            write!(w, "    for (var l = 0u; l < {pairs}u; l++) {{\n        let ab = pairs[2u * l];\n{body}    }}\n");
+        w += "    if (gradient) {\n";
+        for i in 0..nl {
+            let _ = writeln!(w, "        force_{i} += fforce[{i}u];\n        moment_{i} += fmoment[{i}u];");
+        }
+        w += "    }\n";
     }
     w += "    // Each link's wrench reaches the joints at and above it, leaves first.\n";
     w += "    if (gradient && touched) {\n";
@@ -392,12 +427,12 @@ impl RobotBuffers {
             .iter()
             .map(|s| GpuSphere { c: v4(s.center, s.radius), self_buf: s.self_buffer, ..Default::default() })
             .collect();
-        // Each link pair's (first, count) of the sphere pairs that follow.
-        let skip = robot.self_link_pairs.len() as u32;
+        // Each link pair as (a, b), then (first, count) of the sphere pairs that follow.
+        let skip = 2 * robot.self_link_pairs.len() as u32;
         let gpu_pairs: Vec<[u32; 2]> = robot
             .self_link_pairs
             .iter()
-            .map(|lp| [skip + lp.first, lp.count])
+            .flat_map(|lp| [[lp.a, lp.b], [skip + lp.first, lp.count]])
             .chain(robot.self_pairs.iter().copied())
             .collect();
         let gpu_limits: Vec<[f32; 2]> = (0..robot.dof()).map(|j| [robot.lower[j], robot.upper[j]]).collect();
